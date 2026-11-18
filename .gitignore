@@ -1,0 +1,7 @@
+build/
+klipler/
+*.exe
+*.log
+settings.ini
+.DS_Store
+Thumbs.db
