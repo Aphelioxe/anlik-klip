@@ -1,4 +1,5 @@
 #include "main_window.h"
+#include "clip_trimmer.h"
 #include "com_ptr.h"
 #include "hotkey_engine.h"
 #include "sound_fx.h"
@@ -20,7 +21,12 @@
 #include <shellapi.h>
 #include <shobjidl.h>
 #include <algorithm>
+#include <cmath>
 #include <cstdio>
+
+#ifndef EM_SETCUEBANNER
+#define EM_SETCUEBANNER 0x1501
+#endif
 
 namespace {
 
@@ -31,9 +37,11 @@ constexpr COLORREF kRgbBorder  = RGB(45, 55, 74);
 constexpr COLORREF kRgbText    = RGB(238, 242, 248);
 constexpr COLORREF kRgbMuted   = RGB(148, 160, 180);
 
-constexpr UINT_PTR TIMER_PLAYER_ID = 2;
-constexpr UINT WM_MW_THUMB_READY   = WM_APP + 20;
-constexpr UINT WM_MW_PLAYER_EVENT  = WM_APP + 21;
+constexpr UINT_PTR TIMER_PLAYER_ID    = 2;
+constexpr UINT_PTR TIMER_MIC_METER_ID = 3;
+constexpr UINT WM_MW_THUMB_READY      = WM_APP + 20;
+constexpr UINT WM_MW_PLAYER_EVENT     = WM_APP + 21;
+constexpr UINT WM_MW_TRIM_DONE        = WM_APP + 22;
 
 inline Gdiplus::Color Gc(uint8_t r, uint8_t g, uint8_t b, uint8_t a = 255) {
     return Gdiplus::Color(a, r, g, b);
@@ -71,15 +79,19 @@ enum CustomBtnId {
     BTN_SIDE_SAVE,
     BTN_SIDE_TOGGLE,
     BTN_SIDE_MIC,
+    BTN_TOP_FAV_FILTER,
+    BTN_TOP_CLEAR_SEARCH,
     BTN_TOP_FOLDER,
     BTN_TOP_REFRESH,
     BTN_CLIP_PLAY,
+    BTN_CLIP_FAV,
     BTN_CLIP_RENAME,
     BTN_CLIP_REVEAL,
     BTN_CLIP_DELETE,
 
-    // Player controls
+    // Player & Trim controls
     BTN_PLY_BACK = 50,
+    BTN_PLY_FAV,
     BTN_PLY_RENAME,
     BTN_PLY_FOLDER,
     BTN_PLY_DELETE,
@@ -88,11 +100,18 @@ enum CustomBtnId {
     BTN_PLY_PLUS5,
     BTN_PLY_RESTART,
     BTN_PLY_RATE,
+    BTN_PLY_TRIM,
     BTN_PLY_MUTE,
-    BTN_PLY_EXTERNAL
+    BTN_PLY_EXTERNAL,
+    BTN_TRIM_SET_START,
+    BTN_TRIM_SET_END,
+    BTN_TRIM_SAVE_COPY,
+    BTN_TRIM_REPLACE,
+    BTN_TRIM_CANCEL
 };
 
 enum NativeCtrlId {
+    ID_EDT_SEARCH = 2999,
     ID_CMB_DURATION = 3001,
     ID_CMB_RESFPS,
     ID_CMB_BITRATE,
@@ -102,6 +121,8 @@ enum NativeCtrlId {
     ID_CHK_MIC_MUTE,
     ID_TRK_MIC_VOL,
     ID_CMB_MIC_DEV,
+    ID_CHK_MIC_GATE,
+    ID_TRK_MIC_GATE,
     ID_BTN_SET_CLIP_HK,
     ID_BTN_SET_MIC_HK,
     ID_BTN_CLR_MIC_HK,
@@ -115,10 +136,56 @@ enum NativeCtrlId {
     ID_BTN_EXIT_APP,
 
     ID_CTX_PLAY = 4001,
+    ID_CTX_FAV,
     ID_CTX_RENAME,
     ID_CTX_REVEAL,
     ID_CTX_DELETE
 };
+
+struct TrimDoneMsg {
+    bool ok = false;
+    bool replaceOriginal = false;
+    std::wstring origPath;
+    std::wstring outPath;
+    std::wstring message;
+};
+
+void DrawStarPolygon(Gdiplus::Graphics& g, float cx, float cy, float rOut, float rIn, bool filled) {
+    Gdiplus::PointF pts[10];
+    const float startAngle = -3.14159265f / 2.0f;
+    const float step = 3.14159265f / 5.0f;
+    for (int i = 0; i < 10; ++i) {
+        float r = (i % 2 == 0) ? rOut : rIn;
+        float a = startAngle + step * static_cast<float>(i);
+        pts[i].X = cx + r * std::cos(a);
+        pts[i].Y = cy + r * std::sin(a);
+    }
+    if (filled) {
+        Gdiplus::SolidBrush br(Gc(250, 204, 21));
+        g.FillPolygon(&br, pts, 10);
+        Gdiplus::Pen pen(Gc(253, 224, 71), 1.0f);
+        g.DrawPolygon(&pen, pts, 10);
+    } else {
+        Gdiplus::Pen pen(Gc(203, 213, 225, 210), 1.3f);
+        g.DrawPolygon(&pen, pts, 10);
+    }
+}
+
+std::wstring ToLowerStr(std::wstring s) {
+    if (!s.empty()) {
+        CharLowerBuffW(&s[0], static_cast<DWORD>(s.size()));
+    }
+    return s;
+}
+
+std::wstring FormatDurPrecise(double sec) {
+    if (sec < 0.0) sec = 0.0;
+    int m = static_cast<int>(sec) / 60;
+    double rem = sec - m * 60;
+    wchar_t buf[32] = {};
+    swprintf(buf, 32, L"%02d:%04.1f", m, rem);
+    return buf;
+}
 
 struct ThumbMsg {
     uint64_t gen = 0;
@@ -363,10 +430,12 @@ MainWindow::MainWindow(HINSTANCE hInst, RecorderApp& app, HotkeyEngine& hotkeys,
     : hInst_(hInst), app_(app), hotkeys_(hotkeys), cb_(std::move(cb)) {}
 
 MainWindow::~MainWindow() {
+    StopTrimWorker();
     CloseEmbeddedPlayer();
     StopThumbnailWorker();
     ClearThumbnails();
     if (hwnd_) {
+        KillTimer(hwnd_, TIMER_MIC_METER_ID);
         DestroyWindow(hwnd_);
         hwnd_ = nullptr;
     }
@@ -498,12 +567,21 @@ bool MainWindow::HandlePreTranslateMessage(const MSG& msg) {
     }
 
     // Embedded player keyboard shortcuts
-    if (activeTab_ == 0 && playerOpen_ && msg.message == WM_KEYDOWN) {
+    if (activeTab_ == 0 && playerOpen_ && !trimBusy_ && msg.message == WM_KEYDOWN) {
         UINT vk = static_cast<UINT>(msg.wParam);
         if (vk == VK_SPACE) { TogglePlayerPlayPause(); return true; }
         if (vk == VK_LEFT)  { SeekPlayerRelative(-5.0); return true; }
         if (vk == VK_RIGHT) { SeekPlayerRelative(+5.0); return true; }
-        if (vk == VK_ESCAPE) { CloseEmbeddedPlayer(); return true; }
+        if (vk == VK_ESCAPE) {
+            if (trimMode_) ToggleTrimMode();
+            else CloseEmbeddedPlayer();
+            return true;
+        }
+    }
+    if (activeTab_ == 0 && !playerOpen_ && msg.message == WM_KEYDOWN &&
+        msg.wParam == VK_ESCAPE && edtSearch_ && GetFocus() == edtSearch_ && !searchQuery_.empty()) {
+        SetWindowTextW(edtSearch_, L"");
+        return true;
     }
     return false;
 }
@@ -535,9 +613,19 @@ void MainWindow::CreateControls() {
         return c;
     };
 
-    // Card 1: Video (x=242..562, y=68..224)
-    makeLbl(L"Klip Süresi:", 258, 108, 95, 20);
-    cmbDuration_ = make(L"COMBOBOX", L"", CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP, 360, 105, 186, 180, ID_CMB_DURATION);
+    // Gallery search box (not added to settingsCtrls_; toggled by UpdateGalleryControlVisibility)
+    edtSearch_ = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"",
+        WS_CHILD | ES_AUTOHSCROLL | WS_TABSTOP,
+        S(242), S(48), S(256), S(24), hwnd_,
+        reinterpret_cast<HMENU>(static_cast<INT_PTR>(ID_EDT_SEARCH)), hInst_, nullptr);
+    if (edtSearch_) {
+        SendMessageW(edtSearch_, WM_SETFONT, reinterpret_cast<WPARAM>(font_), TRUE);
+        SendMessageW(edtSearch_, EM_SETCUEBANNER, TRUE, reinterpret_cast<LPARAM>(L"Klip ara..."));
+    }
+
+    // Card 1: Video (x=242..562, y=68..248)
+    makeLbl(L"Klip Süresi:", 258, 106, 95, 20);
+    cmbDuration_ = make(L"COMBOBOX", L"", CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP, 360, 103, 186, 180, ID_CMB_DURATION);
     for (int sec : kDurations) {
         wchar_t buf[64] = {};
         if (sec < 60) swprintf(buf, 64, L"Son %d sn (~23 MB)", sec);
@@ -552,60 +640,72 @@ void MainWindow::CreateControls() {
         SendMessageW(cmbResFps_, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(p.label));
     }
 
-    makeLbl(L"Bit Hızı:", 258, 180, 95, 20);
-    cmbBitrate_ = make(L"COMBOBOX", L"", CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP, 360, 177, 186, 180, ID_CMB_BITRATE);
+    makeLbl(L"Bit Hızı:", 258, 182, 95, 20);
+    cmbBitrate_ = make(L"COMBOBOX", L"", CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP, 360, 179, 186, 180, ID_CMB_BITRATE);
     SendMessageW(cmbBitrate_, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"4 Mbps (En Hafif RAM)"));
     SendMessageW(cmbBitrate_, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"6 Mbps (Dengeli 720p60)"));
     SendMessageW(cmbBitrate_, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"8 Mbps (Yüksek Kalite)"));
     SendMessageW(cmbBitrate_, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"10 Mbps (Çok Yüksek)"));
 
-    // Card 2: Audio (x=578..898, y=68..224)
-    chkGameAudio_ = makeChk(L"Oyun / Sistem Sesi", 594, 106, 134, 22, ID_CHK_GAME_AUDIO);
-    trkGameVol_ = make(TRACKBAR_CLASSW, L"", TBS_HORZ | TBS_AUTOTICKS | WS_TABSTOP, 730, 104, 114, 26, ID_TRK_GAME_VOL);
+    // Card 2: Audio & Mic Noise Gate (x=578..898, y=68..248)
+    chkGameAudio_ = makeChk(L"Oyun / Sistem Sesi", 594, 98, 134, 22, ID_CHK_GAME_AUDIO);
+    trkGameVol_ = make(TRACKBAR_CLASSW, L"", TBS_HORZ | TBS_AUTOTICKS | WS_TABSTOP, 730, 96, 114, 26, ID_TRK_GAME_VOL);
     SendMessageW(trkGameVol_, TBM_SETRANGE, TRUE, MAKELPARAM(0, 200));
     SendMessageW(trkGameVol_, TBM_SETTICFREQ, 50, 0);
-    lblGameVol_ = make(L"STATIC", L"%100", SS_RIGHT, 846, 108, 38, 20);
+    lblGameVol_ = make(L"STATIC", L"%100", SS_RIGHT, 846, 100, 38, 20);
 
-    chkMicAudio_ = makeChk(L"Mikrofon", 594, 142, 72, 22, ID_CHK_MIC_AUDIO);
-    chkMicMute_ = makeChk(L"Sustur", 668, 142, 58, 22, ID_CHK_MIC_MUTE);
-    trkMicVol_ = make(TRACKBAR_CLASSW, L"", TBS_HORZ | TBS_AUTOTICKS | WS_TABSTOP, 730, 140, 114, 26, ID_TRK_MIC_VOL);
+    chkMicAudio_ = makeChk(L"Mikrofon", 594, 130, 72, 22, ID_CHK_MIC_AUDIO);
+    chkMicMute_ = makeChk(L"Sustur", 668, 130, 58, 22, ID_CHK_MIC_MUTE);
+    trkMicVol_ = make(TRACKBAR_CLASSW, L"", TBS_HORZ | TBS_AUTOTICKS | WS_TABSTOP, 730, 128, 114, 26, ID_TRK_MIC_VOL);
     SendMessageW(trkMicVol_, TBM_SETRANGE, TRUE, MAKELPARAM(0, 200));
     SendMessageW(trkMicVol_, TBM_SETTICFREQ, 50, 0);
-    lblMicVol_ = make(L"STATIC", L"%100", SS_RIGHT, 846, 144, 38, 20);
+    lblMicVol_ = make(L"STATIC", L"%100", SS_RIGHT, 846, 132, 38, 20);
 
-    makeLbl(L"Mikrofon:", 594, 180, 65, 20);
-    cmbMicDev_ = make(L"COMBOBOX", L"", CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP, 664, 177, 218, 180, ID_CMB_MIC_DEV);
+    makeLbl(L"Cihaz:", 594, 163, 46, 20);
+    cmbMicDev_ = make(L"COMBOBOX", L"", CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP, 642, 160, 240, 180, ID_CMB_MIC_DEV);
 
-    // Card 3: Hotkeys, Folder, Notifications
-    makeLbl(L"Klip Alma Tuşu (ör. F12):", 258, 278, 165, 20);
-    edtClipHotkey_ = make(L"EDIT", L"", ES_READONLY | WS_TABSTOP, 428, 275, 196, 24, 0, WS_EX_CLIENTEDGE);
-    btnSetClipHotkey_ = make(L"BUTTON", L"Tuş Ata", BS_OWNERDRAW | WS_TABSTOP, 632, 274, 96, 26, ID_BTN_SET_CLIP_HK);
+    chkMicGate_ = makeChk(L"Gürültü Kapısı", 594, 194, 108, 22, ID_CHK_MIC_GATE);
+    trkMicGate_ = make(TRACKBAR_CLASSW, L"", TBS_HORZ | TBS_AUTOTICKS | WS_TABSTOP, 704, 192, 122, 26, ID_TRK_MIC_GATE);
+    SendMessageW(trkMicGate_, TBM_SETRANGE, TRUE, MAKELPARAM(-60, -15));
+    SendMessageW(trkMicGate_, TBM_SETTICFREQ, 5, 0);
+    lblMicGate_ = make(L"STATIC", L"-36 dB", SS_RIGHT, 828, 195, 56, 20);
 
-    makeLbl(L"Mikrofon Susturma Tuşu:", 258, 314, 165, 20);
-    edtMicHotkey_ = make(L"EDIT", L"", ES_READONLY | WS_TABSTOP, 428, 311, 196, 24, 0, WS_EX_CLIENTEDGE);
-    btnSetMicHotkey_ = make(L"BUTTON", L"Tuş Ata", BS_OWNERDRAW | WS_TABSTOP, 632, 310, 96, 26, ID_BTN_SET_MIC_HK);
-    btnClearMicHotkey_ = make(L"BUTTON", L"Temizle", BS_OWNERDRAW | WS_TABSTOP, 736, 310, 86, 26, ID_BTN_CLR_MIC_HK);
+    // Card 3: Hotkeys, Folder, Notifications (x=242..898, y=258..528)
+    makeLbl(L"Klip Alma Tuşu (ör. F12):", 258, 294, 165, 20);
+    edtClipHotkey_ = make(L"EDIT", L"", ES_READONLY | WS_TABSTOP, 428, 291, 196, 24, 0, WS_EX_CLIENTEDGE);
+    btnSetClipHotkey_ = make(L"BUTTON", L"Tuş Ata", BS_OWNERDRAW | WS_TABSTOP, 632, 290, 96, 26, ID_BTN_SET_CLIP_HK);
+
+    makeLbl(L"Mikrofon Susturma Tuşu:", 258, 328, 165, 20);
+    edtMicHotkey_ = make(L"EDIT", L"", ES_READONLY | WS_TABSTOP, 428, 325, 196, 24, 0, WS_EX_CLIENTEDGE);
+    btnSetMicHotkey_ = make(L"BUTTON", L"Tuş Ata", BS_OWNERDRAW | WS_TABSTOP, 632, 324, 96, 26, ID_BTN_SET_MIC_HK);
+    btnClearMicHotkey_ = make(L"BUTTON", L"Temizle", BS_OWNERDRAW | WS_TABSTOP, 736, 324, 86, 26, ID_BTN_CLR_MIC_HK);
 
     bool elev = HotkeyEngine::IsProcessElevated();
     wchar_t hkMsg[200] = {};
     swprintf(hkMsg, 200, L"Tuş algılama: Çift katman (RawInput + LLHook) • %ls",
         elev ? L"Yönetici Modu Aktif" : L"Normal Mod (Yönetici açılan oyunlar için yandaki butonu kullanın)");
-    lblHotkeyStatus_ = makeLbl(hkMsg, 258, 346, 488, 20);
+    lblHotkeyStatus_ = makeLbl(hkMsg, 258, 360, 488, 20);
     btnRestartAdmin_ = make(L"BUTTON", elev ? L"Yönetici Aktif" : L"Yönetici Başlat",
-        BS_OWNERDRAW | WS_TABSTOP, 752, 342, 130, 26, ID_BTN_RESTART_ADMIN);
+        BS_OWNERDRAW | WS_TABSTOP, 752, 357, 130, 26, ID_BTN_RESTART_ADMIN);
     if (elev) EnableWindow(btnRestartAdmin_, FALSE);
 
-    makeLbl(L"Kayıt Klasörü:", 258, 384, 95, 20);
-    edtOutDir_ = make(L"EDIT", L"", ES_AUTOHSCROLL | WS_TABSTOP, 358, 381, 366, 24, 0, WS_EX_CLIENTEDGE);
-    btnBrowseDir_ = make(L"BUTTON", L"Seç...", BS_OWNERDRAW | WS_TABSTOP, 732, 380, 72, 26, ID_BTN_BROWSE_DIR);
-    btnOpenDir_ = make(L"BUTTON", L"Aç", BS_OWNERDRAW | WS_TABSTOP, 810, 380, 72, 26, ID_BTN_OPEN_DIR);
+    makeLbl(L"Kayıt Klasörü:", 258, 396, 95, 20);
+    edtOutDir_ = make(L"EDIT", L"", ES_AUTOHSCROLL | WS_TABSTOP, 358, 393, 366, 24, 0, WS_EX_CLIENTEDGE);
+    btnBrowseDir_ = make(L"BUTTON", L"Seç...", BS_OWNERDRAW | WS_TABSTOP, 732, 392, 72, 26, ID_BTN_BROWSE_DIR);
+    btnOpenDir_ = make(L"BUTTON", L"Aç", BS_OWNERDRAW | WS_TABSTOP, 810, 392, 72, 26, ID_BTN_OPEN_DIR);
 
-    chkSound_ = makeChk(L"Klip alınca \"çıng\" bildirim sesi çal", 258, 424, 246, 22, ID_CHK_SOUND);
-    btnTestSound_ = make(L"BUTTON", L"Sesi Test Et", BS_OWNERDRAW | WS_TABSTOP, 512, 421, 98, 26, ID_BTN_TEST_SOUND);
-    chkAutoStart_ = makeChk(L"Windows açılışında arka planda başlat", 258, 460, 290, 22, ID_CHK_AUTOSTART);
+    chkSound_ = makeChk(L"Klip alınca \"çıng\" bildirim sesi çal", 258, 432, 246, 22, ID_CHK_SOUND);
+    btnTestSound_ = make(L"BUTTON", L"Sesi Test Et", BS_OWNERDRAW | WS_TABSTOP, 512, 429, 98, 26, ID_BTN_TEST_SOUND);
+    chkAutoStart_ = makeChk(L"Windows açılışında arka planda başlat", 258, 466, 290, 22, ID_CHK_AUTOSTART);
 
     btnApply_ = make(L"BUTTON", L"Ayarları Kaydet ve Uygula", BS_OWNERDRAW | WS_TABSTOP, 242, 540, 224, 38, ID_BTN_APPLY);
     btnExitApp_ = make(L"BUTTON", L"Uygulamayı Tamamen Kapat", BS_OWNERDRAW | WS_TABSTOP, 684, 540, 214, 38, ID_BTN_EXIT_APP);
+}
+
+void MainWindow::UpdateGalleryControlVisibility() {
+    if (edtSearch_) {
+        ShowWindow(edtSearch_, (activeTab_ == 0 && !playerOpen_) ? SW_SHOW : SW_HIDE);
+    }
 }
 
 void MainWindow::SwitchTab(int tabIndex) {
@@ -617,7 +717,12 @@ void MainWindow::SwitchTab(int tabIndex) {
     for (HWND h : settingsCtrls_) {
         ShowWindow(h, activeTab_ == 1 ? SW_SHOW : SW_HIDE);
     }
-    if (hwnd_) InvalidateRect(hwnd_, nullptr, FALSE);
+    UpdateGalleryControlVisibility();
+    if (hwnd_) {
+        if (activeTab_ == 1) SetTimer(hwnd_, TIMER_MIC_METER_ID, 120, nullptr);
+        else KillTimer(hwnd_, TIMER_MIC_METER_ID);
+        InvalidateRect(hwnd_, nullptr, FALSE);
+    }
 }
 
 void MainWindow::LoadSettingsControls() {
@@ -649,6 +754,11 @@ void MainWindow::LoadSettingsControls() {
     SendMessageW(trkMicVol_, TBM_SETPOS, TRUE, cfg.micVolumePct);
     swprintf(vbuf, 16, L"%%%d", cfg.micVolumePct);
     SetWindowTextW(lblMicVol_, vbuf);
+
+    SendMessageW(chkMicGate_, BM_SETCHECK, cfg.micNoiseGate ? BST_CHECKED : BST_UNCHECKED, 0);
+    SendMessageW(trkMicGate_, TBM_SETPOS, TRUE, cfg.micGateThresholdDb);
+    swprintf(vbuf, 16, L"%d dB", cfg.micGateThresholdDb);
+    SetWindowTextW(lblMicGate_, vbuf);
 
     micDevices_ = EnumerateMicDevices();
     SendMessageW(cmbMicDev_, CB_RESETCONTENT, 0, 0);
@@ -692,6 +802,8 @@ void MainWindow::ReadSettingsControls(AppConfig& out) {
     out.captureMic = (SendMessageW(chkMicAudio_, BM_GETCHECK, 0, 0) == BST_CHECKED);
     out.micMuted = (SendMessageW(chkMicMute_, BM_GETCHECK, 0, 0) == BST_CHECKED);
     out.micVolumePct = static_cast<int>(SendMessageW(trkMicVol_, TBM_GETPOS, 0, 0));
+    out.micNoiseGate = (SendMessageW(chkMicGate_, BM_GETCHECK, 0, 0) == BST_CHECKED);
+    out.micGateThresholdDb = static_cast<int>(SendMessageW(trkMicGate_, TBM_GETPOS, 0, 0));
 
     int micSel = static_cast<int>(SendMessageW(cmbMicDev_, CB_GETCURSEL, 0, 0));
     if (micSel <= 0 || micSel - 1 >= static_cast<int>(micDevices_.size())) out.micDeviceId.clear();
@@ -724,15 +836,16 @@ void MainWindow::StopThumbnailWorker() {
 
 void MainWindow::StartThumbnailWorker() {
     StopThumbnailWorker();
-    if (clips_.empty() || !hwnd_) return;
+    if (filteredIndices_.empty() || !hwnd_) return;
 
     thumbStop_.store(false);
     const uint64_t gen = ++thumbGen_;
     std::vector<std::wstring> paths;
-    const size_t limit = std::min<size_t>(clips_.size(), 32);
-    for (size_t i = 0; i < limit; ++i) {
-        if (thumbBmps_.find(clips_[i].filePath) == thumbBmps_.end()) {
-            paths.push_back(clips_[i].filePath);
+    const size_t limit = std::min<size_t>(filteredIndices_.size(), 32);
+    for (size_t vi = 0; vi < limit; ++vi) {
+        const auto& c = clips_[filteredIndices_[vi]];
+        if (thumbBmps_.find(c.filePath) == thumbBmps_.end()) {
+            paths.push_back(c.filePath);
         }
     }
     if (paths.empty()) return;
@@ -763,18 +876,30 @@ void MainWindow::StartThumbnailWorker() {
     });
 }
 
-void MainWindow::RefreshClips(const std::wstring& selectPath) {
-    std::wstring want = selectPath;
-    if (want.empty() && selectedIdx_ >= 0 && selectedIdx_ < static_cast<int>(clips_.size())) {
-        want = clips_[static_cast<size_t>(selectedIdx_)].filePath;
+void MainWindow::RebuildFilteredView(const std::wstring& preferPath) {
+    std::wstring want = preferPath;
+    if (want.empty() && selectedIdx_ >= 0 && selectedIdx_ < static_cast<int>(filteredIndices_.size())) {
+        want = clips_[filteredIndices_[static_cast<size_t>(selectedIdx_)]].filePath;
     }
 
-    clips_ = ScanClipsFolder(app_.Config().outputDir);
-    selectedIdx_ = clips_.empty() ? -1 : 0;
+    std::wstring qLower = ToLowerStr(searchQuery_);
+    filteredIndices_.clear();
+    filteredIndices_.reserve(clips_.size());
+    for (size_t i = 0; i < clips_.size(); ++i) {
+        const auto& c = clips_[i];
+        if (favOnly_ && !c.isFavorite) continue;
+        if (!qLower.empty()) {
+            std::wstring nameLower = ToLowerStr(c.fileName);
+            if (nameLower.find(qLower) == std::wstring::npos) continue;
+        }
+        filteredIndices_.push_back(i);
+    }
+
+    selectedIdx_ = filteredIndices_.empty() ? -1 : 0;
     if (!want.empty()) {
-        for (size_t i = 0; i < clips_.size(); ++i) {
-            if (_wcsicmp(clips_[i].filePath.c_str(), want.c_str()) == 0) {
-                selectedIdx_ = static_cast<int>(i);
+        for (size_t vi = 0; vi < filteredIndices_.size(); ++vi) {
+            if (_wcsicmp(clips_[filteredIndices_[vi]].filePath.c_str(), want.c_str()) == 0) {
+                selectedIdx_ = static_cast<int>(vi);
                 break;
             }
         }
@@ -783,6 +908,16 @@ void MainWindow::RefreshClips(const std::wstring& selectPath) {
     ClampScroll();
     StartThumbnailWorker();
     if (hwnd_) InvalidateRect(hwnd_, nullptr, FALSE);
+}
+
+void MainWindow::RefreshClips(const std::wstring& selectPath) {
+    std::wstring want = selectPath;
+    if (want.empty() && selectedIdx_ >= 0 && selectedIdx_ < static_cast<int>(filteredIndices_.size())) {
+        want = clips_[filteredIndices_[static_cast<size_t>(selectedIdx_)]].filePath;
+    }
+
+    clips_ = ScanClipsFolder(app_.Config().outputDir, GetFavoritesFilePath());
+    RebuildFilteredView(want);
 }
 
 // ================= EMBEDDED MFPLAY PLAYER =================
@@ -825,8 +960,8 @@ LRESULT CALLBACK MainWindow::VideoHostProc(HWND hwnd, UINT msg, WPARAM wParam, L
     return DefWindowProcW(hwnd, msg, wParam, lParam);
 }
 
-void MainWindow::OpenEmbeddedPlayer(int clipIndex) {
-    if (clipIndex < 0 || clipIndex >= static_cast<int>(clips_.size()) || !hwnd_) return;
+void MainWindow::OpenEmbeddedPlayer(int viewIdx) {
+    if (viewIdx < 0 || viewIdx >= static_cast<int>(filteredIndices_.size()) || !hwnd_) return;
     CloseEmbeddedPlayer();
 
     static bool vReg = false;
@@ -842,9 +977,10 @@ void MainWindow::OpenEmbeddedPlayer(int clipIndex) {
         vReg = true;
     }
 
-    const auto& clip = clips_[static_cast<size_t>(clipIndex)];
-    selectedIdx_ = clipIndex;
-    playerClipIdx_ = clipIndex;
+    const size_t rawIdx = filteredIndices_[static_cast<size_t>(viewIdx)];
+    const auto& clip = clips_[rawIdx];
+    selectedIdx_ = viewIdx;
+    playerClipIdx_ = static_cast<int>(rawIdx);
     playerClipPath_ = clip.filePath;
     playerClipTitle_ = StripMp4Ext(clip.fileName);
     playerDurSec_ = clip.durationSeconds;
@@ -853,9 +989,13 @@ void MainWindow::OpenEmbeddedPlayer(int clipIndex) {
     playerPlaying_ = false;
     playerEnded_ = false;
     playerRate_ = 1.0f;
+    trimMode_ = false;
+    trimStartSec_ = 0.0;
+    trimEndSec_ = (clip.durationSeconds > 0.2) ? clip.durationSeconds : 1.0;
+    draggingTrim_ = 0;
 
     videoHwnd_ = CreateWindowExW(0, vCls, L"", WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS,
-        S(242), S(66), S(656), S(369), hwnd_, nullptr, hInst_, this);
+        S(250), S(62), S(640), S(360), hwnd_, nullptr, hInst_, this);
     if (!videoHwnd_) return;
 
     ++playerGen_;
@@ -872,11 +1012,13 @@ void MainWindow::OpenEmbeddedPlayer(int clipIndex) {
     }
 
     playerOpen_ = true;
+    UpdateGalleryControlVisibility();
     SetTimer(hwnd_, TIMER_PLAYER_ID, 80, nullptr);
     InvalidateRect(hwnd_, nullptr, FALSE);
 }
 
 void MainWindow::CloseEmbeddedPlayer() {
+    StopTrimWorker();
     if (hwnd_) KillTimer(hwnd_, TIMER_PLAYER_ID);
     ++playerGen_;
     if (playerCb_) {
@@ -899,6 +1041,98 @@ void MainWindow::CloseEmbeddedPlayer() {
     playerEnded_ = false;
     draggingSeek_ = false;
     draggingVol_ = false;
+    trimMode_ = false;
+    draggingTrim_ = 0;
+    trimBusy_ = false;
+    UpdateGalleryControlVisibility();
+    if (hwnd_) InvalidateRect(hwnd_, nullptr, FALSE);
+}
+
+void MainWindow::StopTrimWorker() {
+    trimCancel_.store(true);
+    if (trimThread_.joinable()) {
+        trimThread_.join();
+    }
+    trimCancel_.store(false);
+    trimBusy_ = false;
+}
+
+void MainWindow::ToggleTrimMode() {
+    if (!playerOpen_ || trimBusy_) return;
+    trimMode_ = !trimMode_;
+    if (trimMode_) {
+        double dur = (playerDurSec_ > 0.2) ? playerDurSec_ : 1.0;
+        trimStartSec_ = 0.0;
+        trimEndSec_ = dur;
+    }
+    RECT ctrlRc{ S(242), S(428), S(900), S(606) };
+    InvalidateRect(hwnd_, &ctrlRc, FALSE);
+}
+
+void MainWindow::StartTrimAsync(bool replaceOriginal) {
+    if (!playerOpen_ || trimBusy_ || playerClipPath_.empty()) return;
+    double dur = (playerDurSec_ > 0.2) ? playerDurSec_ : 1.0;
+    double tStart = std::max(0.0, std::min(dur - 0.2, trimStartSec_));
+    double tEnd   = std::max(tStart + 0.2, std::min(dur, trimEndSec_));
+    if (tEnd - tStart < 0.2) {
+        SetFooterMessage(L"Kırpma aralığı en az 0.2 saniye olmalı.");
+        return;
+    }
+
+    StopTrimWorker();
+    trimCancel_.store(false);
+    trimBusy_ = true;
+
+    // Release active MFPlay reader/decoder handle cleanly so the source MP4 has zero lock
+    if (hwnd_) KillTimer(hwnd_, TIMER_PLAYER_ID);
+    ++playerGen_;
+    if (playerCb_) {
+        playerCb_->Detach();
+        playerCb_->Release();
+        playerCb_ = nullptr;
+    }
+    if (player_) {
+        player_->Shutdown();
+        player_->Release();
+        player_ = nullptr;
+    }
+    playerReady_ = false;
+    playerPlaying_ = false;
+    if (videoHwnd_) ShowWindow(videoHwnd_, SW_HIDE);
+
+    const std::wstring origPath = playerClipPath_;
+    const std::wstring outPath = replaceOriginal
+        ? (origPath + L".trim.tmp.mp4")
+        : BuildTrimmedCopyPath(origPath);
+
+    SetFooterMessage(replaceOriginal
+        ? L"Ana klip kırpılıyor, lütfen bekleyin..."
+        : L"Kesitten yeni kopya oluşturuluyor...");
+
+    HWND target = hwnd_;
+    trimThread_ = std::thread([this, target, origPath, outPath, tStart, tEnd, replaceOriginal]() {
+        ComScope com(COINIT_MULTITHREADED);
+        std::string errUtf8;
+        bool ok = TrimMp4Clip(origPath, outPath, tStart, tEnd, errUtf8, &trimCancel_);
+        if (trimCancel_.load()) {
+            DeleteFileW(outPath.c_str());
+            return;
+        }
+        auto* m = new TrimDoneMsg{};
+        m->ok = ok;
+        m->replaceOriginal = replaceOriginal;
+        m->origPath = origPath;
+        m->outPath = outPath;
+        if (!ok) {
+            int wlen = MultiByteToWideChar(CP_UTF8, 0, errUtf8.c_str(), -1, nullptr, 0);
+            std::wstring werr(wlen > 0 ? wlen - 1 : 0, L'\0');
+            if (wlen > 1) MultiByteToWideChar(CP_UTF8, 0, errUtf8.c_str(), -1, &werr[0], wlen);
+            m->message = L"Kırpma başarısız: " + werr;
+        }
+        if (!PostMessageW(target, WM_MW_TRIM_DONE, 0, reinterpret_cast<LPARAM>(m))) {
+            delete m;
+        }
+    });
     if (hwnd_) InvalidateRect(hwnd_, nullptr, FALSE);
 }
 
@@ -916,7 +1150,7 @@ void MainWindow::TogglePlayerPlayPause() {
         player_->Play();
         playerPlaying_ = true;
     }
-    RECT ctrlRc{ S(242), S(442), S(900), S(570) };
+    RECT ctrlRc{ S(242), S(428), S(900), S(606) };
     InvalidateRect(hwnd_, &ctrlRc, FALSE);
 }
 
@@ -935,7 +1169,7 @@ void MainWindow::SeekPlayerAbsolute(double targetSec) {
     }
     PropVariantClear(&pos);
 
-    RECT ctrlRc{ S(242), S(442), S(900), S(570) };
+    RECT ctrlRc{ S(242), S(428), S(900), S(606) };
     InvalidateRect(hwnd_, &ctrlRc, FALSE);
 }
 
@@ -952,14 +1186,14 @@ void MainWindow::SetPlayerVolume(float vol01) {
             player_->SetMute(FALSE);
         }
     }
-    RECT ctrlRc{ S(242), S(442), S(900), S(570) };
+    RECT ctrlRc{ S(242), S(428), S(900), S(606) };
     InvalidateRect(hwnd_, &ctrlRc, FALSE);
 }
 
 void MainWindow::TogglePlayerMute() {
     playerMuted_ = !playerMuted_;
     if (player_) player_->SetMute(playerMuted_ ? TRUE : FALSE);
-    RECT ctrlRc{ S(242), S(442), S(900), S(570) };
+    RECT ctrlRc{ S(242), S(428), S(900), S(606) };
     InvalidateRect(hwnd_, &ctrlRc, FALSE);
 }
 
@@ -969,13 +1203,13 @@ void MainWindow::CyclePlayerRate() {
     else if (playerRate_ < 1.75f) playerRate_ = 2.0f;
     else playerRate_ = 0.5f;
     if (player_) player_->SetRate(playerRate_);
-    RECT ctrlRc{ S(242), S(442), S(900), S(570) };
+    RECT ctrlRc{ S(242), S(428), S(900), S(606) };
     InvalidateRect(hwnd_, &ctrlRc, FALSE);
 }
 
 void MainWindow::UpdatePlayerMetrics() {
     if (!player_ || !playerReady_) return;
-    if (!draggingSeek_) {
+    if (!draggingSeek_ && draggingTrim_ == 0) {
         PROPVARIANT pos;
         PropVariantInit(&pos);
         if (SUCCEEDED(player_->GetPosition(MFP_POSITIONTYPE_100NS, &pos)) && pos.vt == VT_I8) {
@@ -987,28 +1221,28 @@ void MainWindow::UpdatePlayerMetrics() {
     if (SUCCEEDED(player_->GetState(&st))) {
         playerPlaying_ = (st == MFP_MEDIAPLAYER_STATE_PLAYING);
     }
-    RECT ctrlRc{ S(242), S(442), S(900), S(566) };
+    RECT ctrlRc{ S(242), S(428), S(900), S(606) };
     InvalidateRect(hwnd_, &ctrlRc, FALSE);
 }
 
 RECT MainWindow::GetSeekBarRect() const {
-    return RECT{ S(254), S(454), S(886), S(478) };
+    return RECT{ S(254), S(442), S(886), S(466) };
 }
 
 RECT MainWindow::GetVolumeBarRect() const {
-    return RECT{ S(794), S(518), S(886), S(542) };
+    return RECT{ S(780), S(500), S(886), S(524) };
 }
 
 // ================= GALLERY & HIT TESTING =================
 
 RECT MainWindow::GetGridViewportRect() const {
-    return RECT{ S(242), S(74), S(898), S(532) };
+    return RECT{ S(242), S(82), S(898), S(534) };
 }
 
 void MainWindow::ClampScroll() {
     RECT vp = GetGridViewportRect();
     int vpH = vp.bottom - vp.top;
-    int rows = (static_cast<int>(clips_.size()) + 1) / 2;
+    int rows = (static_cast<int>(filteredIndices_.size()) + 1) / 2;
     int totalH = rows > 0 ? (rows * S(226) + (rows - 1) * S(14)) : 0;
     maxScrollY_ = std::max(0, totalH - vpH);
     scrollY_ = std::max(0, std::min(maxScrollY_, scrollY_));
@@ -1024,16 +1258,56 @@ int MainWindow::HitTestCard(int mx, int my) const {
     const int gapX = S(16);
     const int gapY = S(14);
 
-    for (size_t i = 0; i < clips_.size(); ++i) {
-        int col = static_cast<int>(i % 2);
-        int row = static_cast<int>(i / 2);
+    for (size_t vi = 0; vi < filteredIndices_.size(); ++vi) {
+        int col = static_cast<int>(vi % 2);
+        int row = static_cast<int>(vi / 2);
         int x = vp.left + col * (cardW + gapX);
         int y = vp.top + row * (cardH + gapY) - scrollY_;
         if (mx >= x && mx <= x + cardW && my >= y && my <= y + cardH) {
-            return static_cast<int>(i);
+            return static_cast<int>(vi);
         }
     }
     return -1;
+}
+
+int MainWindow::HitTestCardStar(int mx, int my) const {
+    if (activeTab_ != 0 || playerOpen_) return -1;
+    RECT vp = GetGridViewportRect();
+    if (mx < vp.left || mx > vp.right - S(12) || my < vp.top || my > vp.bottom) return -1;
+
+    const int cardW = S(312);
+    const int cardH = S(226);
+    const int gapX = S(16);
+    const int gapY = S(14);
+
+    for (size_t vi = 0; vi < filteredIndices_.size(); ++vi) {
+        int col = static_cast<int>(vi % 2);
+        int row = static_cast<int>(vi / 2);
+        int cx = vp.left + col * (cardW + gapX);
+        int cy = vp.top + row * (cardH + gapY) - scrollY_;
+        int tx = cx + S(7), ty = cy + S(7), tw = S(298);
+        int sx = tx + tw - S(32), sy = ty + S(6);
+        if (mx >= sx && mx <= sx + S(26) && my >= sy && my <= sy + S(24)) {
+            return static_cast<int>(vi);
+        }
+    }
+    return -1;
+}
+
+int MainWindow::HitTestTrimHandle(int mx, int my) const {
+    if (activeTab_ != 0 || !playerOpen_ || !trimMode_ || trimBusy_) return 0;
+    RECT sk = GetSeekBarRect();
+    if (my < sk.top - S(4) || my > sk.bottom + S(4)) return 0;
+    double dur = (playerDurSec_ > 0.05) ? playerDurSec_ : 1.0;
+    int skW = sk.right - sk.left;
+    int xStart = sk.left + static_cast<int>(skW * std::max(0.0, std::min(1.0, trimStartSec_ / dur)));
+    int xEnd   = sk.left + static_cast<int>(skW * std::max(0.0, std::min(1.0, trimEndSec_ / dur)));
+    int dStart = std::abs(mx - xStart);
+    int dEnd   = std::abs(mx - xEnd);
+    const int tol = S(11);
+    if (dStart <= tol && dStart <= dEnd) return 1;
+    if (dEnd <= tol) return 2;
+    return 0;
 }
 
 int MainWindow::HitTestCustomButton(int mx, int my) const {
@@ -1055,27 +1329,45 @@ void MainWindow::UpdateHover(int mx, int my) {
     }
 }
 
+void MainWindow::ToggleFavoriteForViewIdx(int viewIdx) {
+    int vi = (viewIdx >= 0) ? viewIdx : selectedIdx_;
+    if (vi < 0 || vi >= static_cast<int>(filteredIndices_.size())) return;
+    size_t rawIdx = filteredIndices_[static_cast<size_t>(vi)];
+    ClipItem& item = clips_[rawIdx];
+    item.isFavorite = !item.isFavorite;
+    SetClipFavorite(GetFavoritesFilePath(), item.fileName, item.isFavorite);
+    SetFooterMessage(item.isFavorite ? L"Klip favorilere eklendi." : L"Klip favorilerden çıkarıldı.");
+    if (favOnly_ && !playerOpen_) {
+        RebuildFilteredView();
+    } else if (hwnd_) {
+        InvalidateRect(hwnd_, nullptr, FALSE);
+    }
+}
+
 void MainWindow::PlaySelected() {
-    if (selectedIdx_ < 0 || selectedIdx_ >= static_cast<int>(clips_.size())) return;
+    if (selectedIdx_ < 0 || selectedIdx_ >= static_cast<int>(filteredIndices_.size())) return;
     OpenEmbeddedPlayer(selectedIdx_);
 }
 
 void MainWindow::PlayExternalSelected() {
-    if (selectedIdx_ < 0 || selectedIdx_ >= static_cast<int>(clips_.size())) return;
-    ShellExecuteW(nullptr, L"open", clips_[static_cast<size_t>(selectedIdx_)].filePath.c_str(),
-        nullptr, nullptr, SW_SHOWNORMAL);
+    if (selectedIdx_ < 0 || selectedIdx_ >= static_cast<int>(filteredIndices_.size())) return;
+    const auto& c = clips_[filteredIndices_[static_cast<size_t>(selectedIdx_)]];
+    ShellExecuteW(nullptr, L"open", c.filePath.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
 }
 
 void MainWindow::RevealSelected() {
-    if (selectedIdx_ < 0 || selectedIdx_ >= static_cast<int>(clips_.size())) return;
-    std::wstring param = L"/select,\"" + clips_[static_cast<size_t>(selectedIdx_)].filePath + L"\"";
+    if (selectedIdx_ < 0 || selectedIdx_ >= static_cast<int>(filteredIndices_.size())) return;
+    const auto& c = clips_[filteredIndices_[static_cast<size_t>(selectedIdx_)]];
+    std::wstring param = L"/select,\"" + c.filePath + L"\"";
     ShellExecuteW(nullptr, L"open", L"explorer.exe", param.c_str(), nullptr, SW_SHOWNORMAL);
 }
 
 void MainWindow::RenameSelected() {
-    if (selectedIdx_ < 0 || selectedIdx_ >= static_cast<int>(clips_.size())) return;
-    const std::wstring oldPath = clips_[static_cast<size_t>(selectedIdx_)].filePath;
-    std::wstring stem = StripMp4Ext(clips_[static_cast<size_t>(selectedIdx_)].fileName);
+    if (selectedIdx_ < 0 || selectedIdx_ >= static_cast<int>(filteredIndices_.size())) return;
+    const auto& c = clips_[filteredIndices_[static_cast<size_t>(selectedIdx_)]];
+    const std::wstring oldPath = c.filePath;
+    const std::wstring oldName = c.fileName;
+    std::wstring stem = StripMp4Ext(oldName);
     if (!ShowRenamePopup(hwnd_, hInst_, dpi_, font_, stem)) return;
 
     bool wasPlayingThis = (playerOpen_ && _wcsicmp(playerClipPath_.c_str(), oldPath.c_str()) == 0);
@@ -1083,6 +1375,11 @@ void MainWindow::RenameSelected() {
 
     std::wstring newPath;
     if (RenameClipFile(oldPath, stem, newPath)) {
+        size_t sl = newPath.find_last_of(L"\\/");
+        std::wstring newName = (sl != std::wstring::npos) ? newPath.substr(sl + 1) : newPath;
+        UpdateFavoriteOnRename(GetFavoritesFilePath(), oldName, newName);
+        InvalidateClipMetadata(oldPath);
+
         auto it = thumbBmps_.find(oldPath);
         if (it != thumbBmps_.end()) {
             thumbBmps_[newPath] = it->second;
@@ -1097,8 +1394,8 @@ void MainWindow::RenameSelected() {
 }
 
 void MainWindow::DeleteSelected() {
-    if (selectedIdx_ < 0 || selectedIdx_ >= static_cast<int>(clips_.size())) return;
-    const auto c = clips_[static_cast<size_t>(selectedIdx_)];
+    if (selectedIdx_ < 0 || selectedIdx_ >= static_cast<int>(filteredIndices_.size())) return;
+    const auto c = clips_[filteredIndices_[static_cast<size_t>(selectedIdx_)]];
     std::wstring msg = L"'" + c.fileName + L"' çöp kutusuna gönderilsin mi?";
     if (MessageBoxW(hwnd_, msg.c_str(), L"Klibi Sil", MB_YESNO | MB_ICONQUESTION) != IDYES) return;
 
@@ -1107,6 +1404,8 @@ void MainWindow::DeleteSelected() {
     }
 
     if (TrashClipFile(c.filePath)) {
+        SetClipFavorite(GetFavoritesFilePath(), c.fileName, false);
+        InvalidateClipMetadata(c.filePath);
         auto it = thumbBmps_.find(c.filePath);
         if (it != thumbBmps_.end()) {
             if (it->second) DeleteObject(it->second);
@@ -1296,69 +1595,113 @@ void MainWindow::PaintWindow(HDC targetDc) {
             Gdiplus::RectF((float)S(16), (float)S(582), (float)S(188), (float)S(20)), &sfCenter, &brMuted);
 
         if (activeTab_ == 0 && playerOpen_) {
-            // ================= TAB 0 (EMBEDDED VIDEO PLAYER) =================
-            addBtn(BTN_PLY_BACK, 242, 18, 132, 34, L"←  Kliplere Dön", Gc(28, 34, 47), Gc(40, 49, 68), Gc(54, 66, 90));
+            // ================= TAB 0 (EMBEDDED VIDEO PLAYER + TRIM) =================
+            bool curFav = false;
+            for (const auto& cc : clips_) {
+                if (_wcsicmp(cc.filePath.c_str(), playerClipPath_.c_str()) == 0) {
+                    curFav = cc.isFavorite;
+                    break;
+                }
+            }
+            addBtn(BTN_PLY_BACK, 242, 18, 114, 34, L"←  Kliplere", Gc(28, 34, 47), Gc(40, 49, 68), Gc(54, 66, 90), !trimBusy_);
             g.DrawString(playerClipTitle_.c_str(), -1, &fBold,
-                Gdiplus::RectF((float)S(386), (float)S(16), (float)S(230), (float)S(22)), &sfLeft, &brText);
-            g.DrawString(L"Space: Oynat/Duraklat  •  ←/→: ±5sn  •  Esc: Geri", -1, &fSmall,
-                Gdiplus::RectF((float)S(386), (float)S(36), (float)S(250), (float)S(16)), &sfLeft, &brMuted);
+                Gdiplus::RectF((float)S(364), (float)S(16), (float)S(194), (float)S(20)), &sfLeft, &brText);
+            g.DrawString(L"Space: Oynat • ←/→: ±5sn • Esc: Geri", -1, &fSmall,
+                Gdiplus::RectF((float)S(364), (float)S(36), (float)S(198), (float)S(16)), &sfLeft, &brMuted);
 
-            addBtn(BTN_PLY_RENAME, 644, 18, 86, 34, L"Adlandır", Gc(28, 34, 47), Gc(40, 49, 68), Gc(52, 64, 86));
-            addBtn(BTN_PLY_FOLDER, 738, 18, 92, 34, L"Klasörde Aç", Gc(28, 34, 47), Gc(40, 49, 68), Gc(52, 64, 86));
-            addBtn(BTN_PLY_DELETE, 838, 18, 60, 34, L"Sil", Gc(153, 27, 27), Gc(185, 28, 28), Gc(220, 38, 38));
+            addBtn(BTN_PLY_FAV, 564, 18, 74, 34, curFav ? L"★ Fav" : L"☆ Fav",
+                curFav ? Gc(92, 68, 14) : Gc(28, 34, 47),
+                curFav ? Gc(120, 88, 18) : Gc(40, 49, 68),
+                curFav ? Gc(250, 204, 21) : Gc(52, 64, 86), !trimBusy_);
+            addBtn(BTN_PLY_RENAME, 644, 18, 84, 34, L"Adlandır", Gc(28, 34, 47), Gc(40, 49, 68), Gc(52, 64, 86), !trimBusy_);
+            addBtn(BTN_PLY_FOLDER, 734, 18, 94, 34, L"Klasörde Aç", Gc(28, 34, 47), Gc(40, 49, 68), Gc(52, 64, 86), !trimBusy_);
+            addBtn(BTN_PLY_DELETE, 834, 18, 64, 34, L"Sil", Gc(153, 27, 27), Gc(185, 28, 28), Gc(220, 38, 38), !trimBusy_);
 
-            // Frame border around child video HWND (242, 66, 656, 369)
-            StrokeRoundRect(g, (float)S(241), (float)S(65), (float)S(658), (float)S(371), 4.0f, Gc(45, 55, 74), 1.0f);
+            // Frame border around child video HWND (250, 62, 640, 360)
+            StrokeRoundRect(g, (float)S(249), (float)S(61), (float)S(642), (float)S(362), 4.0f, Gc(45, 55, 74), 1.0f);
+            if (trimBusy_) {
+                FillRoundRect(g, (float)S(250), (float)S(62), (float)S(640), (float)S(360), 4.0f, Gc(15, 19, 27));
+                g.DrawString(L"✂  Klip kırpılıyor, lütfen bekleyin...", -1, &fTitle,
+                    Gdiplus::RectF((float)S(250), (float)S(62), (float)S(640), (float)S(360)), &sfCenter, &brText);
+            }
 
-            // Control card below video (242, 444, 656, 156)
-            FillRoundRect(g, (float)S(242), (float)S(444), (float)S(656), (float)S(156), (float)S(12), Gc(20, 25, 35));
-            StrokeRoundRect(g, (float)S(242), (float)S(444), (float)S(656), (float)S(156), (float)S(12), Gc(40, 48, 65));
+            // Control card below video (242, 430, 656, 174)
+            FillRoundRect(g, (float)S(242), (float)S(430), (float)S(656), (float)S(174), (float)S(12), Gc(20, 25, 35));
+            StrokeRoundRect(g, (float)S(242), (float)S(430), (float)S(656), (float)S(174), (float)S(12), Gc(40, 48, 65));
 
-            // Seekbar track
+            // Seekbar track + optional trim highlight & handles
             RECT sk = GetSeekBarRect();
             float skW = static_cast<float>(sk.right - sk.left);
             float trackY = static_cast<float>(sk.top + (sk.bottom - sk.top) / 2 - S(3));
             float trackH = static_cast<float>(S(6));
             FillRoundRect(g, (float)sk.left, trackY, skW, trackH, (float)S(3), Gc(42, 51, 68));
-            double ratio = (playerDurSec_ > 0.05) ? std::max(0.0, std::min(1.0, playerPosSec_ / playerDurSec_)) : 0.0;
+
+            double dur = (playerDurSec_ > 0.05) ? playerDurSec_ : 1.0;
+            double ratio = std::max(0.0, std::min(1.0, playerPosSec_ / dur));
             float fillW = static_cast<float>(skW * ratio);
             if (fillW > 2.0f) {
                 FillRoundRect(g, (float)sk.left, trackY, fillW, trackH, (float)S(3), Gc(59, 130, 246));
             }
+            if (trimMode_) {
+                double sr0 = std::max(0.0, std::min(1.0, trimStartSec_ / dur));
+                double sr1 = std::max(sr0, std::min(1.0, trimEndSec_ / dur));
+                float xs = static_cast<float>(sk.left) + static_cast<float>(skW * sr0);
+                float xe = static_cast<float>(sk.left) + static_cast<float>(skW * sr1);
+                if (xe - xs >= 2.0f) {
+                    FillRoundRect(g, xs, trackY - S(1), xe - xs, trackH + S(2), (float)S(3), Gc(16, 185, 129, 200));
+                }
+                FillRoundRect(g, xs - S(4), trackY - S(7), (float)S(8), (float)S(20), (float)S(3), Gc(34, 197, 94));
+                FillRoundRect(g, xe - S(4), trackY - S(7), (float)S(8), (float)S(20), (float)S(3), Gc(245, 158, 11));
+            }
+
             float knobX = static_cast<float>(sk.left) + fillW;
-            float knobR = static_cast<float>(draggingSeek_ ? S(8) : S(7));
+            float knobR = static_cast<float>(draggingSeek_ ? S(8) : S(6));
             Gdiplus::SolidBrush knobGlow(Gc(59, 130, 246, 90));
             g.FillEllipse(&knobGlow, knobX - knobR - S(3), trackY + trackH * 0.5f - knobR - S(3), (knobR + S(3)) * 2.0f, (knobR + S(3)) * 2.0f);
             Gdiplus::SolidBrush knobBr(Gc(248, 250, 252));
             g.FillEllipse(&knobBr, knobX - knobR, trackY + trackH * 0.5f - knobR, knobR * 2.0f, knobR * 2.0f);
 
-            // Time display & speed label
+            // Time display & trim range label
             wchar_t timeTxt[64] = {};
             swprintf(timeTxt, 64, L"%ls  /  %ls",
                 FormatDurClock(playerPosSec_).c_str(), FormatDurClock(playerDurSec_).c_str());
             g.DrawString(timeTxt, -1, &fBold,
-                Gdiplus::RectF((float)S(254), (float)S(480), (float)S(200), (float)S(22)), &sfLeft, &brText);
+                Gdiplus::RectF((float)S(254), (float)S(468), (float)S(150), (float)S(22)), &sfLeft, &brText);
 
-            if (!playerReady_) {
+            if (trimMode_) {
+                double spanSec = std::max(0.0, trimEndSec_ - trimStartSec_);
+                wchar_t trimInfo[128] = {};
+                swprintf(trimInfo, 128, L"Seçili kesit: %ls  →  %ls  (%.1f sn)",
+                    FormatDurPrecise(trimStartSec_).c_str(), FormatDurPrecise(trimEndSec_).c_str(), spanSec);
+                Gdiplus::SolidBrush brMint(Gc(110, 231, 183));
+                g.DrawString(trimInfo, -1, &fSmall,
+                    Gdiplus::RectF((float)S(410), (float)S(468), (float)S(476), (float)S(22)), &sfLeft, &brMint);
+            } else if (!playerReady_ && !trimBusy_) {
                 g.DrawString(L"Video hazırlanıyor...", -1, &fSmall,
-                    Gdiplus::RectF((float)S(460), (float)S(480), (float)S(200), (float)S(22)), &sfLeft, &brMuted);
+                    Gdiplus::RectF((float)S(416), (float)S(468), (float)S(200), (float)S(22)), &sfLeft, &brMuted);
             }
 
             // Transport buttons
-            addBtn(BTN_PLY_PLAYPAUSE, 254, 512, 120, 36,
+            bool canPlay = playerReady_ && !trimBusy_;
+            addBtn(BTN_PLY_PLAYPAUSE, 254, 494, 102, 34,
                 playerPlaying_ ? L"⏸  Duraklat" : (playerEnded_ ? L"↻  Tekrar" : L"▶  Oynat"),
-                Gc(37, 99, 235), Gc(59, 130, 246), Gc(96, 165, 250, 150), playerReady_);
-            addBtn(BTN_PLY_MINUS5, 382, 512, 68, 36, L"-5 sn", Gc(32, 39, 53), Gc(44, 54, 72), Gc(56, 68, 90), playerReady_);
-            addBtn(BTN_PLY_PLUS5, 458, 512, 68, 36, L"+5 sn", Gc(32, 39, 53), Gc(44, 54, 72), Gc(56, 68, 90), playerReady_);
-            addBtn(BTN_PLY_RESTART, 534, 512, 76, 36, L"Başa", Gc(32, 39, 53), Gc(44, 54, 72), Gc(56, 68, 90), playerReady_);
+                Gc(37, 99, 235), Gc(59, 130, 246), Gc(96, 165, 250, 150), canPlay);
+            addBtn(BTN_PLY_MINUS5, 362, 494, 54, 34, L"-5 sn", Gc(32, 39, 53), Gc(44, 54, 72), Gc(56, 68, 90), canPlay);
+            addBtn(BTN_PLY_PLUS5, 422, 494, 54, 34, L"+5 sn", Gc(32, 39, 53), Gc(44, 54, 72), Gc(56, 68, 90), canPlay);
+            addBtn(BTN_PLY_RESTART, 482, 494, 56, 34, L"Başa", Gc(32, 39, 53), Gc(44, 54, 72), Gc(56, 68, 90), canPlay);
 
             wchar_t rateStr[16] = {};
             swprintf(rateStr, 16, L"%.1fx", playerRate_);
-            addBtn(BTN_PLY_RATE, 618, 512, 56, 36, rateStr, Gc(32, 39, 53), Gc(44, 54, 72), Gc(56, 68, 90), playerReady_);
+            addBtn(BTN_PLY_RATE, 544, 494, 48, 34, rateStr, Gc(32, 39, 53), Gc(44, 54, 72), Gc(56, 68, 90), canPlay);
 
-            addBtn(BTN_PLY_MUTE, 738, 512, 48, 36, playerMuted_ ? L"Sessiz" : L"Ses",
+            addBtn(BTN_PLY_TRIM, 600, 494, 92, 34, L"✂  Kırp",
+                trimMode_ ? Gc(13, 148, 136) : Gc(32, 39, 53),
+                trimMode_ ? Gc(20, 184, 166) : Gc(44, 54, 72),
+                trimMode_ ? Gc(94, 234, 212) : Gc(56, 68, 90), canPlay);
+
+            addBtn(BTN_PLY_MUTE, 726, 494, 48, 34, playerMuted_ ? L"Sessiz" : L"Ses",
                 playerMuted_ ? Gc(180, 83, 9) : Gc(32, 39, 53),
-                playerMuted_ ? Gc(217, 119, 6) : Gc(44, 54, 72), Gc(56, 68, 90), playerReady_);
+                playerMuted_ ? Gc(217, 119, 6) : Gc(44, 54, 72), Gc(56, 68, 90), canPlay);
 
             // Volume slider bar
             RECT vb = GetVolumeBarRect();
@@ -1372,34 +1715,69 @@ void MainWindow::PaintWindow(HDC targetDc) {
             float vKnobX = static_cast<float>(vb.left) + vFill;
             g.FillEllipse(&knobBr, vKnobX - S(6), vbY + S(3) - S(6), (float)S(12), (float)S(12));
 
-            addBtn(BTN_PLY_EXTERNAL, 742, 558, 144, 30, L"Dış Oynatıcıda Aç", Gc(26, 32, 44), Gc(38, 46, 64), Gc(48, 58, 78));
-            g.DrawString(footerMsg_.c_str(), -1, &fSmall,
-                Gdiplus::RectF((float)S(254), (float)S(562), (float)S(476), (float)S(22)), &sfLeft, &brMuted);
+            if (trimMode_) {
+                bool validSpan = canPlay && (trimEndSec_ - trimStartSec_ >= 0.2);
+                addBtn(BTN_TRIM_SET_START, 254, 536, 104, 30, L"[  Başlangıç", Gc(20, 83, 45), Gc(22, 101, 52), Gc(74, 222, 128), canPlay);
+                addBtn(BTN_TRIM_SET_END, 364, 536, 90, 30, L"Bitiş  ]", Gc(120, 53, 15), Gc(146, 64, 14), Gc(251, 191, 36), canPlay);
+                addBtn(BTN_TRIM_SAVE_COPY, 462, 536, 148, 30, L"Yeni Kopya Kaydet", Gc(37, 99, 235), Gc(59, 130, 246), Gc(96, 165, 250), validSpan);
+                addBtn(BTN_TRIM_REPLACE, 616, 536, 132, 30, L"Ana Klip Yap", Gc(13, 148, 136), Gc(20, 184, 166), Gc(94, 234, 212), validSpan);
+                addBtn(BTN_TRIM_CANCEL, 754, 536, 68, 30, L"İptal", Gc(32, 39, 53), Gc(44, 54, 72), Gc(56, 68, 90), !trimBusy_);
+                g.DrawString(trimBusy_
+                    ? footerMsg_.c_str()
+                    : L"İpucu: Yeşil/turuncu tutamaçları sürükleyin veya istediğiniz anda Başlangıç / Bitiş'e basın.",
+                    -1, &fSmall, Gdiplus::RectF((float)S(254), (float)S(574), (float)S(632), (float)S(22)), &sfLeft, &brMuted);
+            } else {
+                addBtn(BTN_PLY_EXTERNAL, 742, 566, 144, 30, L"Dış Oynatıcıda Aç", Gc(26, 32, 44), Gc(38, 46, 64), Gc(48, 58, 78));
+                g.DrawString(footerMsg_.c_str(), -1, &fSmall,
+                    Gdiplus::RectF((float)S(254), (float)S(570), (float)S(476), (float)S(22)), &sfLeft, &brMuted);
+            }
         } else if (activeTab_ == 0) {
-            // ================= TAB 0: KLİPLERİM (GALLERY) =================
+            // ================= TAB 0: KLİPLERİM (GALLERY + FAVORITES + SEARCH) =================
             g.DrawString(L"Kayıtlı Klipler", -1, &fTitle,
-                Gdiplus::RectF((float)S(242), (float)S(14), (float)S(320), (float)S(28)), &sfLeft, &brText);
-            g.DrawString(app_.Config().outputDir.c_str(), -1, &fSmall,
-                Gdiplus::RectF((float)S(242), (float)S(42), (float)S(450), (float)S(18)), &sfLeft, &brMuted);
+                Gdiplus::RectF((float)S(242), (float)S(12), (float)S(310), (float)S(28)), &sfLeft, &brText);
 
-            addBtn(BTN_TOP_FOLDER, 710, 20, 98, 32, L"Klasörü Aç", Gc(28, 34, 47), Gc(40, 49, 68), Gc(52, 64, 86));
-            addBtn(BTN_TOP_REFRESH, 816, 20, 82, 32, L"Yenile", Gc(28, 34, 47), Gc(40, 49, 68), Gc(52, 64, 86));
+            addBtn(BTN_TOP_FAV_FILTER, 572, 14, 130, 30, L"★  Favoriler",
+                favOnly_ ? Gc(120, 83, 14) : Gc(28, 34, 47),
+                favOnly_ ? Gc(146, 100, 18) : Gc(40, 49, 68),
+                favOnly_ ? Gc(250, 204, 21) : Gc(52, 64, 86));
+            addBtn(BTN_TOP_FOLDER, 710, 14, 98, 30, L"Klasörü Aç", Gc(28, 34, 47), Gc(40, 49, 68), Gc(52, 64, 86));
+            addBtn(BTN_TOP_REFRESH, 816, 14, 82, 30, L"Yenile", Gc(28, 34, 47), Gc(40, 49, 68), Gc(52, 64, 86));
+
+            if (!searchQuery_.empty()) {
+                addBtn(BTN_TOP_CLEAR_SEARCH, 504, 48, 26, 24, L"✕", Gc(44, 54, 72), Gc(64, 78, 104), Gc(82, 98, 128));
+            }
+            size_t favCount = 0;
+            for (const auto& cc : clips_) if (cc.isFavorite) ++favCount;
+            wchar_t metaInfo[160] = {};
+            if (searchQuery_.empty() && !favOnly_) {
+                swprintf(metaInfo, 160, L"%zu klip  •  %zu favori", clips_.size(), favCount);
+            } else {
+                swprintf(metaInfo, 160, L"%zu / %zu klip gösteriliyor", filteredIndices_.size(), clips_.size());
+            }
+            g.DrawString(metaInfo, -1, &fSmall,
+                Gdiplus::RectF((float)S(540), (float)S(50), (float)S(358), (float)S(20)), &sfLeft, &brMuted);
 
             RECT vp = GetGridViewportRect();
-            if (clips_.empty()) {
+            if (filteredIndices_.empty()) {
                 FillRoundRect(g, (float)vp.left, (float)vp.top, (float)(vp.right - vp.left), (float)(vp.bottom - vp.top),
                     (float)S(14), Gc(20, 25, 35));
                 StrokeRoundRect(g, (float)vp.left, (float)vp.top, (float)(vp.right - vp.left), (float)(vp.bottom - vp.top),
                     (float)S(14), Gc(40, 48, 65));
-                g.DrawString(L"Henüz kayıtlı klip yok", -1, &fTitle,
-                    Gdiplus::RectF((float)vp.left, (float)(vp.top + S(160)), (float)(vp.right - vp.left), (float)S(32)),
-                    &sfCenter, &brText);
-                wchar_t hint[160] = {};
-                swprintf(hint, 160, L"Oyun oynarken %ls tuşuna bastığınızda son %d saniye otomatik olarak buraya kaydedilir.",
-                    hk.c_str(), app_.Config().clipSeconds);
-                g.DrawString(hint, -1, &fMed,
-                    Gdiplus::RectF((float)(vp.left + S(40)), (float)(vp.top + S(200)), (float)(vp.right - vp.left - S(80)), (float)S(36)),
-                    &sfCenter, &brMuted);
+                if (clips_.empty()) {
+                    g.DrawString(L"Henüz kayıtlı klip yok", -1, &fTitle,
+                        Gdiplus::RectF((float)vp.left, (float)(vp.top + S(160)), (float)(vp.right - vp.left), (float)S(32)),
+                        &sfCenter, &brText);
+                    wchar_t hint[160] = {};
+                    swprintf(hint, 160, L"Oyun oynarken %ls tuşuna bastığınızda son %d saniye otomatik olarak buraya kaydedilir.",
+                        hk.c_str(), app_.Config().clipSeconds);
+                    g.DrawString(hint, -1, &fMed,
+                        Gdiplus::RectF((float)(vp.left + S(40)), (float)(vp.top + S(200)), (float)(vp.right - vp.left - S(80)), (float)S(36)),
+                        &sfCenter, &brMuted);
+                } else {
+                    g.DrawString(favOnly_ ? L"Henüz favori klip yok veya arama eşleşmedi" : L"Aramanızla eşleşen klip bulunamadı",
+                        -1, &fTitle, Gdiplus::RectF((float)vp.left, (float)(vp.top + S(175)), (float)(vp.right - vp.left), (float)S(32)),
+                        &sfCenter, &brText);
+                }
             } else {
                 g.SetClip(Gdiplus::Rect(vp.left, vp.top, vp.right - vp.left, vp.bottom - vp.top));
                 const int cardW = S(312);
@@ -1407,16 +1785,16 @@ void MainWindow::PaintWindow(HDC targetDc) {
                 const int gapX = S(16);
                 const int gapY = S(14);
 
-                for (size_t i = 0; i < clips_.size(); ++i) {
-                    int col = static_cast<int>(i % 2);
-                    int row = static_cast<int>(i / 2);
+                for (size_t vi = 0; vi < filteredIndices_.size(); ++vi) {
+                    int col = static_cast<int>(vi % 2);
+                    int row = static_cast<int>(vi / 2);
                     int cx = vp.left + col * (cardW + gapX);
                     int cy = vp.top + row * (cardH + gapY) - scrollY_;
                     if (cy + cardH < vp.top || cy > vp.bottom) continue;
 
-                    bool sel = (static_cast<int>(i) == selectedIdx_);
-                    bool hov = (static_cast<int>(i) == hoverCardIdx_);
-                    const auto& c = clips_[i];
+                    bool sel = (static_cast<int>(vi) == selectedIdx_);
+                    bool hov = (static_cast<int>(vi) == hoverCardIdx_);
+                    const auto& c = clips_[filteredIndices_[vi]];
 
                     FillRoundRect(g, (float)cx, (float)cy, (float)cardW, (float)cardH, (float)S(12),
                         sel ? Gc(28, 39, 62) : (hov ? Gc(29, 36, 50) : Gc(23, 28, 38)));
@@ -1455,6 +1833,16 @@ void MainWindow::PaintWindow(HDC targetDc) {
                         g.FillPolygon(&triB, tri, 3);
                     }
 
+                    // Favorite star button badge at top-right of thumbnail
+                    int stX = tx + tw - S(32), stY = ty + S(6);
+                    FillRoundRect(g, (float)stX, (float)stY, (float)S(26), (float)S(24), (float)S(6),
+                        c.isFavorite ? Gc(46, 36, 12, 225) : Gc(10, 12, 18, 180));
+                    if (c.isFavorite) {
+                        StrokeRoundRect(g, (float)stX, (float)stY, (float)S(26), (float)S(24), (float)S(6), Gc(250, 204, 21, 180));
+                    }
+                    DrawStarPolygon(g, static_cast<float>(stX + S(13)), static_cast<float>(stY + S(12)),
+                        static_cast<float>(S(7)), static_cast<float>(S(3)), c.isFavorite);
+
                     std::wstring durLbl = FormatDurClock(c.durationSeconds);
                     FillRoundRect(g, (float)(tx + tw - S(52)), (float)(ty + th - S(26)), (float)S(44), (float)S(19), (float)S(5), Gc(10, 12, 18, 210));
                     g.DrawString(durLbl.c_str(), -1, &fSmall,
@@ -1491,15 +1879,20 @@ void MainWindow::PaintWindow(HDC targetDc) {
             }
 
             // Bottom action dock
-            bool hasSel = (selectedIdx_ >= 0 && selectedIdx_ < static_cast<int>(clips_.size()));
+            bool hasSel = (selectedIdx_ >= 0 && selectedIdx_ < static_cast<int>(filteredIndices_.size()));
+            bool selFav = hasSel && clips_[filteredIndices_[static_cast<size_t>(selectedIdx_)]].isFavorite;
             FillRoundRect(g, (float)S(242), (float)S(544), (float)S(656), (float)S(56), (float)S(10), Gc(20, 25, 35));
             StrokeRoundRect(g, (float)S(242), (float)S(544), (float)S(656), (float)S(56), (float)S(10), Gc(40, 48, 65));
-            addBtn(BTN_CLIP_PLAY, 254, 555, 118, 34, L"▶  İzle", Gc(37, 99, 235), Gc(59, 130, 246), Gc(96, 165, 250, 140), hasSel);
-            addBtn(BTN_CLIP_RENAME, 380, 555, 116, 34, L"Adlandır", Gc(32, 39, 53), Gc(44, 54, 72), Gc(56, 68, 90), hasSel);
-            addBtn(BTN_CLIP_REVEAL, 504, 555, 128, 34, L"Klasörde Aç", Gc(32, 39, 53), Gc(44, 54, 72), Gc(56, 68, 90), hasSel);
-            addBtn(BTN_CLIP_DELETE, 640, 555, 68, 34, L"Sil", Gc(153, 27, 27), Gc(185, 28, 28), Gc(220, 38, 38), hasSel);
+            addBtn(BTN_CLIP_PLAY, 254, 555, 100, 34, L"▶  İzle", Gc(37, 99, 235), Gc(59, 130, 246), Gc(96, 165, 250, 140), hasSel);
+            addBtn(BTN_CLIP_FAV, 360, 555, 92, 34, selFav ? L"★ Favori" : L"☆ Favori",
+                selFav ? Gc(92, 68, 14) : Gc(32, 39, 53),
+                selFav ? Gc(120, 88, 18) : Gc(44, 54, 72),
+                selFav ? Gc(250, 204, 21) : Gc(56, 68, 90), hasSel);
+            addBtn(BTN_CLIP_RENAME, 458, 555, 84, 34, L"Adlandır", Gc(32, 39, 53), Gc(44, 54, 72), Gc(56, 68, 90), hasSel);
+            addBtn(BTN_CLIP_REVEAL, 548, 555, 102, 34, L"Klasörde Aç", Gc(32, 39, 53), Gc(44, 54, 72), Gc(56, 68, 90), hasSel);
+            addBtn(BTN_CLIP_DELETE, 656, 555, 52, 34, L"Sil", Gc(153, 27, 27), Gc(185, 28, 28), Gc(220, 38, 38), hasSel);
             g.DrawString(footerMsg_.c_str(), -1, &fSmall,
-                Gdiplus::RectF((float)S(718), (float)S(552), (float)S(172), (float)S(40)), &sfLeft, &brMuted);
+                Gdiplus::RectF((float)S(716), (float)S(552), (float)S(174), (float)S(40)), &sfLeft, &brMuted);
         } else {
             // ================= TAB 1: AYARLAR =================
             g.DrawString(L"Ayarlar", -1, &fTitle,
@@ -1507,25 +1900,48 @@ void MainWindow::PaintWindow(HDC targetDc) {
             g.DrawString(L"Değişiklikleri uygulamak için alttaki Kaydet butonunu kullanın.", -1, &fSmall,
                 Gdiplus::RectF((float)S(242), (float)S(42), (float)S(460), (float)S(18)), &sfLeft, &brMuted);
 
-            FillRoundRect(g, (float)S(242), (float)S(68), (float)S(320), (float)S(154), (float)S(12), Gc(23, 28, 38));
-            StrokeRoundRect(g, (float)S(242), (float)S(68), (float)S(320), (float)S(154), (float)S(12), Gc(44, 54, 72));
+            FillRoundRect(g, (float)S(242), (float)S(68), (float)S(320), (float)S(180), (float)S(12), Gc(23, 28, 38));
+            StrokeRoundRect(g, (float)S(242), (float)S(68), (float)S(320), (float)S(180), (float)S(12), Gc(44, 54, 72));
             g.DrawString(L"Video ve Tampon", -1, &fBold,
                 Gdiplus::RectF((float)S(258), (float)S(76), (float)S(220), (float)S(22)), &sfLeft, &brBlueTxt);
 
-            FillRoundRect(g, (float)S(578), (float)S(68), (float)S(320), (float)S(154), (float)S(12), Gc(23, 28, 38));
-            StrokeRoundRect(g, (float)S(578), (float)S(68), (float)S(320), (float)S(154), (float)S(12), Gc(44, 54, 72));
+            FillRoundRect(g, (float)S(578), (float)S(68), (float)S(320), (float)S(180), (float)S(12), Gc(23, 28, 38));
+            StrokeRoundRect(g, (float)S(578), (float)S(68), (float)S(320), (float)S(180), (float)S(12), Gc(44, 54, 72));
             Gdiplus::SolidBrush brGreenTxt(Gc(134, 239, 172));
             g.DrawString(L"Ses (Oyun + Mikrofon)", -1, &fBold,
-                Gdiplus::RectF((float)S(594), (float)S(76), (float)S(240), (float)S(22)), &sfLeft, &brGreenTxt);
+                Gdiplus::RectF((float)S(594), (float)S(74), (float)S(240), (float)S(22)), &sfLeft, &brGreenTxt);
 
-            FillRoundRect(g, (float)S(242), (float)S(236), (float)S(656), (float)S(286), (float)S(12), Gc(23, 28, 38));
-            StrokeRoundRect(g, (float)S(242), (float)S(236), (float)S(656), (float)S(286), (float)S(12), Gc(44, 54, 72));
+            // Live microphone input level vs Noise Gate threshold meter (594..882, y=224..240)
+            {
+                float db = static_cast<float>(st.micLevelDb);
+                float norm = std::max(0.0f, std::min(1.0f, (db + 60.0f) / 60.0f));
+                int thrDb = trkMicGate_ ? static_cast<int>(SendMessageW(trkMicGate_, TBM_GETPOS, 0, 0)) : app_.Config().micGateThresholdDb;
+                float thrNorm = std::max(0.0f, std::min(1.0f, (static_cast<float>(thrDb) + 60.0f) / 60.0f));
+                float barX = static_cast<float>(S(594)), barY = static_cast<float>(S(227));
+                float barW = static_cast<float>(S(212)), barH = static_cast<float>(S(8));
+                FillRoundRect(g, barX, barY, barW, barH, (float)S(4), Gc(34, 42, 58));
+                if (norm > 0.01f) {
+                    bool openNow = (db >= static_cast<float>(thrDb));
+                    FillRoundRect(g, barX, barY, barW * norm, barH, (float)S(4),
+                        openNow ? Gc(34, 197, 94) : Gc(245, 158, 11));
+                }
+                float markerX = barX + barW * thrNorm;
+                FillRoundRect(g, markerX - 1.5f, barY - S(2), 3.0f, barH + S(4), 1.0f, Gc(248, 250, 252));
+
+                wchar_t dbTxt[32] = {};
+                swprintf(dbTxt, 32, L"Mik: %.0f dB", db);
+                g.DrawString(dbTxt, -1, &fSmall,
+                    Gdiplus::RectF((float)S(812), (float)S(221), (float)S(76), (float)S(20)), &sfLeft, &brMuted);
+            }
+
+            FillRoundRect(g, (float)S(242), (float)S(258), (float)S(656), (float)S(270), (float)S(12), Gc(23, 28, 38));
+            StrokeRoundRect(g, (float)S(242), (float)S(258), (float)S(656), (float)S(270), (float)S(12), Gc(44, 54, 72));
             Gdiplus::SolidBrush brPurpTxt(Gc(216, 180, 254));
             g.DrawString(L"Oyun İçi Kısayol, Bildirim ve Klasör", -1, &fBold,
-                Gdiplus::RectF((float)S(258), (float)S(244), (float)S(340), (float)S(22)), &sfLeft, &brPurpTxt);
+                Gdiplus::RectF((float)S(258), (float)S(264), (float)S(340), (float)S(22)), &sfLeft, &brPurpTxt);
 
             g.DrawString(footerMsg_.c_str(), -1, &fSmall,
-                Gdiplus::RectF((float)S(258), (float)S(494), (float)S(624), (float)S(20)), &sfLeft, &brMuted);
+                Gdiplus::RectF((float)S(258), (float)S(498), (float)S(624), (float)S(20)), &sfLeft, &brMuted);
         }
     }
 
@@ -1563,8 +1979,70 @@ LRESULT MainWindow::OnMessage(UINT msg, WPARAM wParam, LPARAM lParam) {
         case WM_TIMER:
             if (wParam == TIMER_PLAYER_ID) {
                 UpdatePlayerMetrics();
+            } else if (wParam == TIMER_MIC_METER_ID && activeTab_ == 1) {
+                RECT mrc{ S(590), S(220), S(892), S(245) };
+                InvalidateRect(hwnd_, &mrc, FALSE);
             }
             return 0;
+
+        case WM_MW_TRIM_DONE: {
+            auto* tm = reinterpret_cast<TrimDoneMsg*>(lParam);
+            if (trimThread_.joinable()) trimThread_.join();
+            trimBusy_ = false;
+            if (tm) {
+                if (tm->ok) {
+                    if (tm->replaceOriginal) {
+                        bool wasFav = false;
+                        for (const auto& cc : clips_) {
+                            if (_wcsicmp(cc.filePath.c_str(), tm->origPath.c_str()) == 0) {
+                                wasFav = cc.isFavorite;
+                                break;
+                            }
+                        }
+                        TrashClipFile(tm->origPath);
+                        MoveFileExW(tm->outPath.c_str(), tm->origPath.c_str(), MOVEFILE_REPLACE_EXISTING);
+                        if (wasFav) {
+                            size_t sl = tm->origPath.find_last_of(L"\\/");
+                            std::wstring fname = (sl != std::wstring::npos) ? tm->origPath.substr(sl + 1) : tm->origPath;
+                            SetClipFavorite(GetFavoritesFilePath(), fname, true);
+                        }
+                        InvalidateClipMetadata(tm->origPath);
+                        auto it = thumbBmps_.find(tm->origPath);
+                        if (it != thumbBmps_.end()) {
+                            if (it->second) DeleteObject(it->second);
+                            thumbBmps_.erase(it);
+                        }
+                        trimMode_ = false;
+                        RefreshClips(tm->origPath);
+                        if (selectedIdx_ >= 0) OpenEmbeddedPlayer(selectedIdx_);
+                        SetFooterMessage(L"Klip kırpıldı ve ana klip güncellendi (eski kopya çöp kutusunda).");
+                    } else {
+                        trimMode_ = false;
+                        favOnly_ = false;
+                        if (edtSearch_ && !searchQuery_.empty()) {
+                            searchQuery_.clear();
+                            SetWindowTextW(edtSearch_, L"");
+                        }
+                        RefreshClips(tm->outPath);
+                        if (selectedIdx_ >= 0) OpenEmbeddedPlayer(selectedIdx_);
+                        SetFooterMessage(L"Kırpılan kesit yeni klip olarak kaydedildi.");
+                    }
+                } else {
+                    if (tm->replaceOriginal) DeleteFileW(tm->outPath.c_str());
+                    std::wstring msg = tm->message;
+                    double savedStart = trimStartSec_, savedEnd = trimEndSec_;
+                    bool keepTrim = trimMode_;
+                    RefreshClips(tm->origPath);
+                    if (selectedIdx_ >= 0) OpenEmbeddedPlayer(selectedIdx_);
+                    trimMode_ = keepTrim;
+                    trimStartSec_ = savedStart;
+                    trimEndSec_ = savedEnd;
+                    SetFooterMessage(msg);
+                }
+                delete tm;
+            }
+            return 0;
+        }
 
         case WM_MW_PLAYER_EVENT: {
             auto* ev = reinterpret_cast<PlayerEventMsg*>(lParam);
@@ -1575,6 +2053,9 @@ LRESULT MainWindow::OnMessage(UINT msg, WPARAM wParam, LPARAM lParam) {
                         PROPVARIANT dur; PropVariantInit(&dur);
                         if (SUCCEEDED(player_->GetDuration(MFP_POSITIONTYPE_100NS, &dur)) && dur.vt == VT_I8) {
                             playerDurSec_ = static_cast<double>(dur.hVal.QuadPart) / 1e7;
+                            if (!trimMode_ || trimEndSec_ > playerDurSec_ || trimEndSec_ <= 0.1) {
+                                trimEndSec_ = playerDurSec_;
+                            }
                         }
                         PropVariantClear(&dur);
                         player_->SetVolume(playerVol_);
@@ -1589,7 +2070,7 @@ LRESULT MainWindow::OnMessage(UINT msg, WPARAM wParam, LPARAM lParam) {
                         playerPlaying_ = false;
                         playerEnded_ = true;
                         playerPosSec_ = playerDurSec_;
-                        RECT ctrlRc{ S(242), S(442), S(900), S(566) };
+                        RECT ctrlRc{ S(242), S(428), S(900), S(606) };
                         InvalidateRect(hwnd_, &ctrlRc, FALSE);
                     } else if (ev->type == MFP_EVENT_TYPE_PLAY) {
                         playerPlaying_ = true;
@@ -1665,12 +2146,31 @@ LRESULT MainWindow::OnMessage(UINT msg, WPARAM wParam, LPARAM lParam) {
             }
             int mx = static_cast<short>(LOWORD(lParam));
             int my = static_cast<short>(HIWORD(lParam));
+            if (draggingTrim_ != 0 && playerOpen_ && !trimBusy_) {
+                RECT sk = GetSeekBarRect();
+                double ratio = static_cast<double>(mx - sk.left) / std::max(1L, sk.right - sk.left);
+                ratio = std::max(0.0, std::min(1.0, ratio));
+                double dur = (playerDurSec_ > 0.2) ? playerDurSec_ : 1.0;
+                double t = ratio * dur;
+                if (draggingTrim_ == 1) {
+                    trimStartSec_ = std::min(t, trimEndSec_ - 0.25);
+                    if (trimStartSec_ < 0.0) trimStartSec_ = 0.0;
+                    playerPosSec_ = trimStartSec_;
+                } else {
+                    trimEndSec_ = std::max(t, trimStartSec_ + 0.25);
+                    if (trimEndSec_ > dur) trimEndSec_ = dur;
+                    playerPosSec_ = trimEndSec_;
+                }
+                RECT ctrlRc{ S(242), S(428), S(900), S(606) };
+                InvalidateRect(hwnd_, &ctrlRc, FALSE);
+                return 0;
+            }
             if (draggingSeek_ && playerOpen_ && playerReady_) {
                 RECT sk = GetSeekBarRect();
                 double ratio = static_cast<double>(mx - sk.left) / std::max(1L, sk.right - sk.left);
                 ratio = std::max(0.0, std::min(1.0, ratio));
                 playerPosSec_ = ratio * playerDurSec_;
-                RECT ctrlRc{ S(242), S(442), S(900), S(566) };
+                RECT ctrlRc{ S(242), S(428), S(900), S(606) };
                 InvalidateRect(hwnd_, &ctrlRc, FALSE);
                 return 0;
             }
@@ -1687,7 +2187,7 @@ LRESULT MainWindow::OnMessage(UINT msg, WPARAM wParam, LPARAM lParam) {
             trackingMouse_ = false;
             hoverBtnId_ = 0;
             hoverCardIdx_ = -1;
-            if (!draggingSeek_ && !draggingVol_) pressedBtnId_ = 0;
+            if (!draggingSeek_ && !draggingVol_ && draggingTrim_ == 0) pressedBtnId_ = 0;
             InvalidateRect(hwnd_, nullptr, FALSE);
             return 0;
 
@@ -1704,7 +2204,13 @@ LRESULT MainWindow::OnMessage(UINT msg, WPARAM wParam, LPARAM lParam) {
             int mx = static_cast<short>(LOWORD(lParam));
             int my = static_cast<short>(HIWORD(lParam));
 
-            if (activeTab_ == 0 && playerOpen_) {
+            if (activeTab_ == 0 && playerOpen_ && !trimBusy_) {
+                int th = HitTestTrimHandle(mx, my);
+                if (th != 0 && playerReady_) {
+                    draggingTrim_ = th;
+                    SetCapture(hwnd_);
+                    return 0;
+                }
                 RECT sk = GetSeekBarRect();
                 if (playerReady_ && mx >= sk.left - S(4) && mx <= sk.right + S(4) && my >= sk.top && my <= sk.bottom) {
                     draggingSeek_ = true;
@@ -1712,7 +2218,7 @@ LRESULT MainWindow::OnMessage(UINT msg, WPARAM wParam, LPARAM lParam) {
                     double ratio = static_cast<double>(mx - sk.left) / std::max(1L, sk.right - sk.left);
                     ratio = std::max(0.0, std::min(1.0, ratio));
                     playerPosSec_ = ratio * playerDurSec_;
-                    RECT ctrlRc{ S(242), S(442), S(900), S(566) };
+                    RECT ctrlRc{ S(242), S(428), S(900), S(606) };
                     InvalidateRect(hwnd_, &ctrlRc, FALSE);
                     return 0;
                 }
@@ -1722,6 +2228,15 @@ LRESULT MainWindow::OnMessage(UINT msg, WPARAM wParam, LPARAM lParam) {
                     SetCapture(hwnd_);
                     float ratio = static_cast<float>(mx - vb.left) / std::max(1L, vb.right - vb.left);
                     SetPlayerVolume(ratio);
+                    return 0;
+                }
+            }
+
+            if (activeTab_ == 0 && !playerOpen_) {
+                int starVi = HitTestCardStar(mx, my);
+                if (starVi >= 0) {
+                    selectedIdx_ = starVi;
+                    ToggleFavoriteForViewIdx(starVi);
                     return 0;
                 }
             }
@@ -1744,6 +2259,13 @@ LRESULT MainWindow::OnMessage(UINT msg, WPARAM wParam, LPARAM lParam) {
         case WM_LBUTTONUP: {
             int mx = static_cast<short>(LOWORD(lParam));
             int my = static_cast<short>(HIWORD(lParam));
+            if (draggingTrim_ != 0) {
+                int which = draggingTrim_;
+                draggingTrim_ = 0;
+                ReleaseCapture();
+                SeekPlayerAbsolute(which == 1 ? trimStartSec_ : trimEndSec_);
+                return 0;
+            }
             if (draggingSeek_) {
                 draggingSeek_ = false;
                 ReleaseCapture();
@@ -1774,15 +2296,24 @@ LRESULT MainWindow::OnMessage(UINT msg, WPARAM wParam, LPARAM lParam) {
                             if (cb_.onToggleMicMuteRequested) cb_.onToggleMicMuteRequested();
                             SendMessageW(chkMicMute_, BM_SETCHECK, app_.Config().micMuted ? BST_CHECKED : BST_UNCHECKED, 0);
                             break;
+                        case BTN_TOP_FAV_FILTER:
+                            favOnly_ = !favOnly_;
+                            RebuildFilteredView();
+                            break;
+                        case BTN_TOP_CLEAR_SEARCH:
+                            if (edtSearch_) SetWindowTextW(edtSearch_, L"");
+                            break;
                         case BTN_TOP_FOLDER: OpenFolder(app_.Config().outputDir); break;
                         case BTN_TOP_REFRESH: RefreshClips(); break;
                         case BTN_CLIP_PLAY: PlaySelected(); break;
+                        case BTN_CLIP_FAV: ToggleFavoriteForViewIdx(); break;
                         case BTN_CLIP_RENAME: RenameSelected(); break;
                         case BTN_CLIP_REVEAL: RevealSelected(); break;
                         case BTN_CLIP_DELETE: DeleteSelected(); break;
 
-                        // Embedded Player buttons
+                        // Embedded Player & Trim buttons
                         case BTN_PLY_BACK: CloseEmbeddedPlayer(); break;
+                        case BTN_PLY_FAV: ToggleFavoriteForViewIdx(); break;
                         case BTN_PLY_RENAME: RenameSelected(); break;
                         case BTN_PLY_FOLDER: RevealSelected(); break;
                         case BTN_PLY_DELETE: DeleteSelected(); break;
@@ -1791,8 +2322,24 @@ LRESULT MainWindow::OnMessage(UINT msg, WPARAM wParam, LPARAM lParam) {
                         case BTN_PLY_PLUS5: SeekPlayerRelative(+5.0); break;
                         case BTN_PLY_RESTART: SeekPlayerAbsolute(0.0); break;
                         case BTN_PLY_RATE: CyclePlayerRate(); break;
+                        case BTN_PLY_TRIM: ToggleTrimMode(); break;
                         case BTN_PLY_MUTE: TogglePlayerMute(); break;
                         case BTN_PLY_EXTERNAL: PlayExternalSelected(); break;
+                        case BTN_TRIM_SET_START:
+                            trimStartSec_ = std::max(0.0, std::min(playerPosSec_, trimEndSec_ - 0.25));
+                            InvalidateRect(hwnd_, nullptr, FALSE);
+                            break;
+                        case BTN_TRIM_SET_END: {
+                            double dur = (playerDurSec_ > 0.2) ? playerDurSec_ : 1.0;
+                            trimEndSec_ = std::min(dur, std::max(playerPosSec_, trimStartSec_ + 0.25));
+                            InvalidateRect(hwnd_, nullptr, FALSE);
+                            break;
+                        }
+                        case BTN_TRIM_SAVE_COPY: StartTrimAsync(false); break;
+                        case BTN_TRIM_REPLACE: StartTrimAsync(true); break;
+                        case BTN_TRIM_CANCEL:
+                            if (trimMode_) ToggleTrimMode();
+                            break;
                     }
                 }
             }
@@ -1802,6 +2349,7 @@ LRESULT MainWindow::OnMessage(UINT msg, WPARAM wParam, LPARAM lParam) {
         case WM_LBUTTONDBLCLK: {
             int mx = static_cast<short>(LOWORD(lParam));
             int my = static_cast<short>(HIWORD(lParam));
+            if (activeTab_ == 0 && !playerOpen_ && HitTestCardStar(mx, my) >= 0) return 0;
             int card = HitTestCard(mx, my);
             if (card >= 0) {
                 selectedIdx_ = card;
@@ -1817,10 +2365,12 @@ LRESULT MainWindow::OnMessage(UINT msg, WPARAM wParam, LPARAM lParam) {
             if (card >= 0) {
                 selectedIdx_ = card;
                 InvalidateRect(hwnd_, nullptr, FALSE);
+                bool isFav = clips_[filteredIndices_[static_cast<size_t>(card)]].isFavorite;
                 POINT pt{ mx, my };
                 ClientToScreen(hwnd_, &pt);
                 HMENU m = CreatePopupMenu();
                 AppendMenuW(m, MF_STRING, ID_CTX_PLAY, L"İzle (Uygulama İçi)");
+                AppendMenuW(m, MF_STRING, ID_CTX_FAV, isFav ? L"☆ Favorilerden Çıkar" : L"★ Favorilere Ekle");
                 AppendMenuW(m, MF_STRING, ID_CTX_RENAME, L"Adını Değiştir...");
                 AppendMenuW(m, MF_STRING, ID_CTX_REVEAL, L"Klasörde Göster");
                 AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
@@ -1857,15 +2407,18 @@ LRESULT MainWindow::OnMessage(UINT msg, WPARAM wParam, LPARAM lParam) {
 
         case WM_HSCROLL: {
             HWND src = reinterpret_cast<HWND>(lParam);
-            if (src == trkGameVol_ || src == trkMicVol_) {
+            if (src == trkGameVol_ || src == trkMicVol_ || src == trkMicGate_) {
                 int gv = static_cast<int>(SendMessageW(trkGameVol_, TBM_GETPOS, 0, 0));
                 int mv = static_cast<int>(SendMessageW(trkMicVol_, TBM_GETPOS, 0, 0));
+                int gdb = static_cast<int>(SendMessageW(trkMicGate_, TBM_GETPOS, 0, 0));
                 wchar_t buf[16] = {};
                 swprintf(buf, 16, L"%%%d", gv); SetWindowTextW(lblGameVol_, buf);
                 swprintf(buf, 16, L"%%%d", mv); SetWindowTextW(lblMicVol_, buf);
+                swprintf(buf, 16, L"%d dB", gdb); SetWindowTextW(lblMicGate_, buf);
                 AppConfig cfg = app_.Config();
                 cfg.gameVolumePct = gv;
                 cfg.micVolumePct = mv;
+                cfg.micGateThresholdDb = gdb;
                 if (cb_.onConfigApplied) cb_.onConfigApplied(cfg);
             }
             return 0;
@@ -1873,18 +2426,29 @@ LRESULT MainWindow::OnMessage(UINT msg, WPARAM wParam, LPARAM lParam) {
 
         case WM_COMMAND: {
             int id = LOWORD(wParam);
+            int code = HIWORD(wParam);
+            if (id == ID_EDT_SEARCH && code == EN_CHANGE && edtSearch_) {
+                wchar_t sbuf[256] = {};
+                GetWindowTextW(edtSearch_, sbuf, 256);
+                searchQuery_ = sbuf;
+                RebuildFilteredView();
+                return 0;
+            }
             switch (id) {
                 case ID_CTX_PLAY: PlaySelected(); break;
+                case ID_CTX_FAV: ToggleFavoriteForViewIdx(); break;
                 case ID_CTX_RENAME: RenameSelected(); break;
                 case ID_CTX_REVEAL: RevealSelected(); break;
                 case ID_CTX_DELETE: DeleteSelected(); break;
                 case ID_CHK_GAME_AUDIO:
                 case ID_CHK_MIC_AUDIO:
-                case ID_CHK_MIC_MUTE: {
+                case ID_CHK_MIC_MUTE:
+                case ID_CHK_MIC_GATE: {
                     AppConfig cfg = app_.Config();
                     cfg.captureGameAudio = (SendMessageW(chkGameAudio_, BM_GETCHECK, 0, 0) == BST_CHECKED);
                     cfg.captureMic = (SendMessageW(chkMicAudio_, BM_GETCHECK, 0, 0) == BST_CHECKED);
                     cfg.micMuted = (SendMessageW(chkMicMute_, BM_GETCHECK, 0, 0) == BST_CHECKED);
+                    cfg.micNoiseGate = (SendMessageW(chkMicGate_, BM_GETCHECK, 0, 0) == BST_CHECKED);
                     if (cb_.onConfigApplied) cb_.onConfigApplied(cfg);
                     InvalidateRect(hwnd_, nullptr, FALSE);
                     break;

@@ -3,5 +3,7 @@ klipler/
 *.exe
 *.log
 settings.ini
+favoriler.txt
+favoriler.txt.tmp
 .DS_Store
 Thumbs.db

@@ -1,5 +1,6 @@
 #include "clip_library.h"
 #include "com_ptr.h"
+#include "config.h"
 
 #include <mfapi.h>
 #include <mfidl.h>
@@ -10,10 +11,43 @@
 #include <algorithm>
 #include <cstdio>
 #include <cstring>
+#include <cwctype>
 #include <mutex>
 #include <unordered_map>
 
 namespace {
+
+std::wstring ToLowerCopy(std::wstring s) {
+    if (!s.empty()) {
+        CharLowerBuffW(&s[0], static_cast<DWORD>(s.size()));
+    }
+    return s;
+}
+
+std::wstring ExtractFileNameOnly(const std::wstring& pathOrName) {
+    size_t pos = pathOrName.find_last_of(L"\\/");
+    return (pos != std::wstring::npos) ? pathOrName.substr(pos + 1) : pathOrName;
+}
+
+bool SaveFavorites(const std::wstring& favPath, const std::unordered_set<std::wstring>& favNamesLower) {
+    if (favPath.empty()) return false;
+    std::wstring tmpPath = favPath + L".tmp";
+    FILE* fp = nullptr;
+    if (_wfopen_s(&fp, tmpPath.c_str(), L"wb") != 0 || !fp) return false;
+
+    for (const auto& name : favNamesLower) {
+        if (name.empty()) continue;
+        int len = WideCharToMultiByte(CP_UTF8, 0, name.c_str(), static_cast<int>(name.size()), nullptr, 0, nullptr, nullptr);
+        if (len > 0) {
+            std::string utf8(static_cast<size_t>(len), '\0');
+            WideCharToMultiByte(CP_UTF8, 0, name.c_str(), static_cast<int>(name.size()), &utf8[0], len, nullptr, nullptr);
+            fwrite(utf8.data(), 1, utf8.size(), fp);
+            fwrite("\n", 1, 1, fp);
+        }
+    }
+    fclose(fp);
+    return MoveFileExW(tmpPath.c_str(), favPath.c_str(), MOVEFILE_REPLACE_EXISTING) != FALSE;
+}
 
 struct CachedMeta {
     uint64_t size = 0;
@@ -81,9 +115,74 @@ void ClearClipMetadataCache() {
     std::unordered_map<std::wstring, CachedMeta>().swap(g_metaCache);
 }
 
-std::vector<ClipItem> ScanClipsFolder(const std::wstring& dir) {
+void InvalidateClipMetadata(const std::wstring& path) {
+    std::lock_guard<std::mutex> lk(g_metaMutex);
+    g_metaCache.erase(path);
+}
+
+std::wstring GetFavoritesFilePath() {
+    return GetExeDirectory() + L"\\favoriler.txt";
+}
+
+std::unordered_set<std::wstring> LoadFavorites(const std::wstring& favPath) {
+    std::unordered_set<std::wstring> out;
+    if (favPath.empty()) return out;
+    FILE* fp = nullptr;
+    if (_wfopen_s(&fp, favPath.c_str(), L"rb") != 0 || !fp) return out;
+
+    fseek(fp, 0, SEEK_END);
+    long sz = ftell(fp);
+    fseek(fp, 0, SEEK_SET);
+    if (sz > 0 && sz < 4 * 1024 * 1024) {
+        std::string raw(static_cast<size_t>(sz), '\0');
+        size_t got = fread(&raw[0], 1, raw.size(), fp);
+        raw.resize(got);
+        size_t pos = 0;
+        while (pos < raw.size()) {
+            size_t nl = raw.find_first_of("\r\n", pos);
+            size_t end = (nl == std::string::npos) ? raw.size() : nl;
+            if (end > pos) {
+                std::string line = raw.substr(pos, end - pos);
+                int wlen = MultiByteToWideChar(CP_UTF8, 0, line.c_str(), static_cast<int>(line.size()), nullptr, 0);
+                if (wlen > 0) {
+                    std::wstring w(static_cast<size_t>(wlen), L'\0');
+                    MultiByteToWideChar(CP_UTF8, 0, line.c_str(), static_cast<int>(line.size()), &w[0], wlen);
+                    out.insert(ToLowerCopy(ExtractFileNameOnly(w)));
+                }
+            }
+            pos = (nl == std::string::npos) ? raw.size() : nl + 1;
+        }
+    }
+    fclose(fp);
+    return out;
+}
+
+bool SetClipFavorite(const std::wstring& favPath, const std::wstring& fileName, bool favorite) {
+    std::wstring key = ToLowerCopy(ExtractFileNameOnly(fileName));
+    if (key.empty()) return false;
+    auto favs = LoadFavorites(favPath);
+    if (favorite) favs.insert(key);
+    else favs.erase(key);
+    return SaveFavorites(favPath, favs);
+}
+
+void UpdateFavoriteOnRename(const std::wstring& favPath, const std::wstring& oldFileName, const std::wstring& newFileName) {
+    std::wstring oldKey = ToLowerCopy(ExtractFileNameOnly(oldFileName));
+    std::wstring newKey = ToLowerCopy(ExtractFileNameOnly(newFileName));
+    if (oldKey.empty() || newKey.empty() || oldKey == newKey) return;
+    auto favs = LoadFavorites(favPath);
+    if (favs.erase(oldKey) > 0) {
+        favs.insert(newKey);
+        SaveFavorites(favPath, favs);
+    }
+}
+
+std::vector<ClipItem> ScanClipsFolder(const std::wstring& dir, const std::wstring& favPath) {
     std::vector<ClipItem> items;
     if (dir.empty()) return items;
+
+    std::unordered_set<std::wstring> favs;
+    if (!favPath.empty()) favs = LoadFavorites(favPath);
 
     std::wstring pattern = dir;
     if (pattern.back() != L'\\' && pattern.back() != L'/') pattern += L'\\';
@@ -105,6 +204,9 @@ std::vector<ClipItem> ScanClipsFolder(const std::wstring& dir) {
         item.fileSizeBytes = (static_cast<uint64_t>(fd.nFileSizeHigh) << 32) | fd.nFileSizeLow;
         item.writeTime64 = (static_cast<uint64_t>(fd.ftLastWriteTime.dwHighDateTime) << 32) |
                            fd.ftLastWriteTime.dwLowDateTime;
+        if (!favs.empty()) {
+            item.isFavorite = (favs.find(ToLowerCopy(name)) != favs.end());
+        }
 
         FILETIME localFt{};
         SYSTEMTIME st{};

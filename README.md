@@ -13,9 +13,9 @@ Windows 10/11 için hafif, tamamen native (C++17 / Win32 / Direct3D 11 / DXGI / 
 - **Klip süresi seçenekleri:** Son 30 sn, 1 dk (60 sn — varsayılan), 2 dk, 3 dk veya 5 dk.
 - **Çözünürlük ve FPS profilleri:** `1280x720 @ 60 FPS` (varsayılan), `1280x720 @ 30 FPS`, `1920x1080 @ 60 FPS`, `1920x1080 @ 30 FPS`.
 - **Bit hızı seçenekleri:** `4 Mbps`, `6 Mbps` (varsayılan), `8 Mbps`, `10 Mbps`.
-- **Çift ses kanalı:** Oyun / sistem sesi (WASAPI loopback) + mikrofon yakalama, ayrı ses seviyesi (`%0`–`%200`), mikrofon cihaz seçimi ve mikrofon susturma desteği.
+- **Çift ses kanalı ve gürültü kapısı:** Oyun / sistem sesi (WASAPI loopback) + mikrofon yakalama, ayrı ses seviyesi (`%0`–`%200`), mikrofon cihaz seçimi, mikrofon susturma ve klavye/arka plan sesini kesen ayarlanabilir **Mikrofon Gürültü Kapısı** (`-60` – `-15 dB` eşik + canlı seviye ölçer).
 - **Oyun içi kısayol algılama:** Çift katmanlı algılama (RawInput + Low-Level Keyboard Hook + `RegisterHotKey` yedeği) ile klip alma (varsayılan `F9`) ve isteğe bağlı mikrofon susturma kısayolu. Yönetici yetkisiyle çalışan oyunlar için uygulama içinden **Yönetici Başlat** seçeneği mevcuttur.
-- **Klip galerisi ve dahili oynatıcı:** Küçük resimli klip listesi, yeniden adlandırma, klasörde açma, Çöp Kutusu'na silme ve uygulama içi Media Foundation oynatıcı (`Space` oynat/duraklat, `←` / `→` 5 sn ileri/geri sar, `Esc` oynatıcıyı kapat, oynatma hızı ve ses kontrolü).
+- **Klip galerisi, favoriler, arama ve hızlı kırpma (trim):** Küçük resimli klip listesi, isimle canlı arama, favori yıldızı (`★` + Favoriler görünümü), yeniden adlandırma, klasörde açma, Çöp Kutusu'na silme ve uygulama içi Media Foundation oynatıcı (`Space` oynat/duraklat, `←` / `→` 5 sn ileri/geri sar, `Esc` geri, hız ve ses kontrolü). Oynatıcıdaki **✂ Kırp** aracıyla seçili aralığı **Yeni Kopya Kaydet** veya **Ana Klip Yap** (eski kopyayı Çöp Kutusu'na alarak üzerine yaz) seçenekleriyle kırpabilirsin.
 - **Sistem tepsisi & düşük bellek:** Pencere kapatıldığında sistem tepsisinde çalışmaya devam eder; isteğe bağlı Windows açılışında arka planda başlatma ve klip alma bildirim sesi bulunur.
 
 ## Hızlı Başlangıç

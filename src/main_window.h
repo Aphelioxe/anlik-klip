@@ -52,13 +52,15 @@ private:
 
     // Clip gallery + async thumbnail loader
     void RefreshClips(const std::wstring& selectPath = L"");
+    void RebuildFilteredView(const std::wstring& preferPath = L"");
+    void UpdateGalleryControlVisibility();
     void StartThumbnailWorker();
     void StopThumbnailWorker();
     void ClearThumbnails();
     void ClampScroll();
 
-    // Embedded MFPlay player
-    void OpenEmbeddedPlayer(int clipIndex);
+    // Embedded MFPlay player + trimmer
+    void OpenEmbeddedPlayer(int viewIdx);
     void CloseEmbeddedPlayer();
     void TogglePlayerPlayPause();
     void SeekPlayerRelative(double deltaSec);
@@ -67,6 +69,9 @@ private:
     void TogglePlayerMute();
     void CyclePlayerRate();
     void UpdatePlayerMetrics();
+    void ToggleTrimMode();
+    void StartTrimAsync(bool replaceOriginal);
+    void StopTrimWorker();
     RECT GetSeekBarRect() const;
     RECT GetVolumeBarRect() const;
 
@@ -79,10 +84,13 @@ private:
     void PaintWindow(HDC hdc);
     RECT GetGridViewportRect() const;
     int HitTestCard(int mx, int my) const;
+    int HitTestCardStar(int mx, int my) const;
+    int HitTestTrimHandle(int mx, int my) const;
     int HitTestCustomButton(int mx, int my) const;
     void UpdateHover(int mx, int my);
 
     // Clip actions
+    void ToggleFavoriteForViewIdx(int viewIdx = -1);
     void PlaySelected();
     void PlayExternalSelected();
     void RevealSelected();
@@ -137,6 +145,21 @@ private:
     bool draggingSeek_ = false;
     bool draggingVol_ = false;
 
+    // Trim state (only active inside embedded player)
+    bool trimMode_ = false;
+    double trimStartSec_ = 0.0;
+    double trimEndSec_ = 0.0;
+    int draggingTrim_ = 0; // 0=none, 1=start, 2=end
+    bool trimBusy_ = false;
+    std::atomic<bool> trimCancel_{false};
+    std::thread trimThread_;
+
+    // Gallery search & favorites state
+    bool favOnly_ = false;
+    std::wstring searchQuery_;
+    std::vector<size_t> filteredIndices_;
+    HWND edtSearch_ = nullptr;
+
     // Hotkey capture state: 0=none, 1=clip, 2=mic
     int captureHotkeyMode_ = 0;
     UINT pendingClipMods_ = 0, pendingClipVk_ = 0;
@@ -165,6 +188,9 @@ private:
     HWND trkMicVol_ = nullptr;
     HWND lblMicVol_ = nullptr;
     HWND cmbMicDev_ = nullptr;
+    HWND chkMicGate_ = nullptr;
+    HWND trkMicGate_ = nullptr;
+    HWND lblMicGate_ = nullptr;
     HWND edtClipHotkey_ = nullptr;
     HWND btnSetClipHotkey_ = nullptr;
     HWND edtMicHotkey_ = nullptr;
