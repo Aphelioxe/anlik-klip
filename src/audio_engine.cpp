@@ -616,10 +616,30 @@ void AudioEngine::ThreadMain(int64_t masterStartQpc, std::wstring micDeviceId) {
     pcmAccum.reserve(4096);
     MicNoiseGate noiseGate;
 
-    int64_t totalEmitted = 0;
-    int64_t aacSamplesFed = 0;
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);
+
+    // Initial drain right before synchronizing QPC counters so WASAPI pre-roll matches masterStartQpc
+    if (gameStream.active && !gameStream.DrainTo48k(gameQ, captureGame_.load())) {
+        Logger::Log("AudioEngine: initial loopback drain failed, resetting");
+        gameStream.Close();
+    }
+    if (micStream.active && !micStream.DrainTo48k(micQ, captureMic_.load() && !micMuted_.load())) {
+        Logger::Log("AudioEngine: initial mic drain failed, resetting");
+        micStream.Close();
+    }
+    while (gameQ.size() > 720) gameQ.pop_front();
+    while (micQ.size() > 720) micQ.pop_front();
+
+    const int64_t initElapsed100Ns = std::max<int64_t>(0, QpcTo100Ns(GetQpcNow() - masterStartQpc));
+    int64_t totalEmitted = (initElapsed100Ns <= 20000000LL) ? 0 : ((initElapsed100Ns * 48000LL) / 10000000LL);
+    int64_t aacSamplesFed = totalEmitted;
     int64_t lastReopenTryQpc = GetQpcNow();
     int64_t lastDefCheckQpc = lastReopenTryQpc;
+    bool catchingUp = false;
+    StereoSample lastGameSample{0.0f, 0.0f};
+    StereoSample lastMicSample{0.0f, 0.0f};
+    double gameSlipAccum = 0.0;
+    double micSlipAccum = 0.0;
 
     HANDLE timer = CreateWaitableTimerExW(nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
     if (!timer) {
@@ -630,16 +650,97 @@ void AudioEngine::ThreadMain(int64_t masterStartQpc, std::wstring micDeviceId) {
     aenc->GetOutputStreamInfo(0, &osi);
     const DWORD outBufSize = osi.cbSize > 0 ? osi.cbSize : 8192;
 
-    while (!stop_.load()) {
-        if (timer) {
-            LARGE_INTEGER due{};
-            due.QuadPart = -100000LL; // 10ms relative
-            SetWaitableTimer(timer, &due, 0, nullptr, nullptr, FALSE);
-            WaitForSingleObject(timer, 20);
-        } else {
-            Sleep(10);
+    auto drainAacOutput = [&]() {
+        while (true) {
+            ComPtr<IMFSample> outSamp;
+            MFCreateSample(outSamp.Put());
+            ComPtr<IMFMediaBuffer> outBuf;
+            MFCreateMemoryBuffer(outBufSize, outBuf.Put());
+            outSamp->AddBuffer(outBuf.Get());
+
+            MFT_OUTPUT_DATA_BUFFER odb{};
+            odb.pSample = outSamp.Get();
+            DWORD status = 0;
+            HRESULT ohr = aenc->ProcessOutput(0, 1, &odb, &status);
+            if (odb.pEvents) odb.pEvents->Release();
+            if (ohr == MF_E_TRANSFORM_NEED_MORE_INPUT || FAILED(ohr)) break;
+
+            ComPtr<IMFMediaBuffer> contig;
+            if (SUCCEEDED(outSamp->ConvertToContiguousBuffer(contig.Put()))) {
+                BYTE* pOut = nullptr;
+                DWORD len = 0;
+                if (SUCCEEDED(contig->Lock(&pOut, nullptr, &len)) && len > 0) {
+                    EncodedPacket pkt;
+                    pkt.data = std::make_shared<const std::vector<uint8_t>>(pOut, pOut + len);
+                    LONGLONG sPts = 0, sDur = 0;
+                    outSamp->GetSampleTime(&sPts);
+                    outSamp->GetSampleDuration(&sDur);
+                    pkt.pts100ns = sPts;
+                    pkt.dur100ns = sDur;
+                    pkt.keyframe = true;
+                    ring_.PushAudio(std::move(pkt));
+                    contig->Unlock();
+                }
+            }
         }
-        if (stop_.load()) break;
+    };
+
+    auto trimQueueSurplus = [&](std::deque<StereoSample>& q, size_t stepNeeded, double& slipAccum) {
+        // Hard clamp bursts (>80ms surplus after this tick) down to 20ms with a short crossfade
+        const size_t hardCap = stepNeeded + 3840;
+        const size_t keepHead = stepNeeded + 960;
+        if (q.size() > hardCap) {
+            size_t dropCount = q.size() - keepHead;
+            StereoSample tailAvg = q[dropCount - 1];
+            q.erase(q.begin(), q.begin() + static_cast<ptrdiff_t>(dropCount));
+            const size_t fadeLen = std::min<size_t>(32, q.size());
+            for (size_t k = 0; k < fadeLen; ++k) {
+                float a = static_cast<float>(k + 1) / static_cast<float>(fadeLen + 1);
+                q[k].l = tailAvg.l * (1.0f - a) + q[k].l * a;
+                q[k].r = tailAvg.r * (1.0f - a) + q[k].r * a;
+            }
+            slipAccum = 0.0;
+        }
+    };
+
+    auto popWithSlip = [](std::deque<StereoSample>& q, double& slipAccum, StereoSample& lastSample,
+                          size_t remainOut, bool allowSlip) -> StereoSample {
+        if (q.empty()) {
+            lastSample.l *= 0.92f;
+            lastSample.r *= 0.92f;
+            return lastSample;
+        }
+        StereoSample s = q.front();
+        q.pop_front();
+        // Smoothly pull down slow clock-crystal drift (>35ms surplus) without jumps
+        if (allowSlip && q.size() > remainOut + 1680) {
+            slipAccum += 0.005;
+            if (slipAccum >= 1.0 && q.size() > remainOut + 2) {
+                slipAccum -= 1.0;
+                q.front().l = 0.5f * (s.l + q.front().l);
+                q.front().r = 0.5f * (s.r + q.front().r);
+                s = q.front();
+                q.pop_front();
+            }
+        } else {
+            slipAccum = 0.0;
+        }
+        lastSample = s;
+        return s;
+    };
+
+    while (!stop_.load()) {
+        if (!catchingUp) {
+            if (timer) {
+                LARGE_INTEGER due{};
+                due.QuadPart = -100000LL; // 10ms relative
+                SetWaitableTimer(timer, &due, 0, nullptr, nullptr, FALSE);
+                WaitForSingleObject(timer, 20);
+            } else {
+                Sleep(10);
+            }
+            if (stop_.load()) break;
+        }
 
         const int64_t nowQpc = GetQpcNow();
         const bool wantGame = captureGame_.load();
@@ -654,6 +755,8 @@ void AudioEngine::ThreadMain(int64_t masterStartQpc, std::wstring micDeviceId) {
                     Logger::Log("AudioEngine: default render device changed, reopening loopback");
                     gameStream.Open(en.Get(), true, L"");
                     gameQ.clear();
+                    lastGameSample = {0.0f, 0.0f};
+                    gameSlipAccum = 0.0;
                 }
             }
             if (wantMic && micDeviceId.empty() && micStream.active) {
@@ -662,6 +765,8 @@ void AudioEngine::ThreadMain(int64_t masterStartQpc, std::wstring micDeviceId) {
                     Logger::Log("AudioEngine: default capture device changed, reopening mic");
                     micStream.Open(en.Get(), false, L"");
                     micQ.clear();
+                    lastMicSample = {0.0f, 0.0f};
+                    micSlipAccum = 0.0;
                 }
             }
         }
@@ -669,20 +774,30 @@ void AudioEngine::ThreadMain(int64_t masterStartQpc, std::wstring micDeviceId) {
         if (en && QpcTo100Ns(nowQpc - lastReopenTryQpc) >= 10000000LL) {
             lastReopenTryQpc = nowQpc;
             if (wantGame && !gameStream.active) {
-                gameStream.Open(en.Get(), true, L"");
+                if (gameStream.Open(en.Get(), true, L"")) {
+                    gameStream.DrainTo48k(gameQ, wantGame);
+                    while (gameQ.size() > 720) gameQ.pop_front();
+                }
             }
             if (wantMic && !micStream.active) {
-                micStream.Open(en.Get(), false, micDeviceId);
+                if (micStream.Open(en.Get(), false, micDeviceId)) {
+                    micStream.DrainTo48k(micQ, wantMic && !micMuted_.load());
+                    while (micQ.size() > 720) micQ.pop_front();
+                }
             }
         }
 
         if (!wantGame && gameStream.active) {
             gameStream.Close();
             gameQ.clear();
+            lastGameSample = {0.0f, 0.0f};
+            gameSlipAccum = 0.0;
         }
         if (!wantMic && micStream.active) {
             micStream.Close();
             micQ.clear();
+            lastMicSample = {0.0f, 0.0f};
+            micSlipAccum = 0.0;
         }
 
         if (gameStream.active && !gameStream.DrainTo48k(gameQ, wantGame)) {
@@ -694,19 +809,47 @@ void AudioEngine::ThreadMain(int64_t masterStartQpc, std::wstring micDeviceId) {
             micStream.Close();
         }
 
-        // Prevent runaway latency (>150ms)
-        while (gameQ.size() > 7200) gameQ.pop_front();
-        while (micQ.size() > 7200) micQ.pop_front();
-
         int64_t elapsed100Ns = QpcTo100Ns(nowQpc - masterStartQpc);
         if (elapsed100Ns < 0) elapsed100Ns = 0;
         int64_t targetSamples = (elapsed100Ns * 48000LL) / 10000000LL;
         int64_t needed = targetSamples - totalEmitted;
-        if (needed <= 0) continue;
-        if (needed > 4800) {
-            // Catch up smoothly without large stalls if system paused
-            needed = 4800;
-            totalEmitted = targetSamples - needed;
+        if (needed <= 0) {
+            catchingUp = false;
+            continue;
+        }
+
+        // Large OS sleep / hibernate (>10s): reset AAC timeline cleanly instead of encoding minutes of silence.
+        // Normal hitches (<=10s) are bridged with continuous silence frames so AAC PTS stays locked 1:1 to QPC.
+        if (needed > 480000) {
+            Logger::Log("AudioEngine: clock jump %lld ms (>10s), resyncing audio timeline",
+                (long long)((needed * 1000LL) / 48000LL));
+            gameQ.clear();
+            micQ.clear();
+            pcmAccum.clear();
+            noiseGate.Reset();
+            lastGameSample = {0.0f, 0.0f};
+            lastMicSample = {0.0f, 0.0f};
+            gameSlipAccum = 0.0;
+            micSlipAccum = 0.0;
+            aenc->ProcessMessage(MFT_MESSAGE_COMMAND_FLUSH, 0);
+            aenc->ProcessMessage(MFT_MESSAGE_NOTIFY_START_OF_STREAM, 0);
+            totalEmitted = targetSamples;
+            aacSamplesFed = targetSamples;
+            catchingUp = false;
+            continue;
+        }
+
+        size_t stepNeeded = static_cast<size_t>(needed);
+        if (stepNeeded > 9600) {
+            stepNeeded = 9600; // Bridge stalls in <=200ms slices without sleeping
+            catchingUp = true;
+        } else {
+            catchingUp = false;
+        }
+
+        if (!catchingUp) {
+            trimQueueSurplus(gameQ, stepNeeded, gameSlipAccum);
+            trimQueueSurplus(micQ, stepNeeded, micSlipAccum);
         }
 
         const float gGain = wantGame ? (static_cast<float>(gameVolPct_.load()) / 100.0f) : 0.0f;
@@ -724,17 +867,10 @@ void AudioEngine::ThreadMain(int64_t masterStartQpc, std::wstring micDeviceId) {
             micLevelDb_.store(-60.0f, std::memory_order_relaxed);
         }
 
-        for (int64_t i = 0; i < needed; ++i) {
-            StereoSample gs{0.0f, 0.0f};
-            if (!gameQ.empty()) {
-                gs = gameQ.front();
-                gameQ.pop_front();
-            }
-            StereoSample ms{0.0f, 0.0f};
-            if (!micQ.empty()) {
-                ms = micQ.front();
-                micQ.pop_front();
-            }
+        for (size_t i = 0; i < stepNeeded; ++i) {
+            const size_t remainOut = stepNeeded - i - 1;
+            StereoSample gs = popWithSlip(gameQ, gameSlipAccum, lastGameSample, remainOut, !catchingUp);
+            StereoSample ms = popWithSlip(micQ, micSlipAccum, lastMicSample, remainOut, !catchingUp);
             float micMul = mGain;
             if (micActive) {
                 bool meterUpd = false;
@@ -751,7 +887,7 @@ void AudioEngine::ThreadMain(int64_t masterStartQpc, std::wstring micDeviceId) {
             pcmAccum.push_back(static_cast<int16_t>(std::max(-32768, std::min(32767, il))));
             pcmAccum.push_back(static_cast<int16_t>(std::max(-32768, std::min(32767, ir))));
         }
-        totalEmitted += needed;
+        totalEmitted += static_cast<int64_t>(stepNeeded);
 
         // Encode 1024-sample AAC frames
         const size_t chunkFloats = 1024 * 2;
@@ -770,47 +906,22 @@ void AudioEngine::ThreadMain(int64_t masterStartQpc, std::wstring micDeviceId) {
             MFCreateSample(inSamp.Put());
             inSamp->AddBuffer(inBuf.Get());
             int64_t pts = (aacSamplesFed * 10000000LL) / 48000LL;
-            int64_t dur = (1024LL * 10000000LL) / 48000LL;
+            int64_t dur = ((aacSamplesFed + 1024) * 10000000LL) / 48000LL - pts;
             inSamp->SetSampleTime(pts);
             inSamp->SetSampleDuration(dur);
 
-            if (SUCCEEDED(aenc->ProcessInput(0, inSamp.Get(), 0))) {
-                aacSamplesFed += 1024;
+            HRESULT phr = aenc->ProcessInput(0, inSamp.Get(), 0);
+            if (phr == MF_E_NOTACCEPTING) {
+                drainAacOutput();
+                phr = aenc->ProcessInput(0, inSamp.Get(), 0);
             }
+            if (FAILED(phr)) {
+                Logger::Log("AudioEngine: AAC ProcessInput failed hr=0x%08lx", (unsigned long)phr);
+                break;
+            }
+            aacSamplesFed += 1024;
             offset += chunkFloats;
-
-            while (true) {
-                ComPtr<IMFSample> outSamp;
-                MFCreateSample(outSamp.Put());
-                ComPtr<IMFMediaBuffer> outBuf;
-                MFCreateMemoryBuffer(outBufSize, outBuf.Put());
-                outSamp->AddBuffer(outBuf.Get());
-
-                MFT_OUTPUT_DATA_BUFFER odb{};
-                odb.pSample = outSamp.Get();
-                DWORD status = 0;
-                HRESULT ohr = aenc->ProcessOutput(0, 1, &odb, &status);
-                if (odb.pEvents) odb.pEvents->Release();
-                if (ohr == MF_E_TRANSFORM_NEED_MORE_INPUT || FAILED(ohr)) break;
-
-                ComPtr<IMFMediaBuffer> contig;
-                if (SUCCEEDED(outSamp->ConvertToContiguousBuffer(contig.Put()))) {
-                    BYTE* pOut = nullptr;
-                    DWORD len = 0;
-                    if (SUCCEEDED(contig->Lock(&pOut, nullptr, &len)) && len > 0) {
-                        EncodedPacket pkt;
-                        pkt.data = std::make_shared<const std::vector<uint8_t>>(pOut, pOut + len);
-                        LONGLONG sPts = 0, sDur = 0;
-                        outSamp->GetSampleTime(&sPts);
-                        outSamp->GetSampleDuration(&sDur);
-                        pkt.pts100ns = sPts;
-                        pkt.dur100ns = sDur;
-                        pkt.keyframe = true;
-                        ring_.PushAudio(std::move(pkt));
-                        contig->Unlock();
-                    }
-                }
-            }
+            drainAacOutput();
         }
         if (offset > 0) {
             pcmAccum.erase(pcmAccum.begin(), pcmAccum.begin() + static_cast<ptrdiff_t>(offset));
@@ -822,4 +933,5 @@ void AudioEngine::ThreadMain(int64_t masterStartQpc, std::wstring micDeviceId) {
     micStream.Close();
     aenc->ProcessMessage(MFT_MESSAGE_NOTIFY_END_OF_STREAM, 0);
     aenc->ProcessMessage(MFT_MESSAGE_COMMAND_DRAIN, 0);
+    drainAacOutput();
 }

@@ -138,12 +138,31 @@ bool RingBuffer::TakeSnapshot(int maxSeconds, ClipSnapshot& out) const {
     int64_t latestPts = video_.back().pts100ns;
     int64_t desiredStart = latestPts - targetNs;
 
-    // Pick the keyframe closest to (and <=) desiredStart, or earliest available keyframe
+    // Never span a sleep/resync timeline discontinuity (where audio stts=1 cannot represent large holes)
+    int64_t minSegmentPts = 0;
+    for (size_t i = video_.size(); i > 1; --i) {
+        if ((video_[i - 1].pts100ns - video_[i - 2].pts100ns) > 50000000LL) { // > 5s video jump
+            minSegmentPts = std::max(minSegmentPts, video_[i - 1].pts100ns);
+            break;
+        }
+    }
+    for (size_t i = audio_.size(); i > 1; --i) {
+        if ((audio_[i - 1].pts100ns - audio_[i - 2].pts100ns) > 5000000LL) { // > 0.5s audio discontinuity
+            minSegmentPts = std::max(minSegmentPts, audio_[i - 1].pts100ns);
+            break;
+        }
+    }
+    if (desiredStart < minSegmentPts) {
+        desiredStart = minSegmentPts;
+    }
+
+    // Pick the keyframe closest to (and <=) desiredStart, or earliest available keyframe after discontinuity
     size_t startIdx = video_.size();
     for (size_t i = 0; i < video_.size(); ++i) {
+        if (video_[i].pts100ns < minSegmentPts) continue;
         if (!video_[i].keyframe) continue;
         if (startIdx == video_.size()) {
-            startIdx = i; // first keyframe fallback
+            startIdx = i; // first keyframe fallback in continuous segment
         }
         if (video_[i].pts100ns <= desiredStart) {
             startIdx = i;

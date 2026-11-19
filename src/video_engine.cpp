@@ -528,8 +528,9 @@ void VideoEngine::ThreadMain(int64_t masterStartQpc, uint32_t dstW, uint32_t dst
     double measuredFps = static_cast<double>(fps);
 
     while (!stop_.load()) {
-        int64_t target100Ns = frameIdx * frameDur100Ns;
+        int64_t target100Ns = (frameIdx * 10000000LL) / fps;
         int64_t now100Ns = QpcTo100Ns(GetQpcNow() - masterStartQpc);
+        if (now100Ns < 0) now100Ns = 0;
         int64_t wait100Ns = target100Ns - now100Ns;
         if (wait100Ns > 10000LL && timer) { // > 1ms
             LARGE_INTEGER due{};
@@ -538,9 +539,11 @@ void VideoEngine::ThreadMain(int64_t masterStartQpc, uint32_t dstW, uint32_t dst
             WaitForSingleObject(timer, 50);
         } else if (wait100Ns < -frameDur100Ns * 3) {
             // Skip ahead cleanly if stalled by UAC / mode switch
-            frameIdx = now100Ns / frameDur100Ns;
-            target100Ns = frameIdx * frameDur100Ns;
+            int64_t jumpIdx = (now100Ns * fps) / 10000000LL;
+            if (jumpIdx > frameIdx) frameIdx = jumpIdx;
+            target100Ns = (frameIdx * 10000000LL) / fps;
         }
+        const int64_t stepDur100Ns = ((frameIdx + 1) * 10000000LL) / fps - target100Ns;
         if (stop_.load()) break;
 
         if (!cap.dupl) {
@@ -643,7 +646,7 @@ void VideoEngine::ThreadMain(int64_t masterStartQpc, uint32_t dstW, uint32_t dst
             MFCreateSample(samp.Put());
             samp->AddBuffer(inBuf.Get());
             samp->SetSampleTime(target100Ns);
-            samp->SetSampleDuration(frameDur100Ns);
+            samp->SetSampleDuration(stepDur100Ns);
             HRESULT phr = venc->ProcessInput(0, samp.Get(), 0);
             if (FAILED(phr)) {
                 Logger::Log("VideoEngine: ProcessInput failed hr=0x%08lx", (unsigned long)phr);
