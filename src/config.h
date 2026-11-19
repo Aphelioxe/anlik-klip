@@ -25,7 +25,7 @@ struct AppConfig {
     int micVolumePct = 100;
     bool micMuted = false;
     bool micNoiseGate = true;
-    int micGateThresholdDb = -36; // -60..-15 dB
+    int micGateThresholdDb = -44; // -60..-15 dB
     std::wstring micDeviceId; // empty = default Windows mic
 
     std::wstring outputDir;

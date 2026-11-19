@@ -2453,6 +2453,15 @@ LRESULT MainWindow::OnMessage(UINT msg, WPARAM wParam, LPARAM lParam) {
                     InvalidateRect(hwnd_, nullptr, FALSE);
                     break;
                 }
+                case ID_CMB_MIC_DEV:
+                    if (code == CBN_SELCHANGE) {
+                        AppConfig cfg = app_.Config();
+                        int micSel = static_cast<int>(SendMessageW(cmbMicDev_, CB_GETCURSEL, 0, 0));
+                        if (micSel <= 0 || micSel - 1 >= static_cast<int>(micDevices_.size())) cfg.micDeviceId.clear();
+                        else cfg.micDeviceId = micDevices_[static_cast<size_t>(micSel - 1)].id;
+                        if (cb_.onConfigApplied) cb_.onConfigApplied(cfg);
+                    }
+                    break;
                 case ID_BTN_SET_CLIP_HK:
                     hotkeys_.SetPaused(true);
                     captureHotkeyMode_ = 1;

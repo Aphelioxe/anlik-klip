@@ -11,6 +11,7 @@
 #include <propvarutil.h>
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstring>
 #include <deque>
@@ -346,12 +347,16 @@ inline float SoftClip(float x) {
  * Keeps a small high-pass sidechain for desk thumps/fan hum without altering voice EQ.
  */
 struct MicNoiseGate {
+    static constexpr size_t kRmsWinLen = 480; // 10 ms at 48 kHz: spans full pitch cycle down to 100 Hz
+    std::array<float, kRmsWinLen> winRing{};
+    size_t winIdx = 0;
+    double winSumSq = 0.0;
     float hpPrevIn = 0.0f;
     float hpState = 0.0f;
     float envSq = 0.0f;
-    float fastSq = 0.0f;
     float peakHoldSq = 0.0f;
     float gain = 0.0f;
+    int sincePeak = 1000;
     int aboveCount = 0;
     int holdLeft = 0;
     int meterSamples = 0;
@@ -359,10 +364,15 @@ struct MicNoiseGate {
     bool open = false;
 
     void Reset() {
+        winRing.fill(0.0f);
+        winIdx = 0;
+        winSumSq = 0.0;
+        hpPrevIn = 0.0f;
+        hpState = 0.0f;
         envSq = 0.0f;
-        fastSq = 0.0f;
         peakHoldSq = 0.0f;
         gain = 0.0f;
+        sincePeak = 1000;
         aboveCount = 0;
         holdLeft = 0;
         meterSamples = 0;
@@ -372,11 +382,20 @@ struct MicNoiseGate {
 
     float Process(float mono, bool enabled, float openSq, float closeSq, bool& meterUpdated) {
         meterUpdated = false;
-        const float hpCoeff = 0.9896f; // ~80 Hz at 48 kHz
+        const float hpCoeff = 0.9935f; // ~50 Hz subsonic desk-thump HPF without attenuating 100+ Hz voice
         hpState = hpCoeff * (hpState + mono - hpPrevIn);
         hpPrevIn = mono;
 
         const float sq = hpState * hpState;
+        winSumSq += static_cast<double>(sq) - static_cast<double>(winRing[winIdx]);
+        if (winSumSq < 0.0) winSumSq = 0.0;
+        winRing[winIdx] = sq;
+        if (++winIdx >= kRmsWinLen) winIdx = 0;
+        const float winMeanSq = static_cast<float>(winSumSq / static_cast<double>(kRmsWinLen));
+
+        if (sq >= openSq) sincePeak = 0;
+        else if (sincePeak < 10000) ++sincePeak;
+
         envSq += ((sq > envSq) ? 0.00148f : 0.00059f) * (sq - envSq);
         if (envSq > peakHoldSq) peakHoldSq = envSq;
         if (++meterSamples >= 1440) { // ~30 ms meter window
@@ -394,19 +413,20 @@ struct MicNoiseGate {
             return 1.0f;
         }
 
-        fastSq += ((sq > fastSq) ? 0.01f : 0.04f) * (sq - fastSq);
-        if (fastSq >= openSq) {
-            // Require ~10 ms sustained energy so <8 ms mechanical key clicks do not trigger the gate
-            if (aboveCount < 480) ++aboveCount;
-            if (aboveCount >= 480) {
+        if (winMeanSq >= openSq && sincePeak <= 216) {
+            // Require ~13 ms sustained vocal RMS to ignore <=7 ms mechanical key clicks
+            if (aboveCount < 624) ++aboveCount;
+            if (aboveCount >= 624) {
                 open = true;
-                holdLeft = 10560; // 220 ms hold
+                holdLeft = 12480; // 260 ms hold
             }
         } else {
-            aboveCount = std::max(0, aboveCount - 6);
+            if (winMeanSq < openSq * 0.70f || sincePeak > 216) {
+                aboveCount = std::max(0, aboveCount - 3);
+            }
             if (open) {
-                if (envSq >= closeSq) {
-                    holdLeft = 10560;
+                if (winMeanSq >= closeSq || envSq >= closeSq) {
+                    holdLeft = 12480;
                 } else if (holdLeft > 0) {
                     --holdLeft;
                 } else {
@@ -874,7 +894,8 @@ void AudioEngine::ThreadMain(int64_t masterStartQpc, std::wstring micDeviceId) {
             float micMul = mGain;
             if (micActive) {
                 bool meterUpd = false;
-                float gGate = noiseGate.Process(0.5f * (ms.l + ms.r), useGate, openSq, closeSq, meterUpd);
+                const float sidechain = (std::fabs(ms.l) >= std::fabs(ms.r)) ? ms.l : ms.r;
+                float gGate = noiseGate.Process(sidechain, useGate, openSq, closeSq, meterUpd);
                 if (meterUpd) {
                     micLevelDb_.store(noiseGate.meterDb, std::memory_order_relaxed);
                 }

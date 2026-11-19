@@ -59,7 +59,7 @@ AppConfig LoadConfig(const std::wstring& iniPath) {
     cfg.micVolumePct = ClampInt(GetPrivateProfileIntW(L"Audio", L"MicVolumePct", 100, iniPath.c_str()), 0, 200);
     cfg.micMuted = GetPrivateProfileIntW(L"Audio", L"MicMuted", 0, iniPath.c_str()) != 0;
     cfg.micNoiseGate = GetPrivateProfileIntW(L"Audio", L"MicNoiseGate", 1, iniPath.c_str()) != 0;
-    cfg.micGateThresholdDb = ClampInt(GetPrivateProfileIntW(L"Audio", L"MicGateThresholdDb", -36, iniPath.c_str()), -60, -15);
+    cfg.micGateThresholdDb = ClampInt(GetPrivateProfileIntW(L"Audio", L"MicGateThresholdDb", -44, iniPath.c_str()), -60, -15);
     cfg.micDeviceId = ReadIniString(L"Audio", L"MicDeviceId", L"", iniPath);
 
     std::wstring outDir = ReadIniString(L"General", L"OutputDir", cfg.outputDir.c_str(), iniPath);
