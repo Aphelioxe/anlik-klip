@@ -492,23 +492,103 @@ bool MainWindow::Create(int initialTab) {
     dpi_ = GetDpiForSystem();
     if (dpi_ < 96) dpi_ = 96;
 
-    DWORD style = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX | WS_CLIPCHILDREN;
-    RECT wr{ 0, 0, S(920), S(620) };
+    DWORD style = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX | WS_MAXIMIZEBOX | WS_THICKFRAME | WS_CLIPCHILDREN;
+    RECT wa{};
+    SystemParametersInfoW(SPI_GETWORKAREA, 0, &wa, 0);
+    const int waW = wa.right - wa.left;
+    const int waH = wa.bottom - wa.top;
+    const int initCW = std::max(S(920), std::min(S(1180), waW - 48));
+    const int initCH = std::max(S(620), std::min(S(740), waH - 64));
+    RECT wr{ 0, 0, initCW, initCH };
     AdjustWindowRectEx(&wr, style, FALSE, 0);
+    const int winW = wr.right - wr.left;
+    const int winH = wr.bottom - wr.top;
+    const int winX = wa.left + std::max(0, (waW - winW) / 2);
+    const int winY = wa.top + std::max(0, (waH - winH) / 2);
 
+    settingsOffsetX_ = 0;
     hwnd_ = CreateWindowExW(0, cls, L"Anlık Klip", style,
-        CW_USEDEFAULT, CW_USEDEFAULT, wr.right - wr.left, wr.bottom - wr.top,
+        winX, winY, winW, winH,
         nullptr, nullptr, hInst_, this);
     if (!hwnd_) return false;
 
     ApplyDarkTitleBarAndControls(hwnd_);
     CreateControls();
     LoadSettingsControls();
+    {
+        RECT cli{}; GetClientRect(hwnd_, &cli);
+        UpdateLayoutForSize(cli.right, cli.bottom);
+    }
     RefreshClips();
     SwitchTab(initialTab);
     ShowWindow(hwnd_, SW_SHOWNORMAL);
     SetForegroundWindow(hwnd_);
     return true;
+}
+
+void MainWindow::FreeBackbuffer() {
+    if (memDc_) {
+        if (memOldBmp_) SelectObject(memDc_, memOldBmp_);
+        if (memBmp_) DeleteObject(memBmp_);
+        DeleteDC(memDc_);
+    }
+    memDc_ = nullptr;
+    memBmp_ = nullptr;
+    memOldBmp_ = nullptr;
+    memW_ = 0;
+    memH_ = 0;
+}
+
+void MainWindow::UpdateLayoutForSize(int cw, int ch) {
+    if (!hwnd_ || cw <= 0 || ch <= 0) return;
+
+    const int newSox = std::max(0, (cw - S(220) - S(700)) / 2);
+    const int dx = newSox - settingsOffsetX_;
+    if (dx != 0) {
+        struct ShiftCtx { int dx; HWND edtSearch; HWND videoHwnd; } sc{ dx, edtSearch_, videoHwnd_ };
+        EnumChildWindows(hwnd_, [](HWND child, LPARAM lp) -> BOOL {
+            auto* s = reinterpret_cast<ShiftCtx*>(lp);
+            if (child == s->edtSearch || child == s->videoHwnd) return TRUE;
+            RECT rc{};
+            if (GetWindowRect(child, &rc)) {
+                HWND parent = GetParent(child);
+                MapWindowPoints(HWND_DESKTOP, parent, reinterpret_cast<LPPOINT>(&rc), 2);
+                SetWindowPos(child, nullptr, rc.left + s->dx, rc.top, 0, 0,
+                    SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+            }
+            return TRUE;
+        }, reinterpret_cast<LPARAM>(&sc));
+        settingsOffsetX_ = newSox;
+    }
+
+    if (edtSearch_) {
+        int sw = std::max(S(240), cw - S(646));
+        SetWindowPos(edtSearch_, nullptr, S(242), S(48), sw, S(24), SWP_NOZORDER | SWP_NOACTIVATE);
+    }
+
+    if (playerOpen_ && videoHwnd_ && !playerFullscreen_) {
+        if (trimMode_) {
+            int availW = std::max(S(320), cw - S(422));
+            int availH = std::max(S(200), ch - S(340));
+            int vw = availW;
+            int vh = (vw * 9) / 16;
+            if (vh > availH) { vh = availH; vw = (vh * 16) / 9; }
+            int vx = S(246) + (availW - vw) / 2;
+            int vy = S(58) + (availH - vh) / 2;
+            SetWindowPos(videoHwnd_, nullptr, vx, vy, vw, vh, SWP_NOZORDER | SWP_NOACTIVATE);
+        } else {
+            int availW = std::max(S(480), cw - S(272));
+            int availH = std::max(S(240), ch - S(254));
+            int vw = availW;
+            int vh = (vw * 9) / 16;
+            if (vh > availH) { vh = availH; vw = (vh * 16) / 9; }
+            int vx = S(246) + (availW - vw) / 2;
+            int vy = S(60) + (availH - vh) / 2;
+            SetWindowPos(videoHwnd_, nullptr, vx, vy, vw, vh, SWP_NOZORDER | SWP_NOACTIVATE);
+        }
+        if (player_) player_->UpdateVideo();
+    }
+    ClampScroll();
 }
 
 void MainWindow::BringToFront(int tab) {
@@ -531,7 +611,8 @@ void MainWindow::NotifyClipSaved(const ClipSaveResult& res) {
 void MainWindow::RefreshLiveStats() {
     if (!hwnd_) return;
     // Repaint sidebar only so embedded video never flickers
-    RECT sideRc{ 0, 0, S(220), S(620) };
+    RECT cli{}; GetClientRect(hwnd_, &cli);
+    RECT sideRc{ 0, 0, S(220), std::max<LONG>(S(620), cli.bottom) };
     InvalidateRect(hwnd_, &sideRc, FALSE);
 }
 
@@ -1058,6 +1139,10 @@ void MainWindow::OpenEmbeddedPlayer(int viewIdx) {
 
     playerOpen_ = true;
     UpdateGalleryControlVisibility();
+    {
+        RECT cli{}; GetClientRect(hwnd_, &cli);
+        UpdateLayoutForSize(cli.right, cli.bottom);
+    }
     SetTimer(hwnd_, TIMER_PLAYER_ID, 80, nullptr);
     InvalidateRect(hwnd_, nullptr, FALSE);
 }
@@ -1134,11 +1219,9 @@ void MainWindow::TogglePlayerFullscreen() {
             savedWindowRc_.right - savedWindowRc_.left, savedWindowRc_.bottom - savedWindowRc_.top,
             SWP_NOZORDER | SWP_FRAMECHANGED | SWP_SHOWWINDOW);
         if (videoHwnd_) {
-            if (trimMode_) {
-                SetWindowPos(videoHwnd_, nullptr, S(250), S(56), S(496), S(279), SWP_NOZORDER | SWP_SHOWWINDOW);
-            } else {
-                SetWindowPos(videoHwnd_, nullptr, S(250), S(62), S(640), S(360), SWP_NOZORDER | SWP_SHOWWINDOW);
-            }
+            RECT cli{}; GetClientRect(hwnd_, &cli);
+            UpdateLayoutForSize(cli.right, cli.bottom);
+            ShowWindow(videoHwnd_, SW_SHOW);
         }
     }
     if (player_) player_->UpdateVideo();
@@ -1156,13 +1239,10 @@ void MainWindow::ToggleTrimMode() {
         editCutActive_ = false;
         cutStartSec_ = 0.0;
         cutEndSec_ = 0.0;
-        if (videoHwnd_) {
-            SetWindowPos(videoHwnd_, nullptr, S(250), S(56), S(496), S(279), SWP_NOZORDER | SWP_SHOWWINDOW);
-        }
-    } else {
-        if (videoHwnd_) {
-            SetWindowPos(videoHwnd_, nullptr, S(250), S(62), S(640), S(360), SWP_NOZORDER | SWP_SHOWWINDOW);
-        }
+    }
+    if (videoHwnd_) {
+        RECT cli{}; GetClientRect(hwnd_, &cli);
+        UpdateLayoutForSize(cli.right, cli.bottom);
     }
     if (player_) player_->UpdateVideo();
     InvalidateRect(hwnd_, nullptr, FALSE);
@@ -1377,46 +1457,72 @@ void MainWindow::UpdatePlayerMetrics() {
 }
 
 RECT MainWindow::GetSeekBarRect() const {
-    if (playerFullscreen_ && hwnd_) {
-        RECT cli{}; GetClientRect(hwnd_, &cli);
-        return RECT{ S(16), cli.bottom - S(58), cli.right - S(16), cli.bottom - S(36) };
+    RECT cli{ 0, 0, S(920), S(620) };
+    if (hwnd_) GetClientRect(hwnd_, &cli);
+    const int cw = cli.right, ch = cli.bottom;
+    if (playerFullscreen_) {
+        return RECT{ S(16), ch - S(58), cw - S(16), ch - S(36) };
     }
     if (trimMode_) {
-        return RECT{ S(254), S(354), S(886), S(382) };
+        return RECT{ S(254), ch - S(264), cw - S(34), ch - S(236) };
     }
-    return RECT{ S(254), S(442), S(886), S(466) };
+    return RECT{ S(254), ch - S(176), cw - S(34), ch - S(152) };
 }
 
 RECT MainWindow::GetVolumeBarRect() const {
-    if (playerFullscreen_ && hwnd_) {
-        RECT cli{}; GetClientRect(hwnd_, &cli);
-        return RECT{ cli.right - S(230), cli.bottom - S(28), cli.right - S(126), cli.bottom - S(8) };
+    RECT cli{ 0, 0, S(920), S(620) };
+    if (hwnd_) GetClientRect(hwnd_, &cli);
+    const int cw = cli.right, ch = cli.bottom;
+    if (playerFullscreen_) {
+        return RECT{ cw - S(230), ch - S(28), cw - S(126), ch - S(8) };
     }
     if (trimMode_) {
-        return RECT{ S(780), S(470), S(886), S(494) };
+        return RECT{ cw - S(140), ch - S(148), cw - S(34), ch - S(124) };
     }
-    return RECT{ S(780), S(500), S(886), S(524) };
+    return RECT{ cw - S(140), ch - S(118), cw - S(34), ch - S(94) };
 }
 
 RECT MainWindow::GetGameVolBarRect() const {
-    return RECT{ S(764), S(100), S(888), S(120) };
+    RECT cli{ 0, 0, S(920), S(620) };
+    if (hwnd_) GetClientRect(hwnd_, &cli);
+    int rx = cli.right - S(156);
+    return RECT{ rx, S(100), cli.right - S(32), S(120) };
 }
 
 RECT MainWindow::GetMicVolBarRect() const {
-    return RECT{ S(764), S(182), S(888), S(202) };
+    RECT cli{ 0, 0, S(920), S(620) };
+    if (hwnd_) GetClientRect(hwnd_, &cli);
+    int rx = cli.right - S(156);
+    return RECT{ rx, S(182), cli.right - S(32), S(202) };
 }
 
 // ================= GALLERY & HIT TESTING =================
 
 RECT MainWindow::GetGridViewportRect() const {
-    return RECT{ S(242), S(82), S(898), S(534) };
+    RECT cli{ 0, 0, S(920), S(620) };
+    if (hwnd_) GetClientRect(hwnd_, &cli);
+    return RECT{ S(242), S(82), cli.right - S(22), cli.bottom - S(86) };
+}
+
+void MainWindow::GetGridMetrics(int& outCols, int& outCardW, int& outCardH, int& outGapX, int& outGapY) const {
+    RECT vp = GetGridViewportRect();
+    int availW = std::max(S(320), static_cast<int>(vp.right - vp.left - S(14)));
+    outCols = (availW >= S(920)) ? 3 : 2;
+    outGapX = S(16);
+    outGapY = S(14);
+    outCardW = (availW - (outCols - 1) * outGapX) / outCols;
+    int thumbW = std::max(S(160), outCardW - S(14));
+    int thumbH = (thumbW * 9) / 16;
+    outCardH = thumbH + S(58);
 }
 
 void MainWindow::ClampScroll() {
     RECT vp = GetGridViewportRect();
     int vpH = vp.bottom - vp.top;
-    int rows = (static_cast<int>(filteredIndices_.size()) + 1) / 2;
-    int totalH = rows > 0 ? (rows * S(226) + (rows - 1) * S(14)) : 0;
+    int cols = 2, cardW = S(312), cardH = S(226), gapX = S(16), gapY = S(14);
+    GetGridMetrics(cols, cardW, cardH, gapX, gapY);
+    int rows = (static_cast<int>(filteredIndices_.size()) + cols - 1) / cols;
+    int totalH = rows > 0 ? (rows * cardH + (rows - 1) * gapY) : 0;
     maxScrollY_ = std::max(0, totalH - vpH);
     scrollY_ = std::max(0, std::min(maxScrollY_, scrollY_));
 }
@@ -1426,14 +1532,12 @@ int MainWindow::HitTestCard(int mx, int my) const {
     RECT vp = GetGridViewportRect();
     if (mx < vp.left || mx > vp.right - S(12) || my < vp.top || my > vp.bottom) return -1;
 
-    const int cardW = S(312);
-    const int cardH = S(226);
-    const int gapX = S(16);
-    const int gapY = S(14);
+    int cols = 2, cardW = S(312), cardH = S(226), gapX = S(16), gapY = S(14);
+    GetGridMetrics(cols, cardW, cardH, gapX, gapY);
 
     for (size_t vi = 0; vi < filteredIndices_.size(); ++vi) {
-        int col = static_cast<int>(vi % 2);
-        int row = static_cast<int>(vi / 2);
+        int col = static_cast<int>(vi % cols);
+        int row = static_cast<int>(vi / cols);
         int x = vp.left + col * (cardW + gapX);
         int y = vp.top + row * (cardH + gapY) - scrollY_;
         if (mx >= x && mx <= x + cardW && my >= y && my <= y + cardH) {
@@ -1448,17 +1552,15 @@ int MainWindow::HitTestCardStar(int mx, int my) const {
     RECT vp = GetGridViewportRect();
     if (mx < vp.left || mx > vp.right - S(12) || my < vp.top || my > vp.bottom) return -1;
 
-    const int cardW = S(312);
-    const int cardH = S(226);
-    const int gapX = S(16);
-    const int gapY = S(14);
+    int cols = 2, cardW = S(312), cardH = S(226), gapX = S(16), gapY = S(14);
+    GetGridMetrics(cols, cardW, cardH, gapX, gapY);
 
     for (size_t vi = 0; vi < filteredIndices_.size(); ++vi) {
-        int col = static_cast<int>(vi % 2);
-        int row = static_cast<int>(vi / 2);
+        int col = static_cast<int>(vi % cols);
+        int row = static_cast<int>(vi / cols);
         int cx = vp.left + col * (cardW + gapX);
         int cy = vp.top + row * (cardH + gapY) - scrollY_;
-        int tx = cx + S(7), ty = cy + S(7), tw = S(298);
+        int tx = cx + S(7), ty = cy + S(7), tw = cardW - S(14);
         int sx = tx + tw - S(32), sy = ty + S(6);
         if (mx >= sx && mx <= sx + S(26) && my >= sy && my <= sy + S(24)) {
             return static_cast<int>(vi);
@@ -1632,9 +1734,15 @@ void MainWindow::PaintWindow(HDC targetDc) {
     const int ch = client.bottom - client.top;
     if (cw <= 0 || ch <= 0) return;
 
-    HDC memDc = CreateCompatibleDC(targetDc);
-    HBITMAP backBmp = CreateCompatibleBitmap(targetDc, cw, ch);
-    HGDIOBJ oldBmp = SelectObject(memDc, backBmp);
+    if (!memDc_ || memW_ != cw || memH_ != ch) {
+        FreeBackbuffer();
+        memDc_ = CreateCompatibleDC(targetDc);
+        memBmp_ = CreateCompatibleBitmap(targetDc, cw, ch);
+        memOldBmp_ = SelectObject(memDc_, memBmp_);
+        memW_ = cw;
+        memH_ = ch;
+    }
+    HDC memDc = memDc_;
 
     {
         Gdiplus::Graphics g(memDc);
@@ -1744,9 +1852,11 @@ void MainWindow::PaintWindow(HDC targetDc) {
             activeTab_ == 1 ? Gc(30, 41, 66) : Gc(19, 23, 32), Gc(34, 45, 70),
             activeTab_ == 1 ? Gc(59, 130, 246, 180) : Gc(0, 0, 0, 0), true, activeTab_ == 1);
 
-        // Telemetry card in sidebar
-        FillRoundRect(g, (float)S(16), (float)S(358), (float)S(188), (float)S(120), (float)S(10), Gc(26, 32, 44));
-        StrokeRoundRect(g, (float)S(16), (float)S(358), (float)S(188), (float)S(120), (float)S(10), Gc(44, 54, 72));
+        // Telemetry card & quick controls anchored cleanly to bottom of sidebar
+        const int sideAnchorY = std::max(0, (ch - S(620)));
+        const int telY = S(358) + sideAnchorY;
+        FillRoundRect(g, (float)S(16), (float)telY, (float)S(188), (float)S(120), (float)S(10), Gc(26, 32, 44));
+        StrokeRoundRect(g, (float)S(16), (float)telY, (float)S(188), (float)S(120), (float)S(10), Gc(44, 54, 72));
         double bufMb = static_cast<double>(st.ring.videoBytes + st.ring.audioBytes) / (1024.0 * 1024.0);
         wchar_t t1[64], t2[64], t3[64], t4[64];
         swprintf(t1, 64, L"RAM: %.1f MB", st.workingSetMb);
@@ -1754,24 +1864,39 @@ void MainWindow::PaintWindow(HDC targetDc) {
         swprintf(t3, 64, L"Süre: %.0f / %d sn", st.ring.bufferedSeconds, app_.Config().clipSeconds);
         std::wstring hk = FormatHotkey(app_.Config().hotkeyMods, app_.Config().hotkeyVk);
         swprintf(t4, 64, L"Kısayol: %ls", hk.c_str());
-        g.DrawString(t1, -1, &fSub, Gdiplus::RectF((float)S(28), (float)S(368), (float)S(164), (float)S(20)), &sfLeft, &brText);
-        g.DrawString(t2, -1, &fSub, Gdiplus::RectF((float)S(28), (float)S(392), (float)S(164), (float)S(20)), &sfLeft, &brMuted);
-        g.DrawString(t3, -1, &fSub, Gdiplus::RectF((float)S(28), (float)S(416), (float)S(164), (float)S(20)), &sfLeft, &brMuted);
-        FillRoundRect(g, (float)S(28), (float)S(443), (float)S(164), (float)S(24), (float)S(6), Gc(37, 99, 235, 55));
+        g.DrawString(t1, -1, &fSub, Gdiplus::RectF((float)S(28), (float)(telY + S(10)), (float)S(164), (float)S(20)), &sfLeft, &brText);
+        g.DrawString(t2, -1, &fSub, Gdiplus::RectF((float)S(28), (float)(telY + S(34)), (float)S(164), (float)S(20)), &sfLeft, &brMuted);
+        g.DrawString(t3, -1, &fSub, Gdiplus::RectF((float)S(28), (float)(telY + S(58)), (float)S(164), (float)S(20)), &sfLeft, &brMuted);
+        FillRoundRect(g, (float)S(28), (float)(telY + S(85)), (float)S(164), (float)S(24), (float)S(6), Gc(37, 99, 235, 55));
         Gdiplus::SolidBrush brBlueTxt(Gc(147, 197, 253));
-        g.DrawString(t4, -1, &fSmall, Gdiplus::RectF((float)S(28), (float)S(443), (float)S(164), (float)S(24)), &sfCenter, &brBlueTxt);
+        g.DrawString(t4, -1, &fSmall, Gdiplus::RectF((float)S(28), (float)(telY + S(85)), (float)S(164), (float)S(24)), &sfCenter, &brBlueTxt);
+
+        auto addBtnPx = [&](int id, int px, int py, int pw, int ph, const std::wstring& label,
+                            Gdiplus::Color baseCol, Gdiplus::Color hoverCol, Gdiplus::Color borderCol,
+                            bool enabled = true) {
+            RECT rc{ px, py, px + pw, py + ph };
+            customButtons_.push_back({ id, rc, enabled });
+            bool hov = enabled && (hoverBtnId_ == id);
+            bool prs = enabled && (pressedBtnId_ == id);
+            Gdiplus::Color fill = !enabled ? Gc(28, 33, 45) : (prs ? hoverCol : (hov ? hoverCol : baseCol));
+            FillRoundRect(g, (float)rc.left, (float)rc.top, (float)pw, (float)ph, (float)S(8), fill);
+            if (borderCol.GetA() > 0) StrokeRoundRect(g, (float)rc.left, (float)rc.top, (float)pw, (float)ph, (float)S(8), borderCol);
+            Gdiplus::SolidBrush tb(!enabled ? Gc(100, 112, 132) : Gc(242, 246, 252));
+            g.DrawString(label.c_str(), -1, &fBold, Gdiplus::RectF((float)rc.left, (float)rc.top, (float)pw, (float)ph), &sfCenter, &tb);
+        };
 
         // Quick controls at bottom of sidebar
-        addBtn(BTN_SIDE_SAVE, 16, 492, 188, 38, L"●  Hemen Klip Al",
+        const int btnBaseY = S(492) + sideAnchorY;
+        addBtnPx(BTN_SIDE_SAVE, S(16), btnBaseY, S(188), S(38), L"●  Hemen Klip Al",
             Gc(37, 99, 235), Gc(59, 130, 246), Gc(96, 165, 250, 150), st.running && !st.saving);
-        addBtn(BTN_SIDE_TOGGLE, 16, 538, 90, 32, st.running ? L"Duraklat" : L"Başlat",
+        addBtnPx(BTN_SIDE_TOGGLE, S(16), btnBaseY + S(46), S(90), S(32), st.running ? L"Duraklat" : L"Başlat",
             st.running ? Gc(30, 37, 52) : Gc(22, 163, 74),
             st.running ? Gc(42, 51, 70) : Gc(34, 197, 94), Gc(52, 64, 86));
-        addBtn(BTN_SIDE_MIC, 114, 538, 90, 32, app_.Config().micMuted ? L"Mik: Sustu" : L"Mik: Açık",
+        addBtnPx(BTN_SIDE_MIC, S(114), btnBaseY + S(46), S(90), S(32), app_.Config().micMuted ? L"Mik: Sustu" : L"Mik: Açık",
             app_.Config().micMuted ? Gc(180, 83, 9) : Gc(30, 37, 52),
             app_.Config().micMuted ? Gc(217, 119, 6) : Gc(42, 51, 70), Gc(52, 64, 86));
         g.DrawString(L"X ile kapatınca tepside çalışır", -1, &fSmall,
-            Gdiplus::RectF((float)S(16), (float)S(582), (float)S(188), (float)S(20)), &sfCenter, &brMuted);
+            Gdiplus::RectF((float)S(16), (float)(btnBaseY + S(90)), (float)S(188), (float)S(20)), &sfCenter, &brMuted);
 
         if (activeTab_ == 0 && playerOpen_ && playerFullscreen_) {
             // ================= FULLSCREEN PLAYER OVERLAY BAR =================
@@ -1841,34 +1966,42 @@ void MainWindow::PaintWindow(HDC targetDc) {
                     break;
                 }
             }
-            addBtn(BTN_PLY_BACK, 242, 18, 114, 34, L"←  Kliplere", Gc(28, 34, 47), Gc(40, 49, 68), Gc(54, 66, 90), !trimBusy_);
+            addBtnPx(BTN_PLY_BACK, S(242), S(18), S(114), S(34), L"←  Kliplere", Gc(28, 34, 47), Gc(40, 49, 68), Gc(54, 66, 90), !trimBusy_);
             g.DrawString(playerClipTitle_.c_str(), -1, &fBold,
-                Gdiplus::RectF((float)S(364), (float)S(16), (float)S(194), (float)S(20)), &sfLeft, &brText);
-            g.DrawString(L"Space: Oynat • ←/→: ±5sn • Esc: Geri", -1, &fSmall,
-                Gdiplus::RectF((float)S(364), (float)S(36), (float)S(198), (float)S(16)), &sfLeft, &brMuted);
+                Gdiplus::RectF((float)S(364), (float)S(16), (float)std::max(S(140), cw - S(720)), (float)S(20)), &sfLeft, &brText);
+            g.DrawString(L"Space: Oynat • ←/→: ±5sn • F: Tam Ekran • Esc: Geri", -1, &fSmall,
+                Gdiplus::RectF((float)S(364), (float)S(36), (float)std::max(S(180), cw - S(720)), (float)S(16)), &sfLeft, &brMuted);
 
-            addBtn(BTN_PLY_FAV, 564, 18, 74, 34, curFav ? L"★ Fav" : L"☆ Fav",
+            addBtnPx(BTN_PLY_FAV, cw - S(356), S(18), S(74), S(34), curFav ? L"★ Fav" : L"☆ Fav",
                 curFav ? Gc(92, 68, 14) : Gc(28, 34, 47),
                 curFav ? Gc(120, 88, 18) : Gc(40, 49, 68),
                 curFav ? Gc(250, 204, 21) : Gc(52, 64, 86), !trimBusy_);
-            addBtn(BTN_PLY_RENAME, 644, 18, 84, 34, L"Adlandır", Gc(28, 34, 47), Gc(40, 49, 68), Gc(52, 64, 86), !trimBusy_);
-            addBtn(BTN_PLY_FOLDER, 734, 18, 94, 34, L"Klasörde Aç", Gc(28, 34, 47), Gc(40, 49, 68), Gc(52, 64, 86), !trimBusy_);
-            addBtn(BTN_PLY_DELETE, 834, 18, 64, 34, L"Sil", Gc(153, 27, 27), Gc(185, 28, 28), Gc(220, 38, 38), !trimBusy_);
+            addBtnPx(BTN_PLY_RENAME, cw - S(276), S(18), S(84), S(34), L"Adlandır", Gc(28, 34, 47), Gc(40, 49, 68), Gc(52, 64, 86), !trimBusy_);
+            addBtnPx(BTN_PLY_FOLDER, cw - S(186), S(18), S(94), S(34), L"Klasörde Aç", Gc(28, 34, 47), Gc(40, 49, 68), Gc(52, 64, 86), !trimBusy_);
+            addBtnPx(BTN_PLY_DELETE, cw - S(86), S(18), S(64), S(34), L"Sil", Gc(153, 27, 27), Gc(185, 28, 28), Gc(220, 38, 38), !trimBusy_);
 
-            // Frame border around child video HWND
+            // Frame border around dynamic child video HWND
+            RECT vrc{ S(246), S(58), cw - S(26), ch - (trimMode_ ? S(286) : S(198)) };
+            if (videoHwnd_) {
+                GetWindowRect(videoHwnd_, &vrc);
+                MapWindowPoints(HWND_DESKTOP, hwnd_, reinterpret_cast<LPPOINT>(&vrc), 2);
+            }
+            StrokeRoundRect(g, (float)(vrc.left - 1), (float)(vrc.top - 1),
+                (float)(vrc.right - vrc.left + 2), (float)(vrc.bottom - vrc.top + 2), 4.0f, Gc(45, 55, 74), 1.0f);
+            if (trimBusy_) {
+                FillRoundRect(g, (float)vrc.left, (float)vrc.top, (float)(vrc.right - vrc.left), (float)(vrc.bottom - vrc.top), 4.0f, Gc(15, 19, 27));
+                g.DrawString(L"✂  Klip düzenleniyor, lütfen bekleyin...", -1, &fTitle,
+                    Gdiplus::RectF((float)vrc.left, (float)vrc.top, (float)(vrc.right - vrc.left), (float)(vrc.bottom - vrc.top)), &sfCenter, &brText);
+            }
+
             if (trimMode_) {
-                StrokeRoundRect(g, (float)S(249), (float)S(55), (float)S(498), (float)S(281), 4.0f, Gc(45, 55, 74), 1.0f);
-                if (trimBusy_) {
-                    FillRoundRect(g, (float)S(250), (float)S(56), (float)S(496), (float)S(279), 4.0f, Gc(15, 19, 27));
-                    g.DrawString(L"✂  Klip düzenleniyor, lütfen bekleyin...", -1, &fTitle,
-                        Gdiplus::RectF((float)S(250), (float)S(56), (float)S(496), (float)S(279)), &sfCenter, &brText);
-                }
-
-                // Right-side Audio & Edit panel (754, 56, 144, 279)
-                FillRoundRect(g, (float)S(754), (float)S(56), (float)S(144), (float)S(279), (float)S(10), Gc(20, 25, 35));
-                StrokeRoundRect(g, (float)S(754), (float)S(56), (float)S(144), (float)S(279), (float)S(10), Gc(40, 48, 65));
+                // Right-side Audio & Edit panel anchored to right edge
+                const int rpX = cw - S(166);
+                const int rpH = std::max(S(266), ch - S(340));
+                FillRoundRect(g, (float)rpX, (float)S(56), (float)S(144), (float)rpH, (float)S(10), Gc(20, 25, 35));
+                StrokeRoundRect(g, (float)rpX, (float)S(56), (float)S(144), (float)rpH, (float)S(10), Gc(40, 48, 65));
                 g.DrawString(L"Ses & Edit", -1, &fBold,
-                    Gdiplus::RectF((float)S(764), (float)S(64), (float)S(124), (float)S(20)), &sfLeft, &brText);
+                    Gdiplus::RectF((float)(rpX + S(10)), (float)S(64), (float)S(124), (float)S(20)), &sfLeft, &brText);
 
                 auto drawMiniSlider = [&](RECT r, int pct, bool muted, Gdiplus::Color col) {
                     float w = static_cast<float>(r.right - r.left);
@@ -1883,50 +2016,41 @@ void MainWindow::PaintWindow(HDC targetDc) {
                 bool canPlay = playerReady_ && !trimBusy_;
                 wchar_t gLbl[48] = {};
                 swprintf(gLbl, 48, L"Oyun/PC: %d%%", editGameMuted_ ? 0 : editGameVolPct_);
-                g.DrawString(gLbl, -1, &fSmall, Gdiplus::RectF((float)S(764), (float)S(84), (float)S(124), (float)S(16)), &sfLeft, &brMuted);
+                g.DrawString(gLbl, -1, &fSmall, Gdiplus::RectF((float)(rpX + S(10)), (float)S(84), (float)S(124), (float)S(16)), &sfLeft, &brMuted);
                 drawMiniSlider(GetGameVolBarRect(), editGameVolPct_, editGameMuted_, Gc(16, 185, 129));
-                addBtn(BTN_EDIT_GAME_MUTE, 764, 124, 124, 24, editGameMuted_ ? L"Oyun: Sustu" : L"Oyun Sustur",
+                addBtnPx(BTN_EDIT_GAME_MUTE, rpX + S(10), S(124), S(124), S(24), editGameMuted_ ? L"Oyun: Sustu" : L"Oyun Sustur",
                     editGameMuted_ ? Gc(180, 83, 9) : Gc(32, 39, 53),
                     editGameMuted_ ? Gc(217, 119, 6) : Gc(44, 54, 72), Gc(56, 68, 90), canPlay);
 
                 wchar_t mLbl[48] = {};
-                if (editHasMultiTrack_) {
-                    swprintf(mLbl, 48, L"Mikrofon: %d%%", editMicMuted_ ? 0 : editMicVolPct_);
-                } else {
-                    swprintf(mLbl, 48, L"Mikrofon (Tek İz)");
-                }
-                g.DrawString(mLbl, -1, &fSmall, Gdiplus::RectF((float)S(764), (float)S(162), (float)S(124), (float)S(16)), &sfLeft, &brMuted);
+                if (editHasMultiTrack_) swprintf(mLbl, 48, L"Mikrofon: %d%%", editMicMuted_ ? 0 : editMicVolPct_);
+                else swprintf(mLbl, 48, L"Mikrofon (Tek İz)");
+                g.DrawString(mLbl, -1, &fSmall, Gdiplus::RectF((float)(rpX + S(10)), (float)S(162), (float)S(124), (float)S(16)), &sfLeft, &brMuted);
                 drawMiniSlider(GetMicVolBarRect(), editMicVolPct_, editMicMuted_ || !editHasMultiTrack_, Gc(59, 130, 246));
-                addBtn(BTN_EDIT_MIC_MUTE, 764, 206, 124, 24, editMicMuted_ ? L"Mik: Sustu" : L"Mik Sustur",
+                addBtnPx(BTN_EDIT_MIC_MUTE, rpX + S(10), S(206), S(124), S(24), editMicMuted_ ? L"Mik: Sustu" : L"Mik Sustur",
                     editMicMuted_ ? Gc(180, 83, 9) : Gc(32, 39, 53),
                     editMicMuted_ ? Gc(217, 119, 6) : Gc(44, 54, 72), Gc(56, 68, 90), canPlay && editHasMultiTrack_);
 
                 wchar_t spdLbl[32] = {};
                 swprintf(spdLbl, 32, L"Kayıt Hızı: %.1fx", editSpeed_);
-                addBtn(BTN_EDIT_SPEED, 764, 240, 124, 24, spdLbl, Gc(32, 39, 53), Gc(44, 54, 72), Gc(56, 68, 90), canPlay);
-                addBtn(BTN_EDIT_ADD_CLIP, 764, 268, 124, 24,
+                addBtnPx(BTN_EDIT_SPEED, rpX + S(10), S(240), S(124), S(24), spdLbl, Gc(32, 39, 53), Gc(44, 54, 72), Gc(56, 68, 90), canPlay);
+                addBtnPx(BTN_EDIT_ADD_CLIP, rpX + S(10), S(268), S(124), S(24),
                     editInsertClipPath_.empty() ? L"+ Klip Ekle" : L"✕ Eklenen Klip",
                     editInsertClipPath_.empty() ? Gc(32, 39, 53) : Gc(30, 64, 175),
                     Gc(44, 54, 72), Gc(96, 165, 250), canPlay);
-                addBtn(BTN_EDIT_VERTICAL, 764, 296, 124, 24,
+                addBtnPx(BTN_EDIT_VERTICAL, rpX + S(10), S(296), S(124), S(24),
                     editVertical916_ ? L"9:16 Dikey: Açık" : L"9:16 Dikey: Kapalı",
                     editVertical916_ ? Gc(124, 58, 237) : Gc(32, 39, 53),
                     editVertical916_ ? Gc(139, 92, 246) : Gc(44, 54, 72), Gc(167, 139, 250), canPlay);
 
-                // Multi-track timeline & control card (242, 342, 656, 262)
-                FillRoundRect(g, (float)S(242), (float)S(342), (float)S(656), (float)S(262), (float)S(12), Gc(20, 25, 35));
-                StrokeRoundRect(g, (float)S(242), (float)S(342), (float)S(656), (float)S(262), (float)S(12), Gc(40, 48, 65));
+                // Multi-track timeline & control card anchored to bottom
+                const int edY = ch - S(278);
+                FillRoundRect(g, (float)S(242), (float)edY, (float)(cw - S(264)), (float)S(262), (float)S(12), Gc(20, 25, 35));
+                StrokeRoundRect(g, (float)S(242), (float)edY, (float)(cw - S(264)), (float)S(262), (float)S(12), Gc(40, 48, 65));
             } else {
-                StrokeRoundRect(g, (float)S(249), (float)S(61), (float)S(642), (float)S(362), 4.0f, Gc(45, 55, 74), 1.0f);
-                if (trimBusy_) {
-                    FillRoundRect(g, (float)S(250), (float)S(62), (float)S(640), (float)S(360), 4.0f, Gc(15, 19, 27));
-                    g.DrawString(L"✂  Klip düzenleniyor, lütfen bekleyin...", -1, &fTitle,
-                        Gdiplus::RectF((float)S(250), (float)S(62), (float)S(640), (float)S(360)), &sfCenter, &brText);
-                }
-
-                // Control card below video (242, 430, 656, 174)
-                FillRoundRect(g, (float)S(242), (float)S(430), (float)S(656), (float)S(174), (float)S(12), Gc(20, 25, 35));
-                StrokeRoundRect(g, (float)S(242), (float)S(430), (float)S(656), (float)S(174), (float)S(12), Gc(40, 48, 65));
+                const int pcY = ch - S(190);
+                FillRoundRect(g, (float)S(242), (float)pcY, (float)(cw - S(264)), (float)S(174), (float)S(12), Gc(20, 25, 35));
+                StrokeRoundRect(g, (float)S(242), (float)pcY, (float)(cw - S(264)), (float)S(174), (float)S(12), Gc(40, 48, 65));
             }
 
             // Seekbar track + optional trim/cut highlight & handles
@@ -1964,27 +2088,26 @@ void MainWindow::PaintWindow(HDC targetDc) {
                 FillRoundRect(g, xs - S(4), trackY - S(7), (float)S(8), (float)S(20), (float)S(3), Gc(34, 197, 94));
                 FillRoundRect(g, xe - S(4), trackY - S(7), (float)S(8), (float)S(20), (float)S(3), Gc(245, 158, 11));
 
-                // Multi-track visual strips (Oyun/PC & Mikrofon)
                 auto drawTrackStrip = [&](int ty, const wchar_t* lbl, Gdiplus::Color col, bool active) {
-                    g.DrawString(lbl, -1, &fSmall, Gdiplus::RectF((float)S(254), (float)S(ty), (float)S(82), (float)S(16)), &sfLeft, &brMuted);
-                    float tx = (float)S(340), tw = (float)S(546);
-                    FillRoundRect(g, tx, (float)S(ty + 2), tw, (float)S(12), (float)S(4), Gc(28, 34, 46));
+                    g.DrawString(lbl, -1, &fSmall, Gdiplus::RectF((float)S(254), (float)ty, (float)S(82), (float)S(16)), &sfLeft, &brMuted);
+                    float tx = (float)S(340), tw = (float)std::max(S(200), cw - S(374));
+                    FillRoundRect(g, tx, (float)(ty + S(2)), tw, (float)S(12), (float)S(4), Gc(28, 34, 46));
                     float s0 = tx + tw * static_cast<float>(sr0);
                     float s1 = tx + tw * static_cast<float>(sr1);
                     if (s1 - s0 > 2.0f) {
-                        FillRoundRect(g, s0, (float)S(ty + 2), s1 - s0, (float)S(12), (float)S(4),
+                        FillRoundRect(g, s0, (float)(ty + S(2)), s1 - s0, (float)S(12), (float)S(4),
                             active ? col : Gc(70, 80, 96, 110));
                     }
                     if (editCutActive_ && cutEndSec_ > cutStartSec_) {
                         float cs0 = tx + tw * static_cast<float>(std::max(sr0, std::min(sr1, cutStartSec_ / dur)));
                         float cs1 = tx + tw * static_cast<float>(std::max(sr0, std::min(sr1, cutEndSec_ / dur)));
                         if (cs1 - cs0 > 2.0f) {
-                            FillRoundRect(g, cs0, (float)S(ty + 2), cs1 - cs0, (float)S(12), (float)S(2), Gc(185, 28, 28, 180));
+                            FillRoundRect(g, cs0, (float)(ty + S(2)), cs1 - cs0, (float)S(12), (float)S(2), Gc(185, 28, 28, 180));
                         }
                     }
                 };
-                drawTrackStrip(388, L"Oyun / PC", Gc(16, 185, 129, 175), !editGameMuted_ && editGameVolPct_ > 0);
-                drawTrackStrip(410, L"Mikrofon", Gc(59, 130, 246, 175), editHasMultiTrack_ && !editMicMuted_ && editMicVolPct_ > 0);
+                drawTrackStrip(ch - S(232), L"Oyun / PC", Gc(16, 185, 129, 175), !editGameMuted_ && editGameVolPct_ > 0);
+                drawTrackStrip(ch - S(210), L"Mikrofon", Gc(59, 130, 246, 175), editHasMultiTrack_ && !editMicMuted_ && editMicVolPct_ > 0);
             }
 
             float knobX = static_cast<float>(sk.left) + fillW;
@@ -1994,15 +2117,14 @@ void MainWindow::PaintWindow(HDC targetDc) {
             Gdiplus::SolidBrush knobBr(Gc(248, 250, 252));
             g.FillEllipse(&knobBr, knobX - knobR, trackY + trackH * 0.5f - knobR, knobR * 2.0f, knobR * 2.0f);
 
-            const int timeY = trimMode_ ? 436 : 468;
-            const int btnY  = trimMode_ ? 464 : 494;
+            const int timeY = trimMode_ ? (ch - S(184)) : (ch - S(152));
+            const int btnY  = trimMode_ ? (ch - S(156)) : (ch - S(126));
 
-            // Time display & trim range label
             wchar_t timeTxt[64] = {};
             swprintf(timeTxt, 64, L"%ls  /  %ls",
                 FormatDurClock(playerPosSec_).c_str(), FormatDurClock(playerDurSec_).c_str());
             g.DrawString(timeTxt, -1, &fBold,
-                Gdiplus::RectF((float)S(254), (float)S(timeY), (float)S(150), (float)S(22)), &sfLeft, &brText);
+                Gdiplus::RectF((float)S(254), (float)timeY, (float)S(150), (float)S(22)), &sfLeft, &brText);
 
             if (trimMode_) {
                 double spanSec = std::max(0.0, trimEndSec_ - trimStartSec_);
@@ -2013,37 +2135,36 @@ void MainWindow::PaintWindow(HDC targetDc) {
                     spanSec / editSpeed_, editCutActive_ ? L", orta kesildi" : L"");
                 Gdiplus::SolidBrush brMint(Gc(110, 231, 183));
                 g.DrawString(trimInfo, -1, &fSmall,
-                    Gdiplus::RectF((float)S(410), (float)S(timeY), (float)S(476), (float)S(22)), &sfLeft, &brMint);
+                    Gdiplus::RectF((float)S(410), (float)timeY, (float)std::max(S(240), cw - S(434)), (float)S(22)), &sfLeft, &brMint);
             } else if (!playerReady_ && !trimBusy_) {
                 g.DrawString(L"Video hazırlanıyor...", -1, &fSmall,
-                    Gdiplus::RectF((float)S(416), (float)S(timeY), (float)S(200), (float)S(22)), &sfLeft, &brMuted);
+                    Gdiplus::RectF((float)S(416), (float)timeY, (float)S(200), (float)S(22)), &sfLeft, &brMuted);
             }
 
             // Transport buttons
             bool canPlay = playerReady_ && !trimBusy_;
-            addBtn(BTN_PLY_PLAYPAUSE, 254, btnY, 98, 34,
+            addBtnPx(BTN_PLY_PLAYPAUSE, S(254), btnY, S(98), S(34),
                 playerPlaying_ ? L"⏸ Duraklat" : (playerEnded_ ? L"↻ Tekrar" : L"▶ Oynat"),
                 Gc(37, 99, 235), Gc(59, 130, 246), Gc(96, 165, 250, 150), canPlay);
-            addBtn(BTN_PLY_MINUS5, 358, btnY, 52, 34, L"-5 sn", Gc(32, 39, 53), Gc(44, 54, 72), Gc(56, 68, 90), canPlay);
-            addBtn(BTN_PLY_PLUS5, 416, btnY, 52, 34, L"+5 sn", Gc(32, 39, 53), Gc(44, 54, 72), Gc(56, 68, 90), canPlay);
-            addBtn(BTN_PLY_RESTART, 474, btnY, 54, 34, L"Başa", Gc(32, 39, 53), Gc(44, 54, 72), Gc(56, 68, 90), canPlay);
+            addBtnPx(BTN_PLY_MINUS5, S(358), btnY, S(52), S(34), L"-5 sn", Gc(32, 39, 53), Gc(44, 54, 72), Gc(56, 68, 90), canPlay);
+            addBtnPx(BTN_PLY_PLUS5, S(416), btnY, S(52), S(34), L"+5 sn", Gc(32, 39, 53), Gc(44, 54, 72), Gc(56, 68, 90), canPlay);
+            addBtnPx(BTN_PLY_RESTART, S(474), btnY, S(54), S(34), L"Başa", Gc(32, 39, 53), Gc(44, 54, 72), Gc(56, 68, 90), canPlay);
 
             wchar_t rateStr[16] = {};
             swprintf(rateStr, 16, L"%.1fx", playerRate_);
-            addBtn(BTN_PLY_RATE, 534, btnY, 46, 34, rateStr, Gc(32, 39, 53), Gc(44, 54, 72), Gc(56, 68, 90), canPlay);
+            addBtnPx(BTN_PLY_RATE, S(534), btnY, S(46), S(34), rateStr, Gc(32, 39, 53), Gc(44, 54, 72), Gc(56, 68, 90), canPlay);
 
-            addBtn(BTN_PLY_TRIM, 586, btnY, 96, 34, L"✂ Düzenle",
+            addBtnPx(BTN_PLY_TRIM, S(586), btnY, S(96), S(34), L"✂ Düzenle",
                 trimMode_ ? Gc(13, 148, 136) : Gc(32, 39, 53),
                 trimMode_ ? Gc(20, 184, 166) : Gc(44, 54, 72),
                 trimMode_ ? Gc(94, 234, 212) : Gc(56, 68, 90), canPlay);
 
-            addBtn(BTN_PLY_FULLSCREEN, 688, btnY, 32, 34, L"⛶", Gc(32, 39, 53), Gc(44, 54, 72), Gc(56, 68, 90), canPlay);
+            addBtnPx(BTN_PLY_FULLSCREEN, cw - S(232), btnY, S(32), S(34), L"⛶", Gc(32, 39, 53), Gc(44, 54, 72), Gc(56, 68, 90), canPlay);
 
-            addBtn(BTN_PLY_MUTE, 726, btnY, 48, 34, playerMuted_ ? L"Sessiz" : L"Ses",
+            addBtnPx(BTN_PLY_MUTE, cw - S(194), btnY, S(48), S(34), playerMuted_ ? L"Sessiz" : L"Ses",
                 playerMuted_ ? Gc(180, 83, 9) : Gc(32, 39, 53),
                 playerMuted_ ? Gc(217, 119, 6) : Gc(44, 54, 72), Gc(56, 68, 90), canPlay);
 
-            // Volume slider bar
             RECT vb = GetVolumeBarRect();
             float vbW = static_cast<float>(vb.right - vb.left);
             float vbY = static_cast<float>(vb.top + (vb.bottom - vb.top) / 2 - S(3));
@@ -2056,26 +2177,28 @@ void MainWindow::PaintWindow(HDC targetDc) {
             g.FillEllipse(&knobBr, vKnobX - S(6), vbY + S(3) - S(6), (float)S(12), (float)S(12));
 
             if (trimMode_) {
+                const int row1Y = ch - S(112);
+                const int row2Y = ch - S(76);
                 bool validSpan = canPlay && (trimEndSec_ - trimStartSec_ >= 0.2);
-                addBtn(BTN_TRIM_SET_START, 254, 508, 92, 30, L"[ Başlangıç", Gc(20, 83, 45), Gc(22, 101, 52), Gc(74, 222, 128), canPlay);
-                addBtn(BTN_TRIM_SET_END, 352, 508, 76, 30, L"Bitiş ]", Gc(120, 53, 15), Gc(146, 64, 14), Gc(251, 191, 36), canPlay);
-                addBtn(BTN_EDIT_CUT_TOGGLE, 434, 508, 104, 30,
+                addBtnPx(BTN_TRIM_SET_START, S(254), row1Y, S(92), S(30), L"[ Başlangıç", Gc(20, 83, 45), Gc(22, 101, 52), Gc(74, 222, 128), canPlay);
+                addBtnPx(BTN_TRIM_SET_END, S(352), row1Y, S(76), S(30), L"Bitiş ]", Gc(120, 53, 15), Gc(146, 64, 14), Gc(251, 191, 36), canPlay);
+                addBtnPx(BTN_EDIT_CUT_TOGGLE, S(434), row1Y, S(104), S(30),
                     editCutActive_ ? L"✕ Orta Kesim" : L"✂ Ortadan Kes",
                     editCutActive_ ? Gc(153, 27, 27) : Gc(32, 39, 53),
                     editCutActive_ ? Gc(185, 28, 28) : Gc(44, 54, 72), Gc(239, 68, 68), canPlay);
-                addBtn(BTN_TRIM_SAVE_COPY, 544, 508, 142, 30, L"Yeni Kopya Kaydet", Gc(37, 99, 235), Gc(59, 130, 246), Gc(96, 165, 250), validSpan);
-                addBtn(BTN_TRIM_REPLACE, 692, 508, 118, 30, L"Ana Klip Yap", Gc(13, 148, 136), Gc(20, 184, 166), Gc(94, 234, 212), validSpan);
-                addBtn(BTN_TRIM_CANCEL, 816, 508, 70, 30, L"İptal", Gc(32, 39, 53), Gc(44, 54, 72), Gc(56, 68, 90), !trimBusy_);
-                addBtn(BTN_EDIT_DISCORD10, 254, 544, 126, 28, L"Discord ≤10 MB", Gc(88, 101, 242), Gc(104, 117, 248), Gc(165, 180, 252), validSpan);
-                addBtn(BTN_EDIT_DISCORD25, 386, 544, 126, 28, L"Discord ≤25 MB", Gc(67, 56, 202), Gc(79, 70, 229), Gc(165, 180, 252), validSpan);
+                addBtnPx(BTN_TRIM_SAVE_COPY, S(544), row1Y, S(142), S(30), L"Yeni Kopya Kaydet", Gc(37, 99, 235), Gc(59, 130, 246), Gc(96, 165, 250), validSpan);
+                addBtnPx(BTN_TRIM_REPLACE, S(692), row1Y, S(118), S(30), L"Ana Klip Yap", Gc(13, 148, 136), Gc(20, 184, 166), Gc(94, 234, 212), validSpan);
+                addBtnPx(BTN_TRIM_CANCEL, S(816), row1Y, S(70), S(30), L"İptal", Gc(32, 39, 53), Gc(44, 54, 72), Gc(56, 68, 90), !trimBusy_);
+                addBtnPx(BTN_EDIT_DISCORD10, S(254), row2Y, S(126), S(28), L"Discord ≤10 MB", Gc(88, 101, 242), Gc(104, 117, 248), Gc(165, 180, 252), validSpan);
+                addBtnPx(BTN_EDIT_DISCORD25, S(386), row2Y, S(126), S(28), L"Discord ≤25 MB", Gc(67, 56, 202), Gc(79, 70, 229), Gc(165, 180, 252), validSpan);
                 g.DrawString(trimBusy_
                     ? footerMsg_.c_str()
                     : L"İpucu: Seçili kesiti veya tüm klibi tek tıkla 10/25 MB Discord ya da 9:16 Dikey çıkarın.",
-                    -1, &fSmall, Gdiplus::RectF((float)S(520), (float)S(544), (float)S(366), (float)S(48)), &sfLeft, &brMuted);
+                    -1, &fSmall, Gdiplus::RectF((float)S(520), (float)row2Y, (float)std::max(S(240), cw - S(546)), (float)S(48)), &sfLeft, &brMuted);
             } else {
-                addBtn(BTN_PLY_EXTERNAL, 742, 566, 144, 30, L"Dış Oynatıcıda Aç", Gc(26, 32, 44), Gc(38, 46, 64), Gc(48, 58, 78));
+                addBtnPx(BTN_PLY_EXTERNAL, cw - S(178), ch - S(54), S(144), S(30), L"Dış Oynatıcıda Aç", Gc(26, 32, 44), Gc(38, 46, 64), Gc(48, 58, 78));
                 g.DrawString(footerMsg_.c_str(), -1, &fSmall,
-                    Gdiplus::RectF((float)S(254), (float)S(570), (float)S(476), (float)S(22)), &sfLeft, &brMuted);
+                    Gdiplus::RectF((float)S(254), (float)(ch - S(50)), (float)std::max(S(240), cw - S(444)), (float)S(22)), &sfLeft, &brMuted);
             }
         } else if (activeTab_ == 0) {
             // ================= TAB 0: KLİPLERİM (GALLERY + FAVORITES + SEARCH) =================
@@ -2204,11 +2327,11 @@ void MainWindow::PaintWindow(HDC targetDc) {
 
                     std::wstring title = StripMp4Ext(c.fileName);
                     g.DrawString(title.c_str(), -1, &fBold,
-                        Gdiplus::RectF((float)(cx + S(10)), (float)(cy + S(181)), (float)(cardW - S(20)), (float)S(20)),
+                        Gdiplus::RectF((float)(cx + S(10)), (float)(ty + th + S(6)), (float)(cardW - S(20)), (float)S(20)),
                         &sfLeft, &brText);
                     std::wstring meta = c.displayDate + L"  •  " + FormatMb(c.fileSizeBytes);
                     g.DrawString(meta.c_str(), -1, &fSmall,
-                        Gdiplus::RectF((float)(cx + S(10)), (float)(cy + S(201)), (float)(cardW - S(20)), (float)S(18)),
+                        Gdiplus::RectF((float)(cx + S(10)), (float)(ty + th + S(26)), (float)(cardW - S(20)), (float)S(18)),
                         &sfLeft, &brMuted);
                 }
                 g.ResetClip();
@@ -2224,59 +2347,60 @@ void MainWindow::PaintWindow(HDC targetDc) {
                 }
             }
 
-            // Bottom action dock
+            // Bottom action dock anchored to bottom of window
             bool hasSel = (selectedIdx_ >= 0 && selectedIdx_ < static_cast<int>(filteredIndices_.size()));
             bool selFav = hasSel && clips_[filteredIndices_[static_cast<size_t>(selectedIdx_)]].isFavorite;
-            FillRoundRect(g, (float)S(242), (float)S(544), (float)S(656), (float)S(56), (float)S(10), Gc(20, 25, 35));
-            StrokeRoundRect(g, (float)S(242), (float)S(544), (float)S(656), (float)S(56), (float)S(10), Gc(40, 48, 65));
-            addBtn(BTN_CLIP_PLAY, 254, 555, 100, 34, L"▶  İzle", Gc(37, 99, 235), Gc(59, 130, 246), Gc(96, 165, 250, 140), hasSel);
-            addBtn(BTN_CLIP_FAV, 360, 555, 92, 34, selFav ? L"★ Favori" : L"☆ Favori",
+            const int dockY = ch - S(76);
+            FillRoundRect(g, (float)S(242), (float)dockY, (float)(cw - S(264)), (float)S(56), (float)S(10), Gc(20, 25, 35));
+            StrokeRoundRect(g, (float)S(242), (float)dockY, (float)(cw - S(264)), (float)S(56), (float)S(10), Gc(40, 48, 65));
+            addBtnPx(BTN_CLIP_PLAY, S(254), dockY + S(11), S(100), S(34), L"▶  İzle", Gc(37, 99, 235), Gc(59, 130, 246), Gc(96, 165, 250, 140), hasSel);
+            addBtnPx(BTN_CLIP_FAV, S(360), dockY + S(11), S(92), S(34), selFav ? L"★ Favori" : L"☆ Favori",
                 selFav ? Gc(92, 68, 14) : Gc(32, 39, 53),
                 selFav ? Gc(120, 88, 18) : Gc(44, 54, 72),
                 selFav ? Gc(250, 204, 21) : Gc(56, 68, 90), hasSel);
-            addBtn(BTN_CLIP_RENAME, 458, 555, 84, 34, L"Adlandır", Gc(32, 39, 53), Gc(44, 54, 72), Gc(56, 68, 90), hasSel);
-            addBtn(BTN_CLIP_REVEAL, 548, 555, 102, 34, L"Klasörde Aç", Gc(32, 39, 53), Gc(44, 54, 72), Gc(56, 68, 90), hasSel);
-            addBtn(BTN_CLIP_DELETE, 656, 555, 52, 34, L"Sil", Gc(153, 27, 27), Gc(185, 28, 28), Gc(220, 38, 38), hasSel);
+            addBtnPx(BTN_CLIP_RENAME, S(458), dockY + S(11), S(84), S(34), L"Adlandır", Gc(32, 39, 53), Gc(44, 54, 72), Gc(56, 68, 90), hasSel);
+            addBtnPx(BTN_CLIP_REVEAL, S(548), dockY + S(11), S(102), S(34), L"Klasörde Aç", Gc(32, 39, 53), Gc(44, 54, 72), Gc(56, 68, 90), hasSel);
+            addBtnPx(BTN_CLIP_DELETE, S(656), dockY + S(11), S(52), S(34), L"Sil", Gc(153, 27, 27), Gc(185, 28, 28), Gc(220, 38, 38), hasSel);
             g.DrawString(footerMsg_.c_str(), -1, &fSmall,
-                Gdiplus::RectF((float)S(716), (float)S(552), (float)S(174), (float)S(40)), &sfLeft, &brMuted);
+                Gdiplus::RectF((float)S(716), (float)(dockY + S(8)), (float)std::max(S(140), cw - S(746)), (float)S(40)), &sfLeft, &brMuted);
         } else {
             // ================= TAB 1: AYARLAR =================
+            const int sox = settingsOffsetX_;
             g.DrawString(L"Ayarlar", -1, &fTitle,
-                Gdiplus::RectF((float)S(242), (float)S(14), (float)S(220), (float)S(28)), &sfLeft, &brText);
+                Gdiplus::RectF((float)(S(242) + sox), (float)S(14), (float)S(220), (float)S(28)), &sfLeft, &brText);
             g.DrawString(L"Video, ses ve kısayol değişiklikleri anında uygulanır.", -1, &fSmall,
-                Gdiplus::RectF((float)S(242), (float)S(42), (float)S(460), (float)S(18)), &sfLeft, &brMuted);
+                Gdiplus::RectF((float)(S(242) + sox), (float)S(42), (float)S(460), (float)S(18)), &sfLeft, &brMuted);
 
-            FillRoundRect(g, (float)S(242), (float)S(68), (float)S(320), (float)S(180), (float)S(12), Gc(23, 28, 38));
-            StrokeRoundRect(g, (float)S(242), (float)S(68), (float)S(320), (float)S(180), (float)S(12), Gc(44, 54, 72));
+            FillRoundRect(g, (float)(S(242) + sox), (float)S(68), (float)S(320), (float)S(180), (float)S(12), Gc(23, 28, 38));
+            StrokeRoundRect(g, (float)(S(242) + sox), (float)S(68), (float)S(320), (float)S(180), (float)S(12), Gc(44, 54, 72));
             g.DrawString(L"Video ve Tampon", -1, &fBold,
-                Gdiplus::RectF((float)S(258), (float)S(76), (float)S(220), (float)S(22)), &sfLeft, &brBlueTxt);
+                Gdiplus::RectF((float)(S(258) + sox), (float)S(76), (float)S(220), (float)S(22)), &sfLeft, &brBlueTxt);
             g.DrawString(L"Hızlı Seçim:", -1, &fSmall,
-                Gdiplus::RectF((float)S(258), (float)S(211), (float)S(84), (float)S(22)), &sfLeft, &brMuted);
+                Gdiplus::RectF((float)(S(258) + sox), (float)S(211), (float)S(84), (float)S(22)), &sfLeft, &brMuted);
             {
                 bool is1080 = (app_.Config().height >= 1080);
-                addBtn(BTN_SET_720P, 344, 208, 96, 28, L"720p HD",
+                addBtnPx(BTN_SET_720P, S(344) + sox, S(208), S(96), S(28), L"720p HD",
                     !is1080 ? Gc(37, 99, 235) : Gc(32, 39, 53),
                     !is1080 ? Gc(59, 130, 246) : Gc(44, 54, 72),
                     !is1080 ? Gc(96, 165, 250, 160) : Gc(56, 68, 90));
-                addBtn(BTN_SET_1080P, 446, 208, 104, 28, L"1080p Full HD",
+                addBtnPx(BTN_SET_1080P, S(446) + sox, S(208), S(104), S(28), L"1080p Full HD",
                     is1080 ? Gc(37, 99, 235) : Gc(32, 39, 53),
                     is1080 ? Gc(59, 130, 246) : Gc(44, 54, 72),
                     is1080 ? Gc(96, 165, 250, 160) : Gc(56, 68, 90));
             }
 
-            FillRoundRect(g, (float)S(578), (float)S(68), (float)S(320), (float)S(180), (float)S(12), Gc(23, 28, 38));
-            StrokeRoundRect(g, (float)S(578), (float)S(68), (float)S(320), (float)S(180), (float)S(12), Gc(44, 54, 72));
+            FillRoundRect(g, (float)(S(578) + sox), (float)S(68), (float)S(320), (float)S(180), (float)S(12), Gc(23, 28, 38));
+            StrokeRoundRect(g, (float)(S(578) + sox), (float)S(68), (float)S(320), (float)S(180), (float)S(12), Gc(44, 54, 72));
             Gdiplus::SolidBrush brGreenTxt(Gc(134, 239, 172));
             g.DrawString(L"Ses (Oyun + Mikrofon)", -1, &fBold,
-                Gdiplus::RectF((float)S(594), (float)S(74), (float)S(240), (float)S(22)), &sfLeft, &brGreenTxt);
+                Gdiplus::RectF((float)(S(594) + sox), (float)S(74), (float)S(240), (float)S(22)), &sfLeft, &brGreenTxt);
 
-            // Live microphone input level vs Noise Gate threshold meter (594..882, y=224..240)
             {
                 float db = static_cast<float>(st.micLevelDb);
                 float norm = std::max(0.0f, std::min(1.0f, (db + 60.0f) / 60.0f));
                 int thrDb = trkMicGate_ ? static_cast<int>(SendMessageW(trkMicGate_, TBM_GETPOS, 0, 0)) : app_.Config().micGateThresholdDb;
                 float thrNorm = std::max(0.0f, std::min(1.0f, (static_cast<float>(thrDb) + 60.0f) / 60.0f));
-                float barX = static_cast<float>(S(594)), barY = static_cast<float>(S(227));
+                float barX = static_cast<float>(S(594) + sox), barY = static_cast<float>(S(227));
                 float barW = static_cast<float>(S(212)), barH = static_cast<float>(S(8));
                 FillRoundRect(g, barX, barY, barW, barH, (float)S(4), Gc(34, 42, 58));
                 if (norm > 0.01f) {
@@ -2290,14 +2414,14 @@ void MainWindow::PaintWindow(HDC targetDc) {
                 wchar_t dbTxt[32] = {};
                 swprintf(dbTxt, 32, L"Mik: %.0f dB", db);
                 g.DrawString(dbTxt, -1, &fSmall,
-                    Gdiplus::RectF((float)S(812), (float)S(221), (float)S(76), (float)S(20)), &sfLeft, &brMuted);
+                    Gdiplus::RectF((float)(S(812) + sox), (float)S(221), (float)S(76), (float)S(20)), &sfLeft, &brMuted);
             }
 
-            FillRoundRect(g, (float)S(242), (float)S(258), (float)S(656), (float)S(270), (float)S(12), Gc(23, 28, 38));
-            StrokeRoundRect(g, (float)S(242), (float)S(258), (float)S(656), (float)S(270), (float)S(12), Gc(44, 54, 72));
+            FillRoundRect(g, (float)(S(242) + sox), (float)S(258), (float)S(656), (float)S(270), (float)S(12), Gc(23, 28, 38));
+            StrokeRoundRect(g, (float)(S(242) + sox), (float)S(258), (float)S(656), (float)S(270), (float)S(12), Gc(44, 54, 72));
             Gdiplus::SolidBrush brPurpTxt(Gc(216, 180, 254));
             g.DrawString(L"Oyun İçi Kısayol, Bildirim ve Klasör", -1, &fBold,
-                Gdiplus::RectF((float)S(258), (float)S(264), (float)S(340), (float)S(22)), &sfLeft, &brPurpTxt);
+                Gdiplus::RectF((float)(S(258) + sox), (float)S(264), (float)S(340), (float)S(22)), &sfLeft, &brPurpTxt);
 
             {
                 const AppConfig& mc = app_.Config();
@@ -2307,24 +2431,21 @@ void MainWindow::PaintWindow(HDC targetDc) {
                         app_.GetMobileLanIp().c_str(), mc.mobileSyncPort, mc.mobilePin.c_str());
                     Gdiplus::SolidBrush brMobOk(Gc(134, 239, 172));
                     g.DrawString(mobTxt, -1, &fSmall,
-                        Gdiplus::RectF((float)S(560), (float)S(468), (float)S(326), (float)S(20)), &sfLeft, &brMobOk);
+                        Gdiplus::RectF((float)(S(560) + sox), (float)S(468), (float)S(326), (float)S(20)), &sfLeft, &brMobOk);
                 } else {
                     std::wstring merr = app_.GetMobileError();
                     const wchar_t* msg = !merr.empty() ? merr.c_str() : L"Telefon aktarımı kapalı (0 RAM)";
                     g.DrawString(msg, -1, &fSmall,
-                        Gdiplus::RectF((float)S(560), (float)S(468), (float)S(326), (float)S(20)), &sfLeft, &brMuted);
+                        Gdiplus::RectF((float)(S(560) + sox), (float)S(468), (float)S(326), (float)S(20)), &sfLeft, &brMuted);
                 }
             }
 
             g.DrawString(footerMsg_.c_str(), -1, &fSmall,
-                Gdiplus::RectF((float)S(258), (float)S(498), (float)S(624), (float)S(20)), &sfLeft, &brMuted);
+                Gdiplus::RectF((float)(S(258) + sox), (float)S(498), (float)S(624), (float)S(20)), &sfLeft, &brMuted);
         }
     }
 
     BitBlt(targetDc, 0, 0, cw, ch, memDc, 0, 0, SRCCOPY);
-    SelectObject(memDc, oldBmp);
-    DeleteObject(backBmp);
-    DeleteDC(memDc);
 }
 
 LRESULT CALLBACK MainWindow::WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
@@ -2344,6 +2465,25 @@ LRESULT MainWindow::OnMessage(UINT msg, WPARAM wParam, LPARAM lParam) {
         case WM_ERASEBKGND:
             return 1;
 
+        case WM_GETMINMAXINFO: {
+            auto* mmi = reinterpret_cast<MINMAXINFO*>(lParam);
+            if (mmi && hwnd_) {
+                DWORD st = static_cast<DWORD>(GetWindowLongPtrW(hwnd_, GWL_STYLE));
+                RECT mr{ 0, 0, S(920), S(620) };
+                AdjustWindowRectEx(&mr, st, FALSE, 0);
+                mmi->ptMinTrackSize.x = mr.right - mr.left;
+                mmi->ptMinTrackSize.y = mr.bottom - mr.top;
+            }
+            return 0;
+        }
+
+        case WM_SIZE:
+            if (wParam != SIZE_MINIMIZED) {
+                UpdateLayoutForSize(LOWORD(lParam), HIWORD(lParam));
+                InvalidateRect(hwnd_, nullptr, FALSE);
+            }
+            return 0;
+
         case WM_PAINT: {
             PAINTSTRUCT ps{};
             HDC hdc = BeginPaint(hwnd_, &ps);
@@ -2356,7 +2496,7 @@ LRESULT MainWindow::OnMessage(UINT msg, WPARAM wParam, LPARAM lParam) {
             if (wParam == TIMER_PLAYER_ID) {
                 UpdatePlayerMetrics();
             } else if (wParam == TIMER_MIC_METER_ID && activeTab_ == 1) {
-                RECT mrc{ S(590), S(220), S(892), S(245) };
+                RECT mrc{ S(590) + settingsOffsetX_, S(220), S(892) + settingsOffsetX_, S(245) };
                 InvalidateRect(hwnd_, &mrc, FALSE);
             }
             return 0;
@@ -3037,6 +3177,10 @@ LRESULT MainWindow::OnMessage(UINT msg, WPARAM wParam, LPARAM lParam) {
             hotkeys_.SetPaused(false);
             CloseEmbeddedPlayer();
             if (cb_.onClosed) cb_.onClosed();
+            return 0;
+
+        case WM_NCDESTROY:
+            FreeBackbuffer();
             return 0;
     }
     return DefWindowProcW(hwnd_, msg, wParam, lParam);

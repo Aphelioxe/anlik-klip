@@ -86,7 +86,10 @@ private:
         bool enabled = true;
     };
     void PaintWindow(HDC hdc);
+    void FreeBackbuffer();
+    void UpdateLayoutForSize(int cw, int ch);
     RECT GetGridViewportRect() const;
+    void GetGridMetrics(int& outCols, int& outCardW, int& outCardH, int& outGapX, int& outGapY) const;
     int HitTestCard(int mx, int my) const;
     int HitTestCardStar(int mx, int my) const;
     int HitTestTrimHandle(int mx, int my) const;
@@ -126,6 +129,12 @@ private:
     int selectedIdx_ = -1;
     int scrollY_ = 0;
     int maxScrollY_ = 0;
+    int settingsOffsetX_ = 0;
+    HDC memDc_ = nullptr;
+    HBITMAP memBmp_ = nullptr;
+    HGDIOBJ memOldBmp_ = nullptr;
+    int memW_ = 0;
+    int memH_ = 0;
     bool trackingMouse_ = false;
     std::vector<UiButtonRect> customButtons_;
 
