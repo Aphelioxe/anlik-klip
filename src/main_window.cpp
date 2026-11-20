@@ -1193,9 +1193,11 @@ void MainWindow::OpenEmbeddedPlayer(int viewIdx) {
         playerCb_, videoHwnd_, &player_);
     if (SUCCEEDED(hr) && player_) {
         IMFPMediaItem* item = nullptr;
-        hr = player_->CreateMediaItemFromURL(playerClipPath_.c_str(), FALSE, 0, &item);
+        hr = player_->CreateMediaItemFromURL(playerClipPath_.c_str(), TRUE, 0, &item);
         if (SUCCEEDED(hr) && item) {
             DWORD nStreams = 0;
+            BOOL hasA = FALSE, selA = FALSE;
+            item->HasAudio(&hasA, &selA);
             if (SUCCEEDED(item->GetNumberOfStreams(&nStreams)) && nStreams > 1) {
                 bool pickedAudio = false;
                 for (DWORD si = 0; si < nStreams; ++si) {
@@ -1209,6 +1211,8 @@ void MainWindow::OpenEmbeddedPlayer(int viewIdx) {
                     PropVariantClear(&vt);
                 }
             }
+            Logger::Log("OpenEmbeddedPlayer: streams=%lu hasAudio=%d selAudio=%d",
+                static_cast<unsigned long>(nStreams), hasA ? 1 : 0, selA ? 1 : 0);
             hr = player_->SetMediaItem(item);
             item->Release();
         }
