@@ -105,6 +105,9 @@ private:
     void RevealSelected();
     void RenameSelected();
     void DeleteSelected();
+    void ShareSelected();
+    void StartUploadClip(const std::wstring& filePath);
+    void StopUploadWorker();
     void PickOutputFolder();
     void ShowDarkComboDropdown(HWND comboHwnd, RECT anchorClientRc);
     void OpenFolder(const std::wstring& path);
@@ -196,6 +199,10 @@ private:
     bool trimBusy_ = false;
     std::atomic<bool> trimCancel_{false};
     std::thread trimThread_;
+
+    bool uploadBusy_ = false;
+    std::atomic<bool> uploadCancel_{false};
+    std::thread uploadThread_;
 
     // Gallery search & favorites state
     bool favOnly_ = false;

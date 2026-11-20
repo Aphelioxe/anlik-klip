@@ -68,7 +68,8 @@ $args = @(
     "-lwinmm",
     "-lpsapi",
     "-lws2_32",
-    "-liphlpapi"
+    "-liphlpapi",
+    "-lwinhttp"
 )
 
 & $clang @args

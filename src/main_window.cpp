@@ -1,5 +1,6 @@
 #include "main_window.h"
 #include "clip_trimmer.h"
+#include "clip_uploader.h"
 #include "com_ptr.h"
 #include "hotkey_engine.h"
 #include "qr_code.h"
@@ -44,6 +45,8 @@ constexpr UINT_PTR TIMER_UI_ANIM_ID   = 4;
 constexpr UINT WM_MW_THUMB_READY      = WM_APP + 20;
 constexpr UINT WM_MW_PLAYER_EVENT     = WM_APP + 21;
 constexpr UINT WM_MW_TRIM_DONE        = WM_APP + 22;
+constexpr UINT WM_MW_UPLOAD_PROGRESS  = WM_APP + 24;
+constexpr UINT WM_MW_UPLOAD_DONE      = WM_APP + 25;
 
 inline Gdiplus::Color Gc(uint8_t r, uint8_t g, uint8_t b, uint8_t a = 255) {
     return Gdiplus::Color(a, r, g, b);
@@ -104,6 +107,7 @@ enum CustomBtnId {
     BTN_TOP_REFRESH,
     BTN_CLIP_PLAY,
     BTN_CLIP_FAV,
+    BTN_CLIP_SHARE,
     BTN_CLIP_RENAME,
     BTN_CLIP_REVEAL,
     BTN_CLIP_DELETE,
@@ -113,6 +117,7 @@ enum CustomBtnId {
     // Player & Trim controls
     BTN_PLY_BACK = 50,
     BTN_PLY_FAV,
+    BTN_PLY_SHARE,
     BTN_PLY_RENAME,
     BTN_PLY_FOLDER,
     BTN_PLY_DELETE,
@@ -468,6 +473,7 @@ MainWindow::MainWindow(HINSTANCE hInst, RecorderApp& app, HotkeyEngine& hotkeys,
 
 MainWindow::~MainWindow() {
     StopTrimWorker();
+    StopUploadWorker();
     CloseEmbeddedPlayer();
     StopThumbnailWorker();
     ClearThumbnails();
@@ -1242,6 +1248,45 @@ void MainWindow::StopTrimWorker() {
     }
     trimCancel_.store(false);
     trimBusy_ = false;
+}
+
+void MainWindow::StopUploadWorker() {
+    uploadCancel_.store(true);
+    if (uploadThread_.joinable()) {
+        uploadThread_.join();
+    }
+    uploadCancel_.store(false);
+    uploadBusy_ = false;
+}
+
+void MainWindow::StartUploadClip(const std::wstring& filePath) {
+    if (uploadBusy_ || trimBusy_ || filePath.empty() || !hwnd_) return;
+    StopUploadWorker();
+    uploadBusy_ = true;
+    uploadCancel_.store(false);
+    SetFooterMessage(L"Link oluşturuluyor... %0");
+
+    HWND target = hwnd_;
+    uploadThread_ = std::thread([this, target, filePath]() {
+        auto* res = new ClipUploadResult(UploadClipToPixeldrain(
+            filePath,
+            [target](int pct) {
+                PostMessageW(target, WM_MW_UPLOAD_PROGRESS, static_cast<WPARAM>(pct), 0);
+            },
+            uploadCancel_));
+        if (!PostMessageW(target, WM_MW_UPLOAD_DONE, 0, reinterpret_cast<LPARAM>(res))) {
+            delete res;
+        }
+    });
+}
+
+void MainWindow::ShareSelected() {
+    if (playerOpen_ && !playerClipPath_.empty()) {
+        StartUploadClip(playerClipPath_);
+        return;
+    }
+    if (selectedIdx_ < 0 || selectedIdx_ >= static_cast<int>(filteredIndices_.size())) return;
+    StartUploadClip(clips_[filteredIndices_[static_cast<size_t>(selectedIdx_)]].filePath);
 }
 
 void MainWindow::TogglePlayerFullscreen() {
@@ -2184,10 +2229,12 @@ void MainWindow::PaintWindow(HDC targetDc) {
             }
             addBtnPx(BTN_PLY_BACK, S(242), S(18), S(114), S(34), L"←  Kliplere", Gc(28, 34, 47), Gc(40, 49, 68), Gc(54, 66, 90), !trimBusy_);
             g.DrawString(playerClipTitle_.c_str(), -1, &fBold,
-                Gdiplus::RectF((float)S(364), (float)S(16), (float)std::max(S(140), cw - S(720)), (float)S(20)), &sfLeft, &brText);
+                Gdiplus::RectF((float)S(364), (float)S(16), (float)std::max(S(140), cw - S(816)), (float)S(20)), &sfLeft, &brText);
             g.DrawString(L"Space: Oynat • ←/→: ±5sn • F: Tam Ekran • Esc: Geri", -1, &fSmall,
-                Gdiplus::RectF((float)S(364), (float)S(36), (float)std::max(S(180), cw - S(720)), (float)S(16)), &sfLeft, &brMuted);
+                Gdiplus::RectF((float)S(364), (float)S(36), (float)std::max(S(180), cw - S(816)), (float)S(16)), &sfLeft, &brMuted);
 
+            addBtnPx(BTN_PLY_SHARE, cw - S(444), S(18), S(82), S(34), uploadBusy_ ? L"Yükleniyor" : L"🔗 Link Al",
+                Gc(13, 148, 136), Gc(20, 184, 166), Gc(94, 234, 212), !trimBusy_ && !uploadBusy_);
             addBtnPx(BTN_PLY_FAV, cw - S(356), S(18), S(74), S(34), curFav ? L"★ Fav" : L"☆ Fav",
                 curFav ? Gc(92, 68, 14) : Gc(28, 34, 47),
                 curFav ? Gc(120, 88, 18) : Gc(40, 49, 68),
@@ -2643,16 +2690,18 @@ void MainWindow::PaintWindow(HDC targetDc) {
             const int dockY = ch - S(76);
             FillRoundRect(g, (float)S(242), (float)dockY, (float)(cw - S(264)), (float)S(56), (float)S(10), Gc(20, 25, 35));
             StrokeRoundRect(g, (float)S(242), (float)dockY, (float)(cw - S(264)), (float)S(56), (float)S(10), Gc(40, 48, 65));
-            addBtnPx(BTN_CLIP_PLAY, S(254), dockY + S(11), S(100), S(34), L"▶  İzle", Gc(37, 99, 235), Gc(59, 130, 246), Gc(96, 165, 250, 140), hasSel);
-            addBtnPx(BTN_CLIP_FAV, S(360), dockY + S(11), S(92), S(34), selFav ? L"★ Favori" : L"☆ Favori",
+            addBtnPx(BTN_CLIP_PLAY, S(254), dockY + S(11), S(82), S(34), L"▶  İzle", Gc(37, 99, 235), Gc(59, 130, 246), Gc(96, 165, 250, 140), hasSel);
+            addBtnPx(BTN_CLIP_FAV, S(342), dockY + S(11), S(82), S(34), selFav ? L"★ Fav" : L"☆ Fav",
                 selFav ? Gc(92, 68, 14) : Gc(32, 39, 53),
                 selFav ? Gc(120, 88, 18) : Gc(44, 54, 72),
                 selFav ? Gc(250, 204, 21) : Gc(56, 68, 90), hasSel);
-            addBtnPx(BTN_CLIP_RENAME, S(458), dockY + S(11), S(84), S(34), L"Adlandır", Gc(32, 39, 53), Gc(44, 54, 72), Gc(56, 68, 90), hasSel);
-            addBtnPx(BTN_CLIP_REVEAL, S(548), dockY + S(11), S(102), S(34), L"Klasörde Aç", Gc(32, 39, 53), Gc(44, 54, 72), Gc(56, 68, 90), hasSel);
-            addBtnPx(BTN_CLIP_DELETE, S(656), dockY + S(11), S(52), S(34), L"Sil", Gc(153, 27, 27), Gc(185, 28, 28), Gc(220, 38, 38), hasSel);
+            addBtnPx(BTN_CLIP_SHARE, S(430), dockY + S(11), S(90), S(34), uploadBusy_ ? L"Yükleniyor" : L"🔗 Link Al",
+                Gc(13, 148, 136), Gc(20, 184, 166), Gc(94, 234, 212), hasSel && !uploadBusy_);
+            addBtnPx(BTN_CLIP_RENAME, S(526), dockY + S(11), S(76), S(34), L"Adlandır", Gc(32, 39, 53), Gc(44, 54, 72), Gc(56, 68, 90), hasSel);
+            addBtnPx(BTN_CLIP_REVEAL, S(608), dockY + S(11), S(74), S(34), L"Klasör", Gc(32, 39, 53), Gc(44, 54, 72), Gc(56, 68, 90), hasSel);
+            addBtnPx(BTN_CLIP_DELETE, S(688), dockY + S(11), S(48), S(34), L"Sil", Gc(153, 27, 27), Gc(185, 28, 28), Gc(220, 38, 38), hasSel);
             g.DrawString(footerMsg_.c_str(), -1, &fSmall,
-                Gdiplus::RectF((float)S(716), (float)(dockY + S(8)), (float)std::max(S(140), cw - S(746)), (float)S(40)), &sfLeft, &brMuted);
+                Gdiplus::RectF((float)S(744), (float)(dockY + S(8)), (float)std::max(S(140), cw - S(770)), (float)S(40)), &sfLeft, &brMuted);
             g.ResetTransform();
             g.ResetClip();
         } else {
@@ -2947,6 +2996,50 @@ LRESULT MainWindow::OnMessage(UINT msg, WPARAM wParam, LPARAM lParam) {
                 }
                 delete tm;
             }
+            return 0;
+        }
+
+        case WM_MW_UPLOAD_PROGRESS: {
+            wchar_t pbuf[64] = {};
+            swprintf(pbuf, 64, L"Link oluşturuluyor... %%%d", static_cast<int>(wParam));
+            SetFooterMessage(pbuf);
+            return 0;
+        }
+
+        case WM_MW_UPLOAD_DONE: {
+            auto* res = reinterpret_cast<ClipUploadResult*>(lParam);
+            if (uploadThread_.joinable()) uploadThread_.join();
+            uploadBusy_ = false;
+            if (res) {
+                if (res->ok && !res->url.empty()) {
+                    if (OpenClipboard(hwnd_)) {
+                        EmptyClipboard();
+                        size_t bytes = (res->url.size() + 1) * sizeof(wchar_t);
+                        HGLOBAL hg = GlobalAlloc(GMEM_MOVEABLE, bytes);
+                        if (hg) {
+                            void* p = GlobalLock(hg);
+                            if (p) {
+                                memcpy(p, res->url.c_str(), bytes);
+                                GlobalUnlock(hg);
+                                SetClipboardData(CF_UNICODETEXT, hg);
+                            } else {
+                                GlobalFree(hg);
+                            }
+                        }
+                        CloseClipboard();
+                    }
+                    SetFooterMessage(L"✓ Link panoya kopyalandı: " + res->url);
+                    std::wstring msg = L"Klip linki oluşturuldu ve panoya kopyalandı!\n\n" + res->url +
+                        L"\n\nBu linkten klibi doğrudan izleyebilir veya indirebilirsiniz.";
+                    MessageBoxW(hwnd_, msg.c_str(), L"Klip Linki Hazır", MB_OK | MB_ICONINFORMATION);
+                } else {
+                    SetFooterMessage(res->error.empty() ? L"Link oluşturulamadı." : res->error);
+                    MessageBoxW(hwnd_, res->error.empty() ? L"Klip yüklenemedi." : res->error.c_str(),
+                        L"Link Hatası", MB_OK | MB_ICONWARNING);
+                }
+                delete res;
+            }
+            InvalidateRect(hwnd_, nullptr, FALSE);
             return 0;
         }
 
@@ -3381,6 +3474,7 @@ LRESULT MainWindow::OnMessage(UINT msg, WPARAM wParam, LPARAM lParam) {
                         case BTN_TOP_REFRESH: RefreshClips(); break;
                         case BTN_CLIP_PLAY: PlaySelected(); break;
                         case BTN_CLIP_FAV: ToggleFavoriteForViewIdx(); break;
+                        case BTN_CLIP_SHARE: ShareSelected(); break;
                         case BTN_CLIP_RENAME: RenameSelected(); break;
                         case BTN_CLIP_REVEAL: RevealSelected(); break;
                         case BTN_CLIP_DELETE: DeleteSelected(); break;
@@ -3422,6 +3516,7 @@ LRESULT MainWindow::OnMessage(UINT msg, WPARAM wParam, LPARAM lParam) {
                         // Embedded Player & Trim buttons
                         case BTN_PLY_BACK: CloseEmbeddedPlayer(); break;
                         case BTN_PLY_FAV: ToggleFavoriteForViewIdx(); break;
+                        case BTN_PLY_SHARE: ShareSelected(); break;
                         case BTN_PLY_RENAME: RenameSelected(); break;
                         case BTN_PLY_FOLDER: RevealSelected(); break;
                         case BTN_PLY_DELETE: DeleteSelected(); break;
