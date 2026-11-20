@@ -99,10 +99,11 @@ void DownmixFrameToStereo(const uint8_t* framePtr, const PcmFormatInfo& fmt, flo
         float fl = ReadSampleAsFloat(framePtr + 0 * bps, fmt);
         float fr = ReadSampleAsFloat(framePtr + 1 * bps, fmt);
         float fc = ReadSampleAsFloat(framePtr + 2 * bps, fmt);
+        float lfe = ReadSampleAsFloat(framePtr + 3 * bps, fmt);
         float bl = ReadSampleAsFloat(framePtr + 4 * bps, fmt);
         float br = ReadSampleAsFloat(framePtr + 5 * bps, fmt);
-        outL = fl + 0.7071f * fc + 0.7071f * bl;
-        outR = fr + 0.7071f * fc + 0.7071f * br;
+        outL = fl + 0.7071f * fc + 0.5f * lfe + 0.7071f * bl;
+        outR = fr + 0.7071f * fc + 0.5f * lfe + 0.7071f * br;
         return;
     }
     if (ch == 8) {
@@ -110,12 +111,13 @@ void DownmixFrameToStereo(const uint8_t* framePtr, const PcmFormatInfo& fmt, flo
         float fl = ReadSampleAsFloat(framePtr + 0 * bps, fmt);
         float fr = ReadSampleAsFloat(framePtr + 1 * bps, fmt);
         float fc = ReadSampleAsFloat(framePtr + 2 * bps, fmt);
+        float lfe = ReadSampleAsFloat(framePtr + 3 * bps, fmt);
         float bl = ReadSampleAsFloat(framePtr + 4 * bps, fmt);
         float br = ReadSampleAsFloat(framePtr + 5 * bps, fmt);
         float sl = ReadSampleAsFloat(framePtr + 6 * bps, fmt);
         float sr = ReadSampleAsFloat(framePtr + 7 * bps, fmt);
-        outL = fl + 0.7071f * fc + 0.7071f * bl + 0.7071f * sl;
-        outR = fr + 0.7071f * fc + 0.7071f * br + 0.7071f * sr;
+        outL = fl + 0.7071f * fc + 0.5f * lfe + 0.5f * bl + 0.5f * sl;
+        outR = fr + 0.7071f * fc + 0.5f * lfe + 0.5f * br + 0.5f * sr;
         return;
     }
     // Generic multi-channel fallback
@@ -567,10 +569,14 @@ void AudioEngine::ThreadMain(int64_t masterStartQpc, std::wstring micDeviceId) {
     outMT->SetUINT32(MF_MT_AUDIO_BITS_PER_SAMPLE, 16);
     outMT->SetUINT32(MF_MT_AUDIO_SAMPLES_PER_SECOND, 48000);
     outMT->SetUINT32(MF_MT_AUDIO_NUM_CHANNELS, 2);
-    outMT->SetUINT32(MF_MT_AUDIO_AVG_BYTES_PER_SECOND, 20000); // 160 kbps
+    outMT->SetUINT32(MF_MT_AUDIO_AVG_BYTES_PER_SECOND, 24000); // 192 kbps
     outMT->SetUINT32(MF_MT_AAC_PAYLOAD_TYPE, 0);
     outMT->SetUINT32(MF_MT_AAC_AUDIO_PROFILE_LEVEL_INDICATION, 0x29);
     hr = aenc->SetOutputType(0, outMT.Get(), 0);
+    if (FAILED(hr)) {
+        outMT->SetUINT32(MF_MT_AUDIO_AVG_BYTES_PER_SECOND, 20000); // 160 kbps fallback
+        hr = aenc->SetOutputType(0, outMT.Get(), 0);
+    }
 
     ComPtr<IMFMediaType> inMT;
     MFCreateMediaType(inMT.Put());
@@ -638,7 +644,17 @@ void AudioEngine::ThreadMain(int64_t masterStartQpc, std::wstring micDeviceId) {
 
     SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);
 
-    // Initial drain right before synchronizing QPC counters so WASAPI pre-roll matches masterStartQpc
+    auto seedQueueCushion = [](std::deque<StereoSample>& q, size_t targetSamples) {
+        const size_t maxKeep = std::max<size_t>(1440, targetSamples + 480);
+        if (q.size() > maxKeep) {
+            q.erase(q.begin(), q.begin() + static_cast<ptrdiff_t>(q.size() - maxKeep));
+        }
+        if (q.size() < targetSamples) {
+            q.insert(q.begin(), targetSamples - q.size(), StereoSample{0.0f, 0.0f});
+        }
+    };
+
+    // Initial drain + 20ms (960 samples) jitter cushion so WASAPI packet phase jitter never causes underrun clicks
     if (gameStream.active && !gameStream.DrainTo48k(gameQ, captureGame_.load())) {
         Logger::Log("AudioEngine: initial loopback drain failed, resetting");
         gameStream.Close();
@@ -647,15 +663,18 @@ void AudioEngine::ThreadMain(int64_t masterStartQpc, std::wstring micDeviceId) {
         Logger::Log("AudioEngine: initial mic drain failed, resetting");
         micStream.Close();
     }
-    while (gameQ.size() > 720) gameQ.pop_front();
-    while (micQ.size() > 720) micQ.pop_front();
+    if (gameStream.active) seedQueueCushion(gameQ, 960);
+    if (micStream.active) seedQueueCushion(micQ, 960);
 
     const int64_t initElapsed100Ns = std::max<int64_t>(0, QpcTo100Ns(GetQpcNow() - masterStartQpc));
-    int64_t totalEmitted = (initElapsed100Ns <= 20000000LL) ? 0 : ((initElapsed100Ns * 48000LL) / 10000000LL);
+    const int64_t readySamples = (initElapsed100Ns * 48000LL) / 10000000LL;
+    int64_t totalEmitted = (initElapsed100Ns <= 20000000LL) ? 0 : readySamples;
     int64_t aacSamplesFed = totalEmitted;
+    int64_t preRollEndSample = readySamples;
     int64_t lastReopenTryQpc = GetQpcNow();
     int64_t lastDefCheckQpc = lastReopenTryQpc;
     bool catchingUp = false;
+    bool wasCatchingUp = false;
     StereoSample lastGameSample{0.0f, 0.0f};
     StereoSample lastMicSample{0.0f, 0.0f};
     double gameSlipAccum = 0.0;
@@ -706,14 +725,13 @@ void AudioEngine::ThreadMain(int64_t masterStartQpc, std::wstring micDeviceId) {
     };
 
     auto trimQueueSurplus = [&](std::deque<StereoSample>& q, size_t stepNeeded, double& slipAccum) {
-        // Hard clamp bursts (>80ms surplus after this tick) down to 20ms with a short crossfade
         const size_t hardCap = stepNeeded + 3840;
         const size_t keepHead = stepNeeded + 960;
         if (q.size() > hardCap) {
             size_t dropCount = q.size() - keepHead;
             StereoSample tailAvg = q[dropCount - 1];
             q.erase(q.begin(), q.begin() + static_cast<ptrdiff_t>(dropCount));
-            const size_t fadeLen = std::min<size_t>(32, q.size());
+            const size_t fadeLen = std::min<size_t>(48, q.size());
             for (size_t k = 0; k < fadeLen; ++k) {
                 float a = static_cast<float>(k + 1) / static_cast<float>(fadeLen + 1);
                 q[k].l = tailAvg.l * (1.0f - a) + q[k].l * a;
@@ -724,23 +742,33 @@ void AudioEngine::ThreadMain(int64_t masterStartQpc, std::wstring micDeviceId) {
     };
 
     auto popWithSlip = [](std::deque<StereoSample>& q, double& slipAccum, StereoSample& lastSample,
-                          size_t remainOut, bool allowSlip) -> StereoSample {
+                          size_t remainOut, bool allowDrift, bool streamActive) -> StereoSample {
         if (q.empty()) {
-            lastSample.l *= 0.92f;
-            lastSample.r *= 0.92f;
+            lastSample.l *= 0.992f;
+            lastSample.r *= 0.992f;
             return lastSample;
         }
         StereoSample s = q.front();
         q.pop_front();
-        // Smoothly pull down slow clock-crystal drift (>35ms surplus) without jumps
-        if (allowSlip && q.size() > remainOut + 1680) {
-            slipAccum += 0.005;
-            if (slipAccum >= 1.0 && q.size() > remainOut + 2) {
-                slipAccum -= 1.0;
-                q.front().l = 0.5f * (s.l + q.front().l);
-                q.front().r = 0.5f * (s.r + q.front().r);
-                s = q.front();
-                q.pop_front();
+        if (allowDrift && streamActive) {
+            if (q.size() > remainOut + 1920) {
+                slipAccum += 0.0015;
+                if (slipAccum >= 1.0 && q.size() > remainOut + 2) {
+                    slipAccum -= 1.0;
+                    q.front().l = 0.5f * (s.l + q.front().l);
+                    q.front().r = 0.5f * (s.r + q.front().r);
+                    s = q.front();
+                    q.pop_front();
+                }
+            } else if (q.size() < remainOut + 192) {
+                slipAccum -= 0.0015;
+                if (slipAccum <= -1.0 && !q.empty()) {
+                    slipAccum += 1.0;
+                    StereoSample interp{ 0.5f * (s.l + q.front().l), 0.5f * (s.r + q.front().r) };
+                    q.push_front(interp);
+                }
+            } else {
+                slipAccum = 0.0;
             }
         } else {
             slipAccum = 0.0;
@@ -796,13 +824,13 @@ void AudioEngine::ThreadMain(int64_t masterStartQpc, std::wstring micDeviceId) {
             if (wantGame && !gameStream.active) {
                 if (gameStream.Open(en.Get(), true, L"")) {
                     gameStream.DrainTo48k(gameQ, wantGame);
-                    while (gameQ.size() > 720) gameQ.pop_front();
+                    seedQueueCushion(gameQ, 960);
                 }
             }
             if (wantMic && !micStream.active) {
                 if (micStream.Open(en.Get(), false, micDeviceId)) {
                     micStream.DrainTo48k(micQ, wantMic && !micMuted_.load());
-                    while (micQ.size() > 720) micQ.pop_front();
+                    seedQueueCushion(micQ, 960);
                 }
             }
         }
@@ -855,7 +883,11 @@ void AudioEngine::ThreadMain(int64_t masterStartQpc, std::wstring micDeviceId) {
             aenc->ProcessMessage(MFT_MESSAGE_NOTIFY_START_OF_STREAM, 0);
             totalEmitted = targetSamples;
             aacSamplesFed = targetSamples;
+            preRollEndSample = targetSamples;
+            if (wantGame && gameStream.active) seedQueueCushion(gameQ, 960);
+            if (wantMic && micStream.active) seedQueueCushion(micQ, 960);
             catchingUp = false;
+            wasCatchingUp = false;
             continue;
         }
 
@@ -868,9 +900,14 @@ void AudioEngine::ThreadMain(int64_t masterStartQpc, std::wstring micDeviceId) {
         }
 
         if (!catchingUp) {
+            if (wasCatchingUp) {
+                if (gameStream.active && gameQ.size() < stepNeeded + 960) seedQueueCushion(gameQ, stepNeeded + 960);
+                if (micStream.active && micQ.size() < stepNeeded + 960) seedQueueCushion(micQ, stepNeeded + 960);
+            }
             trimQueueSurplus(gameQ, stepNeeded, gameSlipAccum);
             trimQueueSurplus(micQ, stepNeeded, micSlipAccum);
         }
+        wasCatchingUp = catchingUp;
 
         const float gGain = wantGame ? (static_cast<float>(gameVolPct_.load()) / 100.0f) : 0.0f;
         const bool micActive = wantMic && !micMuted_.load();
@@ -889,8 +926,14 @@ void AudioEngine::ThreadMain(int64_t masterStartQpc, std::wstring micDeviceId) {
 
         for (size_t i = 0; i < stepNeeded; ++i) {
             const size_t remainOut = stepNeeded - i - 1;
-            StereoSample gs = popWithSlip(gameQ, gameSlipAccum, lastGameSample, remainOut, !catchingUp);
-            StereoSample ms = popWithSlip(micQ, micSlipAccum, lastMicSample, remainOut, !catchingUp);
+            const int64_t curSampleIdx = totalEmitted + static_cast<int64_t>(i);
+            const bool inPreRoll = (curSampleIdx < preRollEndSample);
+            StereoSample gs = inPreRoll
+                ? StereoSample{0.0f, 0.0f}
+                : popWithSlip(gameQ, gameSlipAccum, lastGameSample, remainOut, !catchingUp, wantGame && gameStream.active);
+            StereoSample ms = inPreRoll
+                ? StereoSample{0.0f, 0.0f}
+                : popWithSlip(micQ, micSlipAccum, lastMicSample, remainOut, !catchingUp, micActive && micStream.active);
             float micMul = mGain;
             if (micActive) {
                 bool meterUpd = false;

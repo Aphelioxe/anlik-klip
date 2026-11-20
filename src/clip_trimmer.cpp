@@ -306,7 +306,7 @@ bool TrimMp4Clip(const std::wstring& srcPath, const std::wstring& dstPath,
         outA->SetUINT32(MF_MT_AUDIO_BITS_PER_SAMPLE, 16);
         outA->SetUINT32(MF_MT_AUDIO_SAMPLES_PER_SECOND, 48000);
         outA->SetUINT32(MF_MT_AUDIO_NUM_CHANNELS, 2);
-        outA->SetUINT32(MF_MT_AUDIO_AVG_BYTES_PER_SECOND, 20000);
+        outA->SetUINT32(MF_MT_AUDIO_AVG_BYTES_PER_SECOND, 24000);
         if (SUCCEEDED(sw->AddStream(outA.Get(), &aOutIdx))) {
             ComPtr<IMFMediaType> inA;
             MFCreateMediaType(inA.Put());
