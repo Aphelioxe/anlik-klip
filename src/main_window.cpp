@@ -40,6 +40,7 @@ constexpr COLORREF kRgbMuted   = RGB(148, 160, 180);
 
 constexpr UINT_PTR TIMER_PLAYER_ID    = 2;
 constexpr UINT_PTR TIMER_MIC_METER_ID = 3;
+constexpr UINT_PTR TIMER_UI_ANIM_ID   = 4;
 constexpr UINT WM_MW_THUMB_READY      = WM_APP + 20;
 constexpr UINT WM_MW_PLAYER_EVENT     = WM_APP + 21;
 constexpr UINT WM_MW_TRIM_DONE        = WM_APP + 22;
@@ -467,6 +468,7 @@ MainWindow::~MainWindow() {
     ClearThumbnails();
     if (hwnd_) {
         KillTimer(hwnd_, TIMER_MIC_METER_ID);
+        KillTimer(hwnd_, TIMER_UI_ANIM_ID);
         DestroyWindow(hwnd_);
         hwnd_ = nullptr;
     }
@@ -524,10 +526,13 @@ bool MainWindow::Create(int initialTab) {
     const int winY = wa.top + std::max(0, (waH - winH) / 2);
 
     settingsOffsetX_ = 0;
-    hwnd_ = CreateWindowExW(0, cls, L"Anlık Klip", style,
+    openAnimAlpha_ = 0;
+    animPhase_ = 0.0;
+    hwnd_ = CreateWindowExW(WS_EX_LAYERED, cls, L"Anlık Klip", style,
         winX, winY, winW, winH,
         nullptr, nullptr, hInst_, this);
     if (!hwnd_) return false;
+    SetLayeredWindowAttributes(hwnd_, 0, 0, LWA_ALPHA);
 
     ApplyDarkTitleBarAndControls(hwnd_);
     CreateControls();
@@ -540,6 +545,7 @@ bool MainWindow::Create(int initialTab) {
     SwitchTab(initialTab);
     ShowWindow(hwnd_, SW_SHOWNORMAL);
     SetForegroundWindow(hwnd_);
+    SetTimer(hwnd_, TIMER_UI_ANIM_ID, 16, nullptr);
     return true;
 }
 
@@ -1767,16 +1773,40 @@ void MainWindow::PaintWindow(HDC targetDc) {
         g.SetTextRenderingHint(Gdiplus::TextRenderingHintClearTypeGridFit);
         g.SetPixelOffsetMode(Gdiplus::PixelOffsetModeHalf);
 
-        g.Clear(Gc(10, 13, 20));
+        g.Clear(Gc(9, 12, 19));
+
+        // Ambient radial/gradient glow orbs (vibrant modern backdrop)
+        if (!playerFullscreen_) {
+            {
+                Gdiplus::GraphicsPath gp;
+                gp.AddEllipse(S(180), -S(120), S(520), S(420));
+                Gdiplus::PathGradientBrush pgb(&gp);
+                pgb.SetCenterColor(Gc(37, 99, 235, 42));
+                Gdiplus::Color sur[1] = { Gc(37, 99, 235, 0) };
+                int cnt = 1;
+                pgb.SetSurroundColors(sur, &cnt);
+                g.FillPath(&pgb, &gp);
+            }
+            {
+                Gdiplus::GraphicsPath gp2;
+                gp2.AddEllipse(cw - S(340), -S(80), S(460), S(380));
+                Gdiplus::PathGradientBrush pgb2(&gp2);
+                pgb2.SetCenterColor(Gc(139, 92, 246, 36));
+                Gdiplus::Color sur2[1] = { Gc(139, 92, 246, 0) };
+                int cnt2 = 1;
+                pgb2.SetSurroundColors(sur2, &cnt2);
+                g.FillPath(&pgb2, &gp2);
+            }
+        }
 
         // Sleek gradient sidebar panel
         {
             Gdiplus::LinearGradientBrush sbSide(
                 Gdiplus::PointF(0, 0), Gdiplus::PointF(0, (float)std::max(1, ch)),
-                Gc(17, 22, 33), Gc(13, 17, 25));
+                Gc(18, 24, 38), Gc(11, 15, 24));
             g.FillRectangle(&sbSide, 0, 0, S(220), ch);
         }
-        Gdiplus::Pen sepPen(Gc(34, 42, 60), 1.0f);
+        Gdiplus::Pen sepPen(Gc(42, 54, 80), 1.0f);
         g.DrawLine(&sepPen, S(220), 0, S(220), ch);
 
         Gdiplus::FontFamily ff(L"Segoe UI");
@@ -1799,8 +1829,11 @@ void MainWindow::PaintWindow(HDC targetDc) {
         sfCenter.SetLineAlignment(Gdiplus::StringAlignmentCenter);
         sfCenter.SetFormatFlags(Gdiplus::StringFormatFlagsNoWrap);
 
-        // Brand emblem
-        FillRoundRect(g, (float)S(16), (float)S(18), (float)S(36), (float)S(36), (float)S(10), Gc(37, 99, 235));
+        const float pulse01 = static_cast<float>(0.5 + 0.5 * std::sin(animPhase_));
+
+        // Brand emblem (blue->violet gradient + pulsing live ring)
+        FillRoundRectGrad(g, (float)S(16), (float)S(18), (float)S(36), (float)S(36), (float)S(10),
+            Gc(59, 130, 246), Gc(124, 58, 237));
         {
             Gdiplus::SolidBrush brDot(Gc(255, 255, 255));
             g.FillEllipse(&brDot, (float)S(26), (float)S(28), (float)S(16), (float)S(16));
@@ -1812,17 +1845,22 @@ void MainWindow::PaintWindow(HDC targetDc) {
         swprintf(resSub, 48, L"%dp • %d FPS", app_.Config().height, app_.Config().fps);
         g.DrawString(resSub, -1, &fSub, Gdiplus::RectF((float)S(60), (float)S(38), (float)S(146), (float)S(18)), &sfLeft, &brMuted);
 
-        // Live status capsule
+        // Live status capsule with animated pulse halo
         AppRuntimeStats st = app_.GetStats();
         bool recOn = st.running;
-        FillRoundRect(g, (float)S(16), (float)S(72), (float)S(188), (float)S(28), (float)S(14),
-            recOn ? Gc(20, 83, 45, 160) : Gc(51, 65, 85, 160));
+        FillRoundRectGrad(g, (float)S(16), (float)S(72), (float)S(188), (float)S(28), (float)S(14),
+            recOn ? Gc(22, 101, 52, 190) : Gc(51, 65, 85, 160),
+            recOn ? Gc(15, 72, 38, 175) : Gc(36, 46, 62, 160));
         StrokeRoundRect(g, (float)S(16), (float)S(72), (float)S(188), (float)S(28), (float)S(14),
-            recOn ? Gc(34, 197, 94, 180) : Gc(100, 116, 139, 160));
+            recOn ? Gc(74, 222, 128, static_cast<uint8_t>(140 + 80 * pulse01)) : Gc(100, 116, 139, 160));
         {
+            if (recOn) {
+                Gdiplus::SolidBrush haloB(Gc(74, 222, 128, static_cast<uint8_t>(40 + 90 * pulse01)));
+                g.FillEllipse(&haloB, (float)S(24), (float)S(78), (float)S(16), (float)S(16));
+            }
             Gdiplus::SolidBrush dotB(recOn ? Gc(74, 222, 128) : Gc(148, 163, 184));
             g.FillEllipse(&dotB, (float)S(28), (float)S(82), (float)S(8), (float)S(8));
-            Gdiplus::SolidBrush statusTxtB(recOn ? Gc(187, 247, 208) : Gc(203, 213, 225));
+            Gdiplus::SolidBrush statusTxtB(recOn ? Gc(209, 250, 229) : Gc(203, 213, 225));
             g.DrawString(recOn ? L"Kayıt Aktif" : L"Duraklatıldı", -1, &fSub,
                 Gdiplus::RectF((float)S(42), (float)S(72), (float)S(154), (float)S(28)), &sfLeft, &statusTxtB);
         }
@@ -2312,11 +2350,16 @@ void MainWindow::PaintWindow(HDC targetDc) {
                     bool hov = (static_cast<int>(vi) == hoverCardIdx_);
                     const auto& c = clips_[filteredIndices_[vi]];
 
-                    FillRoundRect(g, (float)cx, (float)cy, (float)cardW, (float)cardH, (float)S(12),
-                        sel ? Gc(28, 39, 62) : (hov ? Gc(29, 36, 50) : Gc(23, 28, 38)));
+                    if (sel || hov) {
+                        FillRoundRect(g, (float)(cx - S(2)), (float)(cy - S(2)), (float)(cardW + S(4)), (float)(cardH + S(4)),
+                            (float)S(14), sel ? Gc(56, 189, 248, 45) : Gc(59, 130, 246, 30));
+                    }
+                    FillRoundRectGrad(g, (float)cx, (float)cy, (float)cardW, (float)cardH, (float)S(12),
+                        sel ? Gc(32, 46, 78) : (hov ? Gc(31, 40, 58) : Gc(22, 28, 41)),
+                        sel ? Gc(22, 32, 56) : (hov ? Gc(23, 30, 44) : Gc(17, 22, 32)));
                     StrokeRoundRect(g, (float)cx, (float)cy, (float)cardW, (float)cardH, (float)S(12),
-                        sel ? Gc(59, 130, 246) : (hov ? Gc(75, 89, 115) : Gc(42, 51, 68)),
-                        sel ? 2.0f : 1.0f);
+                        sel ? Gc(56, 189, 248) : (hov ? Gc(96, 165, 250) : Gc(44, 54, 76)),
+                        sel ? 2.0f : (hov ? 1.5f : 1.0f));
 
                     int tx = cx + S(7), ty = cy + S(7), tw = S(298), th = S(168);
                     auto it = thumbBmps_.find(c.filePath);
@@ -2377,8 +2420,18 @@ void MainWindow::PaintWindow(HDC targetDc) {
                     std::wstring gTag = ExtractGameTagFromName(c.fileName);
                     int badgeX = tx + S(8);
                     if (!gTag.empty()) {
-                        int tagW = std::min(S(120), S(18) + static_cast<int>(gTag.size()) * S(6));
-                        FillRoundRect(g, (float)badgeX, (float)(ty + S(8)), (float)tagW, (float)S(20), (float)S(6), Gc(37, 99, 235, 215));
+                        Gdiplus::Color tagTop = Gc(79, 70, 229, 230), tagBot = Gc(55, 48, 163, 230);
+                        if (_wcsicmp(gTag.c_str(), L"Valorant") == 0) {
+                            tagTop = Gc(244, 63, 94, 235); tagBot = Gc(190, 18, 60, 235);
+                        } else if (_wcsicmp(gTag.c_str(), L"LeagueOfLegends") == 0) {
+                            tagTop = Gc(14, 165, 233, 235); tagBot = Gc(3, 105, 161, 235);
+                        } else if (_wcsicmp(gTag.c_str(), L"CS2") == 0) {
+                            tagTop = Gc(245, 158, 11, 235); tagBot = Gc(180, 83, 9, 235);
+                        } else if (_wcsicmp(gTag.c_str(), L"osu") == 0) {
+                            tagTop = Gc(236, 72, 153, 235); tagBot = Gc(190, 24, 93, 235);
+                        }
+                        int tagW = std::min(S(124), S(18) + static_cast<int>(gTag.size()) * S(6));
+                        FillRoundRectGrad(g, (float)badgeX, (float)(ty + S(8)), (float)tagW, (float)S(20), (float)S(6), tagTop, tagBot);
                         g.DrawString(gTag.c_str(), -1, &fSmall,
                             Gdiplus::RectF((float)badgeX, (float)(ty + S(8)), (float)tagW, (float)S(20)), &sfCenter, &brText);
                         badgeX += tagW + S(6);
@@ -2567,6 +2620,22 @@ LRESULT MainWindow::OnMessage(UINT msg, WPARAM wParam, LPARAM lParam) {
             } else if (wParam == TIMER_MIC_METER_ID && activeTab_ == 1) {
                 RECT mrc{ S(590) + settingsOffsetX_, S(220), S(892) + settingsOffsetX_, S(245) };
                 InvalidateRect(hwnd_, &mrc, FALSE);
+            } else if (wParam == TIMER_UI_ANIM_ID) {
+                if (openAnimAlpha_ < 255) {
+                    openAnimAlpha_ = std::min(255, openAnimAlpha_ + 22);
+                    if (hwnd_) SetLayeredWindowAttributes(hwnd_, 0, static_cast<BYTE>(openAnimAlpha_), LWA_ALPHA);
+                    if (openAnimAlpha_ >= 255 && hwnd_) {
+                        LONG_PTR ex = GetWindowLongPtrW(hwnd_, GWL_EXSTYLE);
+                        SetWindowLongPtrW(hwnd_, GWL_EXSTYLE, ex & ~WS_EX_LAYERED);
+                        SetTimer(hwnd_, TIMER_UI_ANIM_ID, 48, nullptr);
+                    }
+                } else {
+                    animPhase_ += 0.16;
+                    if (hwnd_ && !playerFullscreen_) {
+                        RECT sidePulseRc{ S(14), S(68), S(208), S(104) };
+                        InvalidateRect(hwnd_, &sidePulseRc, FALSE);
+                    }
+                }
             }
             return 0;
 

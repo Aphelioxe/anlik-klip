@@ -135,6 +135,8 @@ private:
     HGDIOBJ memOldBmp_ = nullptr;
     int memW_ = 0;
     int memH_ = 0;
+    int openAnimAlpha_ = 255;
+    double animPhase_ = 0.0;
     bool trackingMouse_ = false;
     std::vector<UiButtonRect> customButtons_;
 
