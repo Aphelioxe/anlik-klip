@@ -126,9 +126,8 @@ bool WriteClipToMp4(const ClipSnapshot& snap, const std::wstring& finalPath, std
         return false;
     }
 
-    bool hasAudio = (!snap.audio.empty() && !snap.aacUserData.empty());
-    DWORD aStream = 0;
-    if (hasAudio) {
+    auto addAacStream = [&](DWORD& outStreamId) -> bool {
+        if (snap.aacUserData.empty()) return false;
         ComPtr<IMFMediaType> aMT;
         MFCreateMediaType(aMT.Put());
         aMT->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Audio);
@@ -136,17 +135,39 @@ bool WriteClipToMp4(const ClipSnapshot& snap, const std::wstring& finalPath, std
         aMT->SetUINT32(MF_MT_AUDIO_BITS_PER_SAMPLE, 16);
         aMT->SetUINT32(MF_MT_AUDIO_SAMPLES_PER_SECOND, 48000);
         aMT->SetUINT32(MF_MT_AUDIO_NUM_CHANNELS, 2);
-        aMT->SetUINT32(MF_MT_AUDIO_AVG_BYTES_PER_SECOND, 20000);
+        aMT->SetUINT32(MF_MT_AUDIO_AVG_BYTES_PER_SECOND, 24000);
         aMT->SetUINT32(MF_MT_AAC_PAYLOAD_TYPE, 0);
         aMT->SetUINT32(MF_MT_AAC_AUDIO_PROFILE_LEVEL_INDICATION, 0x29);
         aMT->SetBlob(MF_MT_USER_DATA, snap.aacUserData.data(), static_cast<UINT32>(snap.aacUserData.size()));
 
-        hr = sw->AddStream(aMT.Get(), &aStream);
-        if (SUCCEEDED(hr)) hr = sw->SetInputMediaType(aStream, aMT.Get(), nullptr);
-        if (FAILED(hr)) {
-            Logger::Log("Mp4Writer: audio stream setup failed hr=0x%08lx, continuing video-only", (unsigned long)hr);
-            hasAudio = false;
+        HRESULT ahr = sw->AddStream(aMT.Get(), &outStreamId);
+        if (SUCCEEDED(ahr)) ahr = sw->SetInputMediaType(outStreamId, aMT.Get(), nullptr);
+        if (FAILED(ahr)) {
+            Logger::Log("Mp4Writer: audio stream setup failed hr=0x%08lx", (unsigned long)ahr);
+            return false;
         }
+        return true;
+    };
+
+    struct AudioTrackCursor {
+        const std::vector<EncodedPacket>* pkts = nullptr;
+        DWORD streamId = 0;
+        size_t idx = 0;
+        bool active = false;
+    };
+
+    AudioTrackCursor aTracks[3];
+    if (!snap.audio.empty()) {
+        aTracks[0].pkts = &snap.audio;
+        aTracks[0].active = addAacStream(aTracks[0].streamId);
+    }
+    if (!snap.audioGame.empty() && aTracks[0].active) {
+        aTracks[1].pkts = &snap.audioGame;
+        aTracks[1].active = addAacStream(aTracks[1].streamId);
+    }
+    if (!snap.audioMic.empty() && aTracks[0].active) {
+        aTracks[2].pkts = &snap.audioMic;
+        aTracks[2].active = addAacStream(aTracks[2].streamId);
     }
 
     hr = sw->BeginWriting();
@@ -162,13 +183,30 @@ bool WriteClipToMp4(const ClipSnapshot& snap, const std::wstring& finalPath, std
     const int64_t defaultVDur = 10000000LL / (snap.fps > 0 ? snap.fps : 60);
     const int64_t defaultADur = 1024LL * 10000000LL / 48000;
 
-    size_t vi = 0, ai = 0;
-    const size_t aCount = hasAudio ? snap.audio.size() : 0;
+    size_t vi = 0;
+    while (true) {
+        int bestKind = -1; // -1=none, 0=video, 1..3=audio track 0..2
+        int64_t bestPts = INT64_MAX;
+        if (vi < snap.video.size()) {
+            bestKind = 0;
+            bestPts = snap.video[vi].pts100ns;
+        }
+        for (int t = 0; t < 3; ++t) {
+            if (aTracks[t].active && aTracks[t].idx < aTracks[t].pkts->size()) {
+                int64_t ap = (*aTracks[t].pkts)[aTracks[t].idx].pts100ns;
+                if (ap < bestPts) {
+                    bestPts = ap;
+                    bestKind = t + 1;
+                }
+            }
+        }
+        if (bestKind < 0) break;
 
-    while (vi < snap.video.size() || ai < aCount) {
-        bool writeV = (vi < snap.video.size()) &&
-                      (ai >= aCount || snap.video[vi].pts100ns <= snap.audio[ai].pts100ns);
-        const EncodedPacket& pkt = writeV ? snap.video[vi++] : snap.audio[ai++];
+        const bool writeV = (bestKind == 0);
+        const EncodedPacket& pkt = writeV
+            ? snap.video[vi++]
+            : (*aTracks[bestKind - 1].pkts)[aTracks[bestKind - 1].idx++];
+        const DWORD targetStream = writeV ? vStream : aTracks[bestKind - 1].streamId;
         if (!pkt.data || pkt.data->empty()) continue;
 
         ComPtr<IMFMediaBuffer> mb;
@@ -193,7 +231,7 @@ bool WriteClipToMp4(const ClipSnapshot& snap, const std::wstring& finalPath, std
             sample->SetUINT32(MFSampleExtension_CleanPoint, TRUE);
         }
 
-        hr = sw->WriteSample(writeV ? vStream : aStream, sample.Get());
+        hr = sw->WriteSample(targetStream, sample.Get());
         if (FAILED(hr)) {
             char msg[96];
             snprintf(msg, sizeof(msg), "WriteSample(%s) hr=0x%08lx", writeV ? "V" : "A", (unsigned long)hr);

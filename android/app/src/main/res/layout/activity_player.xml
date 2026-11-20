@@ -1,11 +1,14 @@
 <?xml version="1.0" encoding="utf-8"?>
 <LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:app="http://schemas.android.com/apk/res-auto"
     android:layout_width="match_parent"
     android:layout_height="match_parent"
     android:background="#000000"
     android:orientation="vertical">
 
+    <!-- Top Player Toolbar (hidden in fullscreen) -->
     <LinearLayout
+        android:id="@+id/panelTopBar"
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
         android:background="@color/bg_surface"
@@ -37,6 +40,17 @@
             android:textStyle="bold" />
 
         <Button
+            android:id="@+id/btnToggleTrim"
+            android:layout_width="wrap_content"
+            android:layout_height="38dp"
+            android:layout_marginEnd="6dp"
+            android:backgroundTint="@color/bg_card"
+            android:text="✂ Kırp"
+            android:textAllCaps="false"
+            android:textColor="@color/text_primary"
+            android:textSize="12sp" />
+
+        <Button
             android:id="@+id/btnPlayerDownload"
             android:layout_width="wrap_content"
             android:layout_height="38dp"
@@ -47,7 +61,9 @@
             android:textSize="12sp" />
     </LinearLayout>
 
+    <!-- Video Container + Gesture & Custom Overlay Controls -->
     <FrameLayout
+        android:id="@+id/videoContainer"
         android:layout_width="match_parent"
         android:layout_height="0dp"
         android:layout_weight="1">
@@ -63,6 +79,122 @@
             android:layout_width="48dp"
             android:layout_height="48dp"
             android:layout_gravity="center" />
+
+        <TextView
+            android:id="@+id/txtSeekFeedback"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_gravity="center"
+            android:background="@drawable/bg_badge"
+            android:paddingHorizontal="18dp"
+            android:paddingVertical="10dp"
+            android:text="+5 sn"
+            android:textColor="@color/text_primary"
+            android:textSize="18sp"
+            android:textStyle="bold"
+            android:visibility="gone" />
+
+        <!-- Custom Overlay Bar -->
+        <LinearLayout
+            android:id="@+id/panelVideoControls"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_gravity="bottom"
+            android:background="#B30B0F17"
+            android:orientation="vertical"
+            android:padding="10dp">
+
+            <SeekBar
+                android:id="@+id/seekVideo"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:progressTint="@color/accent_blue"
+                android:thumbTint="@color/text_primary" />
+
+            <LinearLayout
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="4dp"
+                android:gravity="center_vertical"
+                android:orientation="horizontal">
+
+                <Button
+                    android:id="@+id/btnPlayPause"
+                    android:layout_width="wrap_content"
+                    android:layout_height="36dp"
+                    android:backgroundTint="@color/accent_blue"
+                    android:text="⏸"
+                    android:textColor="@color/text_primary"
+                    android:textSize="13sp" />
+
+                <TextView
+                    android:id="@+id/txtVideoTime"
+                    android:layout_width="0dp"
+                    android:layout_height="wrap_content"
+                    android:layout_marginHorizontal="10dp"
+                    android:layout_weight="1"
+                    android:text="00:00 / 00:00"
+                    android:textColor="@color/text_primary"
+                    android:textSize="12sp" />
+
+                <Button
+                    android:id="@+id/btnSpeed"
+                    android:layout_width="wrap_content"
+                    android:layout_height="36dp"
+                    android:layout_marginEnd="6dp"
+                    android:backgroundTint="@color/bg_card"
+                    android:text="1.0x"
+                    android:textAllCaps="false"
+                    android:textColor="@color/text_primary"
+                    android:textSize="12sp" />
+
+                <Button
+                    android:id="@+id/btnFullscreen"
+                    android:layout_width="wrap_content"
+                    android:layout_height="36dp"
+                    android:backgroundTint="@color/bg_card"
+                    android:text="⛶"
+                    android:textColor="@color/text_primary"
+                    android:textSize="15sp" />
+            </LinearLayout>
+        </LinearLayout>
     </FrameLayout>
+
+    <!-- Mobile Trim Panel -->
+    <LinearLayout
+        android:id="@+id/panelTrim"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:background="@color/bg_surface"
+        android:orientation="vertical"
+        android:padding="12dp"
+        android:visibility="gone">
+
+        <TextView
+            android:id="@+id/txtTrimRange"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="Kırpma: 00:00 → 01:00"
+            android:textColor="@color/accent_green"
+            android:textSize="13sp"
+            android:textStyle="bold" />
+
+        <com.google.android.material.slider.RangeSlider
+            android:id="@+id/sliderTrim"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            app:thumbColor="@color/accent_green"
+            app:trackColorActive="@color/accent_green"
+            app:trackColorInactive="@color/bg_card" />
+
+        <Button
+            android:id="@+id/btnTrimSave"
+            android:layout_width="match_parent"
+            android:layout_height="40dp"
+            android:backgroundTint="@color/accent_green"
+            android:text="✂ Kırp &amp; Galeriye Kaydet"
+            android:textAllCaps="false"
+            android:textColor="@color/text_primary" />
+    </LinearLayout>
 
 </LinearLayout>

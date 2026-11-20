@@ -51,9 +51,13 @@ public class MainActivity extends AppCompatActivity implements ClipAdapter.Liste
     private final ExecutorService dlExecutor = Executors.newSingleThreadExecutor();
     private final Handler mainHandler = new Handler(Looper.getMainLooper());
 
+    private View viewStatusDot;
     private TextView txtStatus;
+    private TextView txtEmptyState;
+    private TextView txtSelectedCount;
     private LinearLayout panelConnect;
     private LinearLayout panelControls;
+    private LinearLayout panelMultiSelect;
     private EditText edtIp;
     private EditText edtPort;
     private EditText edtPin;
@@ -108,9 +112,13 @@ public class MainActivity extends AppCompatActivity implements ClipAdapter.Liste
         super.onCreate(savedInstanceState);
         setContentView(R.layout.activity_main);
 
+        viewStatusDot = findViewById(R.id.viewStatusDot);
         txtStatus = findViewById(R.id.txtStatus);
+        txtEmptyState = findViewById(R.id.txtEmptyState);
+        txtSelectedCount = findViewById(R.id.txtSelectedCount);
         panelConnect = findViewById(R.id.panelConnect);
         panelControls = findViewById(R.id.panelControls);
+        panelMultiSelect = findViewById(R.id.panelMultiSelect);
         edtIp = findViewById(R.id.edtIp);
         edtPort = findViewById(R.id.edtPort);
         edtPin = findViewById(R.id.edtPin);
@@ -137,6 +145,18 @@ public class MainActivity extends AppCompatActivity implements ClipAdapter.Liste
                 panelConnect.setVisibility(panelConnect.getVisibility() == View.VISIBLE ? View.GONE : View.VISIBLE));
         findViewById(R.id.btnDiscover).setOnClickListener(v -> discoverOnLan());
         findViewById(R.id.btnConnect).setOnClickListener(v -> connectFromInputs());
+
+        findViewById(R.id.btnSelectAll).setOnClickListener(v -> adapter.selectAll());
+        findViewById(R.id.btnCancelSelect).setOnClickListener(v -> adapter.clearSelection());
+        findViewById(R.id.btnBatchDownload).setOnClickListener(v -> {
+            List<ClipItem> sel = adapter.getSelectedItems();
+            if (sel.isEmpty()) return;
+            for (ClipItem c : sel) {
+                onDownloadClip(c);
+            }
+            Toast.makeText(this, sel.size() + " klip indirme sırasına eklendi", Toast.LENGTH_SHORT).show();
+            adapter.clearSelection();
+        });
 
         btnFilterAll.setOnClickListener(v -> {
             onlyFavorites = false;
@@ -255,6 +275,7 @@ public class MainActivity extends AppCompatActivity implements ClipAdapter.Liste
                         .apply();
                 mainHandler.post(() -> {
                     connected = true;
+                    viewStatusDot.setBackgroundResource(R.drawable.bg_dot_online);
                     adapter.setConnection(currentHost, currentPort, currentPin);
                     txtStatus.setText("Bağlı: " + info.pcName + " (" + info.clipCount + " klip)");
                     panelConnect.setVisibility(View.GONE);
@@ -268,6 +289,7 @@ public class MainActivity extends AppCompatActivity implements ClipAdapter.Liste
             } catch (Exception e) {
                 mainHandler.post(() -> {
                     connected = false;
+                    viewStatusDot.setBackgroundResource(R.drawable.bg_dot_offline);
                     txtStatus.setText("Bağlantı hatası: " + e.getMessage());
                     Toast.makeText(this, "Bağlanılamadı: " + e.getMessage(), Toast.LENGTH_LONG).show();
                 });
@@ -319,6 +341,14 @@ public class MainActivity extends AppCompatActivity implements ClipAdapter.Liste
             filtered.add(c);
         }
         adapter.setItems(filtered);
+        if (!connected) {
+            txtEmptyState.setVisibility(View.VISIBLE);
+        } else if (filtered.isEmpty()) {
+            txtEmptyState.setText("Gösterilecek klip bulunamadı.");
+            txtEmptyState.setVisibility(View.VISIBLE);
+        } else {
+            txtEmptyState.setVisibility(View.GONE);
+        }
     }
 
     private void updateFilterButtons() {
@@ -347,6 +377,12 @@ public class MainActivity extends AppCompatActivity implements ClipAdapter.Liste
             return;
         }
         startDownload(item);
+    }
+
+    @Override
+    public void onSelectionChanged(int selectedCount, boolean selectionMode) {
+        panelMultiSelect.setVisibility(selectionMode ? View.VISIBLE : View.GONE);
+        txtSelectedCount.setText(selectedCount + " klip seçili");
     }
 
     private void startDownload(ClipItem item) {

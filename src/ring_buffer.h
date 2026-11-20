@@ -29,7 +29,9 @@ struct ClipSnapshot {
     uint32_t fps = 60;
     uint32_t videoBitrateBps = 6000000;
     std::vector<EncodedPacket> video;
-    std::vector<EncodedPacket> audio;
+    std::vector<EncodedPacket> audio;      // Track 1: Mix (Game + Mic)
+    std::vector<EncodedPacket> audioGame;  // Track 2: Isolated Game/PC audio
+    std::vector<EncodedPacket> audioMic;   // Track 3: Isolated Microphone audio
     int64_t basePts100ns = 0;
     double durationSeconds = 0.0;
 };
@@ -51,18 +53,24 @@ public:
 
     void PushVideo(EncodedPacket pkt);
     void PushAudio(EncodedPacket pkt);
+    void PushAudioGame(EncodedPacket pkt);
+    void PushAudioMic(EncodedPacket pkt);
     void Clear();
 
     RingStats GetStats() const;
     bool TakeSnapshot(int maxSeconds, ClipSnapshot& out) const;
 
 private:
+    void PushAudioQueue(std::deque<EncodedPacket>& q, EncodedPacket pkt);
+    void TrimAudioQueueLocked(std::deque<EncodedPacket>& q, int64_t cutoffPts);
     void TrimLocked();
 
     mutable std::mutex mutex_;
     int targetSeconds_;
     std::deque<EncodedPacket> video_;
     std::deque<EncodedPacket> audio_;
+    std::deque<EncodedPacket> audioGame_;
+    std::deque<EncodedPacket> audioMic_;
     size_t videoBytes_ = 0;
     size_t audioBytes_ = 0;
 

@@ -1,5 +1,6 @@
 <?xml version="1.0" encoding="utf-8"?>
 <LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:id="@+id/cardRoot"
     android:layout_width="match_parent"
     android:layout_height="wrap_content"
     android:layout_marginBottom="12dp"
@@ -9,7 +10,7 @@
 
     <FrameLayout
         android:layout_width="match_parent"
-        android:layout_height="180dp">
+        android:layout_height="184dp">
 
         <ImageView
             android:id="@+id/imgThumb"
@@ -19,6 +20,12 @@
             android:contentDescription="Klip önizleme"
             android:scaleType="centerCrop" />
 
+        <View
+            android:layout_width="match_parent"
+            android:layout_height="64dp"
+            android:layout_gravity="bottom"
+            android:background="@drawable/bg_thumb_gradient" />
+
         <TextView
             android:id="@+id/txtResBadge"
             android:layout_width="wrap_content"
@@ -26,25 +33,39 @@
             android:layout_gravity="top|start"
             android:layout_margin="8dp"
             android:background="@drawable/bg_badge"
-            android:paddingHorizontal="6dp"
-            android:paddingVertical="2dp"
+            android:paddingHorizontal="8dp"
+            android:paddingVertical="3dp"
             android:text="1080p"
             android:textColor="@color/text_primary"
             android:textSize="11sp"
             android:textStyle="bold" />
 
         <TextView
-            android:id="@+id/txtFavBadge"
-            android:layout_width="wrap_content"
-            android:layout_height="wrap_content"
+            android:id="@+id/txtSelectedBadge"
+            android:layout_width="28dp"
+            android:layout_height="28dp"
             android:layout_gravity="top|end"
             android:layout_margin="8dp"
             android:background="@drawable/bg_badge"
-            android:paddingHorizontal="6dp"
+            android:gravity="center"
+            android:text="✓"
+            android:textColor="@color/accent_blue"
+            android:textSize="15sp"
+            android:textStyle="bold"
+            android:visibility="gone" />
+
+        <TextView
+            android:id="@+id/txtFavBadge"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_gravity="bottom|start"
+            android:layout_margin="8dp"
+            android:background="@drawable/bg_badge"
+            android:paddingHorizontal="7dp"
             android:paddingVertical="2dp"
-            android:text="★"
+            android:text="★ Favori"
             android:textColor="@color/accent_amber"
-            android:textSize="13sp"
+            android:textSize="11sp"
             android:visibility="gone" />
 
         <TextView
@@ -54,17 +75,18 @@
             android:layout_gravity="bottom|end"
             android:layout_margin="8dp"
             android:background="@drawable/bg_badge"
-            android:paddingHorizontal="6dp"
-            android:paddingVertical="2dp"
+            android:paddingHorizontal="8dp"
+            android:paddingVertical="3dp"
             android:text="01:00"
             android:textColor="@color/text_primary"
-            android:textSize="11sp" />
+            android:textSize="11sp"
+            android:textStyle="bold" />
     </FrameLayout>
 
     <LinearLayout
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
-        android:layout_marginTop="8dp"
+        android:layout_marginTop="10dp"
         android:gravity="center_vertical"
         android:orientation="horizontal">
 
@@ -72,6 +94,7 @@
             android:layout_width="0dp"
             android:layout_height="wrap_content"
             android:layout_weight="1"
+            android:paddingEnd="8dp"
             android:orientation="vertical">
 
             <TextView
@@ -89,6 +112,7 @@
                 android:id="@+id/txtMeta"
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
+                android:layout_marginTop="2dp"
                 android:text="20.11.2026 • 45 MB"
                 android:textColor="@color/text_secondary"
                 android:textSize="12sp" />
@@ -110,7 +134,7 @@
         style="?android:attr/progressBarStyleHorizontal"
         android:layout_width="match_parent"
         android:layout_height="4dp"
-        android:layout_marginTop="6dp"
+        android:layout_marginTop="8dp"
         android:max="100"
         android:progressTint="@color/accent_green"
         android:visibility="gone" />

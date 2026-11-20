@@ -537,78 +537,86 @@ void AudioEngine::ThreadMain(int64_t masterStartQpc, std::wstring micDeviceId) {
 
     // Setup MF AAC Encoder
     ComPtr<IMFTransform> aenc;
-    MFT_REGISTER_TYPE_INFO outInfo = { MFMediaType_Audio, MFAudioFormat_AAC };
-    IMFActivate** acts = nullptr;
-    UINT32 actCount = 0;
-    HRESULT hr = MFTEnumEx(MFT_CATEGORY_AUDIO_ENCODER,
-        MFT_ENUM_FLAG_SYNCMFT | MFT_ENUM_FLAG_LOCALMFT | MFT_ENUM_FLAG_SORTANDFILTER,
-        nullptr, &outInfo, &acts, &actCount);
+    auto createAacMft = [&](ComPtr<IMFTransform>& outEnc, DWORD& outSize, std::vector<uint8_t>* outUdata) -> bool {
+        MFT_REGISTER_TYPE_INFO outInfo = { MFMediaType_Audio, MFAudioFormat_AAC };
+        IMFActivate** acts = nullptr;
+        UINT32 actCount = 0;
+        HRESULT hr = MFTEnumEx(MFT_CATEGORY_AUDIO_ENCODER,
+            MFT_ENUM_FLAG_SYNCMFT | MFT_ENUM_FLAG_LOCALMFT | MFT_ENUM_FLAG_SORTANDFILTER,
+            nullptr, &outInfo, &acts, &actCount);
 
-    if (SUCCEEDED(hr) && actCount > 0) {
-        hr = acts[0]->ActivateObject(__uuidof(IMFTransform), aenc.PutVoid());
-        for (UINT32 i = 0; i < actCount; ++i) acts[i]->Release();
-        CoTaskMemFree(acts);
-    } else {
-        if (acts) CoTaskMemFree(acts);
-        std::lock_guard<std::mutex> lk(errMutex_);
-        lastError_ = L"AAC kodlayıcı bulunamadı.";
-        Logger::Log("AudioEngine: MFTEnumEx AAC failed hr=0x%08lx count=%u", (unsigned long)hr, actCount);
-        return;
-    }
+        if (SUCCEEDED(hr) && actCount > 0) {
+            hr = acts[0]->ActivateObject(__uuidof(IMFTransform), outEnc.PutVoid());
+            for (UINT32 i = 0; i < actCount; ++i) acts[i]->Release();
+            CoTaskMemFree(acts);
+        } else {
+            if (acts) CoTaskMemFree(acts);
+            return false;
+        }
+        if (FAILED(hr) || !outEnc) return false;
 
-    if (FAILED(hr) || !aenc) {
-        std::lock_guard<std::mutex> lk(errMutex_);
-        lastError_ = L"AAC kodlayıcı başlatılamadı.";
-        return;
-    }
+        ComPtr<IMFMediaType> outMT;
+        MFCreateMediaType(outMT.Put());
+        outMT->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Audio);
+        outMT->SetGUID(MF_MT_SUBTYPE, MFAudioFormat_AAC);
+        outMT->SetUINT32(MF_MT_AUDIO_BITS_PER_SAMPLE, 16);
+        outMT->SetUINT32(MF_MT_AUDIO_SAMPLES_PER_SECOND, 48000);
+        outMT->SetUINT32(MF_MT_AUDIO_NUM_CHANNELS, 2);
+        outMT->SetUINT32(MF_MT_AUDIO_AVG_BYTES_PER_SECOND, 24000); // 192 kbps
+        outMT->SetUINT32(MF_MT_AAC_PAYLOAD_TYPE, 0);
+        outMT->SetUINT32(MF_MT_AAC_AUDIO_PROFILE_LEVEL_INDICATION, 0x29);
+        hr = outEnc->SetOutputType(0, outMT.Get(), 0);
+        if (FAILED(hr)) {
+            outMT->SetUINT32(MF_MT_AUDIO_AVG_BYTES_PER_SECOND, 20000); // 160 kbps fallback
+            hr = outEnc->SetOutputType(0, outMT.Get(), 0);
+        }
 
-    ComPtr<IMFMediaType> outMT;
-    MFCreateMediaType(outMT.Put());
-    outMT->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Audio);
-    outMT->SetGUID(MF_MT_SUBTYPE, MFAudioFormat_AAC);
-    outMT->SetUINT32(MF_MT_AUDIO_BITS_PER_SAMPLE, 16);
-    outMT->SetUINT32(MF_MT_AUDIO_SAMPLES_PER_SECOND, 48000);
-    outMT->SetUINT32(MF_MT_AUDIO_NUM_CHANNELS, 2);
-    outMT->SetUINT32(MF_MT_AUDIO_AVG_BYTES_PER_SECOND, 24000); // 192 kbps
-    outMT->SetUINT32(MF_MT_AAC_PAYLOAD_TYPE, 0);
-    outMT->SetUINT32(MF_MT_AAC_AUDIO_PROFILE_LEVEL_INDICATION, 0x29);
-    hr = aenc->SetOutputType(0, outMT.Get(), 0);
-    if (FAILED(hr)) {
-        outMT->SetUINT32(MF_MT_AUDIO_AVG_BYTES_PER_SECOND, 20000); // 160 kbps fallback
-        hr = aenc->SetOutputType(0, outMT.Get(), 0);
-    }
+        ComPtr<IMFMediaType> inMT;
+        MFCreateMediaType(inMT.Put());
+        inMT->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Audio);
+        inMT->SetGUID(MF_MT_SUBTYPE, MFAudioFormat_PCM);
+        inMT->SetUINT32(MF_MT_AUDIO_BITS_PER_SAMPLE, 16);
+        inMT->SetUINT32(MF_MT_AUDIO_SAMPLES_PER_SECOND, 48000);
+        inMT->SetUINT32(MF_MT_AUDIO_NUM_CHANNELS, 2);
+        inMT->SetUINT32(MF_MT_AUDIO_BLOCK_ALIGNMENT, 4);
+        inMT->SetUINT32(MF_MT_AUDIO_AVG_BYTES_PER_SECOND, 48000 * 4);
+        if (SUCCEEDED(hr)) hr = outEnc->SetInputType(0, inMT.Get(), 0);
+        if (FAILED(hr)) return false;
 
-    ComPtr<IMFMediaType> inMT;
-    MFCreateMediaType(inMT.Put());
-    inMT->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Audio);
-    inMT->SetGUID(MF_MT_SUBTYPE, MFAudioFormat_PCM);
-    inMT->SetUINT32(MF_MT_AUDIO_BITS_PER_SAMPLE, 16);
-    inMT->SetUINT32(MF_MT_AUDIO_SAMPLES_PER_SECOND, 48000);
-    inMT->SetUINT32(MF_MT_AUDIO_NUM_CHANNELS, 2);
-    inMT->SetUINT32(MF_MT_AUDIO_BLOCK_ALIGNMENT, 4);
-    inMT->SetUINT32(MF_MT_AUDIO_AVG_BYTES_PER_SECOND, 48000 * 4);
-    if (SUCCEEDED(hr)) hr = aenc->SetInputType(0, inMT.Get(), 0);
-
-    if (FAILED(hr)) {
-        std::lock_guard<std::mutex> lk(errMutex_);
-        lastError_ = L"AAC format ayarı başarısız.";
-        Logger::Log("AudioEngine: AAC SetInput/OutputType failed hr=0x%08lx", (unsigned long)hr);
-        return;
-    }
-
-    ComPtr<IMFMediaType> curOut;
-    if (SUCCEEDED(aenc->GetOutputCurrentType(0, curOut.Put())) && curOut) {
-        UINT32 ulen = 0;
-        if (SUCCEEDED(curOut->GetBlobSize(MF_MT_USER_DATA, &ulen)) && ulen > 0) {
-            std::vector<uint8_t> udata(ulen);
-            if (SUCCEEDED(curOut->GetBlob(MF_MT_USER_DATA, udata.data(), ulen, nullptr))) {
-                ring_.UpdateAacUserData(std::move(udata));
+        if (outUdata) {
+            ComPtr<IMFMediaType> curOut;
+            if (SUCCEEDED(outEnc->GetOutputCurrentType(0, curOut.Put())) && curOut) {
+                UINT32 ulen = 0;
+                if (SUCCEEDED(curOut->GetBlobSize(MF_MT_USER_DATA, &ulen)) && ulen > 0) {
+                    outUdata->resize(ulen);
+                    curOut->GetBlob(MF_MT_USER_DATA, outUdata->data(), ulen, nullptr);
+                }
             }
         }
+        outEnc->ProcessMessage(MFT_MESSAGE_NOTIFY_BEGIN_STREAMING, 0);
+        outEnc->ProcessMessage(MFT_MESSAGE_NOTIFY_START_OF_STREAM, 0);
+        MFT_OUTPUT_STREAM_INFO osi{};
+        outEnc->GetOutputStreamInfo(0, &osi);
+        outSize = osi.cbSize > 0 ? osi.cbSize : 8192;
+        return true;
+    };
+
+    DWORD outBufSize = 8192;
+    std::vector<uint8_t> udata;
+    if (!createAacMft(aenc, outBufSize, &udata)) {
+        std::lock_guard<std::mutex> lk(errMutex_);
+        lastError_ = L"AAC kodlayıcı başlatılamadı.";
+        Logger::Log("AudioEngine: createAacMft failed");
+        return;
+    }
+    if (!udata.empty()) {
+        ring_.UpdateAacUserData(std::move(udata));
     }
 
-    aenc->ProcessMessage(MFT_MESSAGE_NOTIFY_BEGIN_STREAMING, 0);
-    aenc->ProcessMessage(MFT_MESSAGE_NOTIFY_START_OF_STREAM, 0);
+    ComPtr<IMFTransform> aencGame, aencMic;
+    DWORD outBufSizeGame = 8192, outBufSizeMic = 8192;
+    const bool hasGameTrackEnc = createAacMft(aencGame, outBufSizeGame, nullptr);
+    const bool hasMicTrackEnc = createAacMft(aencMic, outBufSizeMic, nullptr);
 
     ComPtr<IMMDeviceEnumerator> en;
     CoCreateInstance(__uuidof(MMDeviceEnumerator), nullptr, CLSCTX_ALL,
@@ -639,7 +647,11 @@ void AudioEngine::ThreadMain(int64_t masterStartQpc, std::wstring micDeviceId) {
     std::deque<StereoSample> gameQ;
     std::deque<StereoSample> micQ;
     std::vector<int16_t> pcmAccum;
+    std::vector<int16_t> pcmGameAccum;
+    std::vector<int16_t> pcmMicAccum;
     pcmAccum.reserve(4096);
+    pcmGameAccum.reserve(4096);
+    pcmMicAccum.reserve(4096);
     MicNoiseGate noiseGate;
 
     SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);
@@ -685,22 +697,19 @@ void AudioEngine::ThreadMain(int64_t masterStartQpc, std::wstring micDeviceId) {
         timer = CreateWaitableTimerW(nullptr, FALSE, nullptr);
     }
 
-    MFT_OUTPUT_STREAM_INFO osi{};
-    aenc->GetOutputStreamInfo(0, &osi);
-    const DWORD outBufSize = osi.cbSize > 0 ? osi.cbSize : 8192;
-
-    auto drainAacOutput = [&]() {
+    auto drainTrackOutput = [](IMFTransform* enc, DWORD bufSz, auto&& pushFn) {
+        if (!enc) return;
         while (true) {
             ComPtr<IMFSample> outSamp;
             MFCreateSample(outSamp.Put());
             ComPtr<IMFMediaBuffer> outBuf;
-            MFCreateMemoryBuffer(outBufSize, outBuf.Put());
+            MFCreateMemoryBuffer(bufSz, outBuf.Put());
             outSamp->AddBuffer(outBuf.Get());
 
             MFT_OUTPUT_DATA_BUFFER odb{};
             odb.pSample = outSamp.Get();
             DWORD status = 0;
-            HRESULT ohr = aenc->ProcessOutput(0, 1, &odb, &status);
+            HRESULT ohr = enc->ProcessOutput(0, 1, &odb, &status);
             if (odb.pEvents) odb.pEvents->Release();
             if (ohr == MF_E_TRANSFORM_NEED_MORE_INPUT || FAILED(ohr)) break;
 
@@ -717,10 +726,20 @@ void AudioEngine::ThreadMain(int64_t masterStartQpc, std::wstring micDeviceId) {
                     pkt.pts100ns = sPts;
                     pkt.dur100ns = sDur;
                     pkt.keyframe = true;
-                    ring_.PushAudio(std::move(pkt));
+                    pushFn(std::move(pkt));
                     contig->Unlock();
                 }
             }
+        }
+    };
+
+    auto drainAllOutputs = [&]() {
+        drainTrackOutput(aenc.Get(), outBufSize, [&](EncodedPacket p) { ring_.PushAudio(std::move(p)); });
+        if (hasGameTrackEnc) {
+            drainTrackOutput(aencGame.Get(), outBufSizeGame, [&](EncodedPacket p) { ring_.PushAudioGame(std::move(p)); });
+        }
+        if (hasMicTrackEnc) {
+            drainTrackOutput(aencMic.Get(), outBufSizeMic, [&](EncodedPacket p) { ring_.PushAudioMic(std::move(p)); });
         }
     };
 
@@ -944,51 +963,72 @@ void AudioEngine::ThreadMain(int64_t masterStartQpc, std::wstring micDeviceId) {
                 }
                 micMul *= gGate;
             }
-            float l = SoftClip(gs.l * gGain + ms.l * micMul);
-            float r = SoftClip(gs.r * gGain + ms.r * micMul);
-            int32_t il = static_cast<int32_t>(std::lrintf(l * 32767.0f));
-            int32_t ir = static_cast<int32_t>(std::lrintf(r * 32767.0f));
-            pcmAccum.push_back(static_cast<int16_t>(std::max(-32768, std::min(32767, il))));
-            pcmAccum.push_back(static_cast<int16_t>(std::max(-32768, std::min(32767, ir))));
+            auto pushStereo = [](std::vector<int16_t>& dst, float fl, float fr) {
+                int32_t il = static_cast<int32_t>(std::lrintf(SoftClip(fl) * 32767.0f));
+                int32_t ir = static_cast<int32_t>(std::lrintf(SoftClip(fr) * 32767.0f));
+                dst.push_back(static_cast<int16_t>(std::max(-32768, std::min(32767, il))));
+                dst.push_back(static_cast<int16_t>(std::max(-32768, std::min(32767, ir))));
+            };
+            pushStereo(pcmAccum, gs.l * gGain + ms.l * micMul, gs.r * gGain + ms.r * micMul);
+            if (hasGameTrackEnc) pushStereo(pcmGameAccum, gs.l * gGain, gs.r * gGain);
+            if (hasMicTrackEnc)  pushStereo(pcmMicAccum, ms.l * micMul, ms.r * micMul);
         }
         totalEmitted += static_cast<int64_t>(stepNeeded);
+
+        auto feedTrack = [&](IMFTransform* enc, DWORD bufSz, const int16_t* pcm, int64_t pts, int64_t dur, auto&& pushFn) -> bool {
+            ComPtr<IMFMediaBuffer> inBuf;
+            if (FAILED(MFCreateMemoryBuffer(1024 * 4, inBuf.Put()))) return false;
+            BYTE* pDst = nullptr;
+            if (SUCCEEDED(inBuf->Lock(&pDst, nullptr, nullptr))) {
+                memcpy(pDst, pcm, 1024 * 4);
+                inBuf->Unlock();
+                inBuf->SetCurrentLength(1024 * 4);
+            }
+            ComPtr<IMFSample> inSamp;
+            MFCreateSample(inSamp.Put());
+            inSamp->AddBuffer(inBuf.Get());
+            inSamp->SetSampleTime(pts);
+            inSamp->SetSampleDuration(dur);
+            HRESULT phr = enc->ProcessInput(0, inSamp.Get(), 0);
+            if (phr == MF_E_NOTACCEPTING) {
+                drainTrackOutput(enc, bufSz, pushFn);
+                phr = enc->ProcessInput(0, inSamp.Get(), 0);
+            }
+            if (FAILED(phr)) return false;
+            drainTrackOutput(enc, bufSz, pushFn);
+            return true;
+        };
 
         // Encode 1024-sample AAC frames
         const size_t chunkFloats = 1024 * 2;
         size_t offset = 0;
         while (pcmAccum.size() - offset >= chunkFloats) {
-            ComPtr<IMFMediaBuffer> inBuf;
-            if (FAILED(MFCreateMemoryBuffer(1024 * 4, inBuf.Put()))) break;
-            BYTE* pDst = nullptr;
-            if (SUCCEEDED(inBuf->Lock(&pDst, nullptr, nullptr))) {
-                memcpy(pDst, pcmAccum.data() + offset, 1024 * 4);
-                inBuf->Unlock();
-                inBuf->SetCurrentLength(1024 * 4);
-            }
-
-            ComPtr<IMFSample> inSamp;
-            MFCreateSample(inSamp.Put());
-            inSamp->AddBuffer(inBuf.Get());
             int64_t pts = (aacSamplesFed * 10000000LL) / 48000LL;
             int64_t dur = ((aacSamplesFed + 1024) * 10000000LL) / 48000LL - pts;
-            inSamp->SetSampleTime(pts);
-            inSamp->SetSampleDuration(dur);
-
-            HRESULT phr = aenc->ProcessInput(0, inSamp.Get(), 0);
-            if (phr == MF_E_NOTACCEPTING) {
-                drainAacOutput();
-                phr = aenc->ProcessInput(0, inSamp.Get(), 0);
-            }
-            if (FAILED(phr)) {
-                Logger::Log("AudioEngine: AAC ProcessInput failed hr=0x%08lx", (unsigned long)phr);
+            if (!feedTrack(aenc.Get(), outBufSize, pcmAccum.data() + offset, pts, dur,
+                           [&](EncodedPacket p) { ring_.PushAudio(std::move(p)); })) {
+                Logger::Log("AudioEngine: AAC ProcessInput failed");
                 break;
+            }
+            if (hasGameTrackEnc && pcmGameAccum.size() >= offset + chunkFloats) {
+                feedTrack(aencGame.Get(), outBufSizeGame, pcmGameAccum.data() + offset, pts, dur,
+                          [&](EncodedPacket p) { ring_.PushAudioGame(std::move(p)); });
+            }
+            if (hasMicTrackEnc && pcmMicAccum.size() >= offset + chunkFloats) {
+                feedTrack(aencMic.Get(), outBufSizeMic, pcmMicAccum.data() + offset, pts, dur,
+                          [&](EncodedPacket p) { ring_.PushAudioMic(std::move(p)); });
             }
             aacSamplesFed += 1024;
             offset += chunkFloats;
-            drainAacOutput();
         }
         if (offset > 0) {
             pcmAccum.erase(pcmAccum.begin(), pcmAccum.begin() + static_cast<ptrdiff_t>(offset));
+            if (hasGameTrackEnc && pcmGameAccum.size() >= offset) {
+                pcmGameAccum.erase(pcmGameAccum.begin(), pcmGameAccum.begin() + static_cast<ptrdiff_t>(offset));
+            }
+            if (hasMicTrackEnc && pcmMicAccum.size() >= offset) {
+                pcmMicAccum.erase(pcmMicAccum.begin(), pcmMicAccum.begin() + static_cast<ptrdiff_t>(offset));
+            }
         }
     }
 
@@ -997,5 +1037,13 @@ void AudioEngine::ThreadMain(int64_t masterStartQpc, std::wstring micDeviceId) {
     micStream.Close();
     aenc->ProcessMessage(MFT_MESSAGE_NOTIFY_END_OF_STREAM, 0);
     aenc->ProcessMessage(MFT_MESSAGE_COMMAND_DRAIN, 0);
-    drainAacOutput();
+    if (hasGameTrackEnc) {
+        aencGame->ProcessMessage(MFT_MESSAGE_NOTIFY_END_OF_STREAM, 0);
+        aencGame->ProcessMessage(MFT_MESSAGE_COMMAND_DRAIN, 0);
+    }
+    if (hasMicTrackEnc) {
+        aencMic->ProcessMessage(MFT_MESSAGE_NOTIFY_END_OF_STREAM, 0);
+        aencMic->ProcessMessage(MFT_MESSAGE_COMMAND_DRAIN, 0);
+    }
+    drainAllOutputs();
 }

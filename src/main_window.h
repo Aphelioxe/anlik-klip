@@ -69,11 +69,15 @@ private:
     void TogglePlayerMute();
     void CyclePlayerRate();
     void UpdatePlayerMetrics();
+    void TogglePlayerFullscreen();
     void ToggleTrimMode();
     void StartTrimAsync(bool replaceOriginal);
     void StopTrimWorker();
+    void PickInsertClip();
     RECT GetSeekBarRect() const;
     RECT GetVolumeBarRect() const;
+    RECT GetGameVolBarRect() const;
+    RECT GetMicVolBarRect() const;
 
     // Hit-testing & custom painting
     struct UiButtonRect {
@@ -144,12 +148,28 @@ private:
     float playerRate_ = 1.0f;
     bool draggingSeek_ = false;
     bool draggingVol_ = false;
+    bool playerFullscreen_ = false;
+    RECT savedWindowRc_{};
+    DWORD savedWindowStyle_ = 0;
+    DWORD savedWindowExStyle_ = 0;
 
-    // Trim state (only active inside embedded player)
+    // Trim & low-level multi-track editor state (only active inside embedded player)
     bool trimMode_ = false;
     double trimStartSec_ = 0.0;
     double trimEndSec_ = 0.0;
-    int draggingTrim_ = 0; // 0=none, 1=start, 2=end
+    bool editCutActive_ = false;
+    double cutStartSec_ = 0.0;
+    double cutEndSec_ = 0.0;
+    int draggingTrim_ = 0; // 0=none, 1=start, 2=end, 3=cutStart, 4=cutEnd
+    bool editHasMultiTrack_ = false;
+    int editGameVolPct_ = 100;
+    int editMicVolPct_ = 100;
+    bool editGameMuted_ = false;
+    bool editMicMuted_ = false;
+    bool draggingEditGameVol_ = false;
+    bool draggingEditMicVol_ = false;
+    double editSpeed_ = 1.0;
+    std::wstring editInsertClipPath_;
     bool trimBusy_ = false;
     std::atomic<bool> trimCancel_{false};
     std::thread trimThread_;

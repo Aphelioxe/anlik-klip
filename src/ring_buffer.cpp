@@ -50,23 +50,44 @@ void RingBuffer::PushVideo(EncodedPacket pkt) {
     TrimLocked();
 }
 
-void RingBuffer::PushAudio(EncodedPacket pkt) {
+void RingBuffer::PushAudioQueue(std::deque<EncodedPacket>& q, EncodedPacket pkt) {
     if (!pkt.data || pkt.data->empty()) return;
     std::lock_guard<std::mutex> lk(mutex_);
-    if (!audio_.empty() && pkt.pts100ns < audio_.back().pts100ns) {
-        pkt.pts100ns = audio_.back().pts100ns + 1;
+    if (!q.empty() && pkt.pts100ns < q.back().pts100ns) {
+        pkt.pts100ns = q.back().pts100ns + 1;
     }
     audioBytes_ += pkt.data->size();
-    audio_.push_back(std::move(pkt));
+    q.push_back(std::move(pkt));
     TrimLocked();
+}
+
+void RingBuffer::PushAudio(EncodedPacket pkt) {
+    PushAudioQueue(audio_, std::move(pkt));
+}
+
+void RingBuffer::PushAudioGame(EncodedPacket pkt) {
+    PushAudioQueue(audioGame_, std::move(pkt));
+}
+
+void RingBuffer::PushAudioMic(EncodedPacket pkt) {
+    PushAudioQueue(audioMic_, std::move(pkt));
 }
 
 void RingBuffer::Clear() {
     std::lock_guard<std::mutex> lk(mutex_);
     video_.clear();
     audio_.clear();
+    audioGame_.clear();
+    audioMic_.clear();
     videoBytes_ = 0;
     audioBytes_ = 0;
+}
+
+void RingBuffer::TrimAudioQueueLocked(std::deque<EncodedPacket>& q, int64_t cutoffPts) {
+    while (!q.empty() && q.front().pts100ns < cutoffPts) {
+        audioBytes_ -= q.front().data->size();
+        q.pop_front();
+    }
 }
 
 void RingBuffer::TrimLocked() {
@@ -102,16 +123,18 @@ void RingBuffer::TrimLocked() {
     // Trim audio aligned to oldest video packet (with 1s margin)
     if (!video_.empty()) {
         int64_t cutoffPts = video_.front().pts100ns - 10000000LL;
-        while (!audio_.empty() && audio_.front().pts100ns < cutoffPts) {
-            audioBytes_ -= audio_.front().data->size();
-            audio_.pop_front();
-        }
-    } else if (!audio_.empty()) {
-        int64_t cutoffPts = audio_.back().pts100ns - (targetNs + 50000000LL);
-        while (!audio_.empty() && audio_.front().pts100ns < cutoffPts) {
-            audioBytes_ -= audio_.front().data->size();
-            audio_.pop_front();
-        }
+        TrimAudioQueueLocked(audio_, cutoffPts);
+        TrimAudioQueueLocked(audioGame_, cutoffPts);
+        TrimAudioQueueLocked(audioMic_, cutoffPts);
+    } else {
+        auto trimFallback = [&](std::deque<EncodedPacket>& q) {
+            if (!q.empty()) {
+                TrimAudioQueueLocked(q, q.back().pts100ns - (targetNs + 50000000LL));
+            }
+        };
+        trimFallback(audio_);
+        trimFallback(audioGame_);
+        trimFallback(audioMic_);
     }
 }
 
@@ -190,11 +213,14 @@ bool RingBuffer::TakeSnapshot(int maxSeconds, ClipSnapshot& out) const {
         out.video.push_back(video_[i]);
     }
 
-    out.audio.clear();
-    for (const auto& ap : audio_) {
-        if (ap.pts100ns >= basePts) {
-            out.audio.push_back(ap);
+    auto copySinceBase = [&](const std::deque<EncodedPacket>& src, std::vector<EncodedPacket>& dst) {
+        dst.clear();
+        for (const auto& ap : src) {
+            if (ap.pts100ns >= basePts) dst.push_back(ap);
         }
-    }
+    };
+    copySinceBase(audio_, out.audio);
+    copySinceBase(audioGame_, out.audioGame);
+    copySinceBase(audioMic_, out.audioMic);
     return !out.video.empty();
 }

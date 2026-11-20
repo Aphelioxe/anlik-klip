@@ -6,13 +6,39 @@
 #include <atomic>
 #include <string>
 
+struct ClipEditSpec {
+    std::wstring srcPath;
+    std::wstring dstPath;
+    double startSec = 0.0;
+    double endSec = 0.0;
+
+    // Optional middle cut: removes [cutStartSec, cutEndSec] when cutEndSec > cutStartSec
+    double cutStartSec = 0.0;
+    double cutEndSec = 0.0;
+
+    // Optional second clip to insert (at cut point if cut is active, otherwise appended at end)
+    std::wstring insertClipPath;
+
+    // Playback/export speed (0.5 .. 2.0) and per-track audio volumes (0 .. 200%)
+    double speed = 1.0;
+    int gameVolPct = 100;
+    int micVolPct = 100;
+};
+
 /** Returns a non-colliding copy path alongside srcPath (e.g. "Clip_kesit.mp4"). */
 std::wstring BuildTrimmedCopyPath(const std::wstring& srcPath);
 
+/** Probes whether an MP4 clip contains separate Game (Track 2) and Mic (Track 3) audio streams. */
+bool ProbeClipAudioTracks(const std::wstring& path, bool& outHasSeparateGameMic, double* outDurationSec = nullptr);
+
 /**
- * Frame-accurately trims [startSec, endSec] from an MP4 file while preserving
- * BT.709 color metadata and exact A/V sync. Writes via .tmp.mp4 before moving to dstPath.
+ * Edits an MP4 clip (trim, optional middle cut, optional clip insertion, speed, and
+ * independent Game/Mic audio mixing) while preserving BT.709 color metadata and A/V sync.
  */
+bool EditMp4Clip(const ClipEditSpec& spec, std::string& outError,
+                 std::atomic<bool>* cancelFlag = nullptr);
+
+/** Frame-accurately trims [startSec, endSec] from an MP4 file. */
 bool TrimMp4Clip(const std::wstring& srcPath, const std::wstring& dstPath,
                  double startSec, double endSec, std::string& outError,
                  std::atomic<bool>* cancelFlag = nullptr);

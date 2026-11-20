@@ -8,6 +8,7 @@ import android.view.View;
 import android.view.ViewGroup;
 import android.widget.Button;
 import android.widget.ImageView;
+import android.widget.LinearLayout;
 import android.widget.ProgressBar;
 import android.widget.TextView;
 
@@ -16,20 +17,25 @@ import androidx.core.content.ContextCompat;
 import androidx.recyclerview.widget.RecyclerView;
 
 import java.util.ArrayList;
+import java.util.HashSet;
 import java.util.List;
+import java.util.Set;
 import java.util.concurrent.ExecutorService;
 
 public class ClipAdapter extends RecyclerView.Adapter<ClipAdapter.Holder> {
     public interface Listener {
         void onPlayClip(ClipItem item);
         void onDownloadClip(ClipItem item);
+        void onSelectionChanged(int selectedCount, boolean selectionMode);
     }
 
     private final List<ClipItem> items = new ArrayList<>();
+    private final Set<String> selectedFiles = new HashSet<>();
     private final ExecutorService executor;
     private final Handler mainHandler = new Handler(Looper.getMainLooper());
     private final Listener listener;
 
+    private boolean selectionMode = false;
     private String host = "";
     private int port = 47820;
     private String pin = "";
@@ -49,6 +55,33 @@ public class ClipAdapter extends RecyclerView.Adapter<ClipAdapter.Holder> {
         items.clear();
         items.addAll(newItems);
         notifyDataSetChanged();
+    }
+
+    public boolean isSelectionMode() {
+        return selectionMode;
+    }
+
+    public List<ClipItem> getSelectedItems() {
+        List<ClipItem> out = new ArrayList<>();
+        for (ClipItem c : items) {
+            if (selectedFiles.contains(c.fileName)) out.add(c);
+        }
+        return out;
+    }
+
+    public void selectAll() {
+        selectionMode = true;
+        selectedFiles.clear();
+        for (ClipItem c : items) selectedFiles.add(c.fileName);
+        notifyDataSetChanged();
+        listener.onSelectionChanged(selectedFiles.size(), true);
+    }
+
+    public void clearSelection() {
+        selectionMode = false;
+        selectedFiles.clear();
+        notifyDataSetChanged();
+        listener.onSelectionChanged(0, false);
     }
 
     public void notifyClipUpdated(String fileName) {
@@ -71,6 +104,10 @@ public class ClipAdapter extends RecyclerView.Adapter<ClipAdapter.Holder> {
     public void onBindViewHolder(@NonNull Holder holder, int position) {
         ClipItem item = items.get(position);
         holder.boundFile = item.fileName;
+
+        boolean isSelected = selectionMode && selectedFiles.contains(item.fileName);
+        holder.cardRoot.setBackgroundResource(isSelected ? R.drawable.bg_card_selected : R.drawable.bg_card);
+        holder.txtSelectedBadge.setVisibility(isSelected ? View.VISIBLE : View.GONE);
 
         holder.txtTitle.setText(item.fileName);
         holder.txtMeta.setText(item.date + " • " + item.getFormattedSize());
@@ -97,6 +134,7 @@ public class ClipAdapter extends RecyclerView.Adapter<ClipAdapter.Holder> {
         }
 
         holder.imgThumb.setImageBitmap(null);
+        holder.imgThumb.setClipToOutline(true);
         final String targetFile = item.fileName;
         executor.execute(() -> {
             Bitmap bmp = ApiClient.fetchThumbnail(host, port, pin, targetFile);
@@ -109,8 +147,34 @@ public class ClipAdapter extends RecyclerView.Adapter<ClipAdapter.Holder> {
             }
         });
 
-        holder.itemView.setOnClickListener(v -> listener.onPlayClip(item));
+        holder.itemView.setOnClickListener(v -> {
+            if (selectionMode) {
+                toggleSelection(item.fileName);
+            } else {
+                listener.onPlayClip(item);
+            }
+        });
+
+        holder.itemView.setOnLongClickListener(v -> {
+            if (!selectionMode) {
+                selectionMode = true;
+            }
+            toggleSelection(item.fileName);
+            return true;
+        });
+
         holder.btnDownload.setOnClickListener(v -> listener.onDownloadClip(item));
+    }
+
+    private void toggleSelection(String fileName) {
+        if (selectedFiles.contains(fileName)) {
+            selectedFiles.remove(fileName);
+            if (selectedFiles.isEmpty()) selectionMode = false;
+        } else {
+            selectedFiles.add(fileName);
+        }
+        notifyDataSetChanged();
+        listener.onSelectionChanged(selectedFiles.size(), selectionMode);
     }
 
     @Override
@@ -120,8 +184,10 @@ public class ClipAdapter extends RecyclerView.Adapter<ClipAdapter.Holder> {
 
     static class Holder extends RecyclerView.ViewHolder {
         String boundFile = "";
+        final LinearLayout cardRoot;
         final ImageView imgThumb;
         final TextView txtResBadge;
+        final TextView txtSelectedBadge;
         final TextView txtFavBadge;
         final TextView txtDuration;
         final TextView txtTitle;
@@ -131,8 +197,10 @@ public class ClipAdapter extends RecyclerView.Adapter<ClipAdapter.Holder> {
 
         Holder(@NonNull View itemView) {
             super(itemView);
+            cardRoot = itemView.findViewById(R.id.cardRoot);
             imgThumb = itemView.findViewById(R.id.imgThumb);
             txtResBadge = itemView.findViewById(R.id.txtResBadge);
+            txtSelectedBadge = itemView.findViewById(R.id.txtSelectedBadge);
             txtFavBadge = itemView.findViewById(R.id.txtFavBadge);
             txtDuration = itemView.findViewById(R.id.txtDuration);
             txtTitle = itemView.findViewById(R.id.txtTitle);
