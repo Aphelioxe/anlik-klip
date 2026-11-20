@@ -1268,7 +1268,7 @@ void MainWindow::StartUploadClip(const std::wstring& filePath) {
 
     HWND target = hwnd_;
     uploadThread_ = std::thread([this, target, filePath]() {
-        auto* res = new ClipUploadResult(UploadClipToPixeldrain(
+        auto* res = new ClipUploadResult(UploadClipToShareLink(
             filePath,
             [target](int pct) {
                 PostMessageW(target, WM_MW_UPLOAD_PROGRESS, static_cast<WPARAM>(pct), 0);

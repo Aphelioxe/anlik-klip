@@ -10,7 +10,7 @@ struct ClipUploadResult {
     std::wstring error;
 };
 
-ClipUploadResult UploadClipToPixeldrain(
+ClipUploadResult UploadClipToShareLink(
     const std::wstring& filePath,
     const std::function<void(int pct)>& onProgress,
     std::atomic<bool>& cancelFlag);
