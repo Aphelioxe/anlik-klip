@@ -177,12 +177,99 @@ void UpdateFavoriteOnRename(const std::wstring& favPath, const std::wstring& old
     }
 }
 
+std::wstring GetClipLinksFilePath() {
+    return GetExeDirectory() + L"\\klip_linkleri.txt";
+}
+
+static bool SaveClipLinks(const std::wstring& linksPath, const std::unordered_map<std::wstring, std::wstring>& links) {
+    if (linksPath.empty()) return false;
+    FILE* fp = nullptr;
+    if (_wfopen_s(&fp, linksPath.c_str(), L"wb") != 0 || !fp) return false;
+    for (const auto& kv : links) {
+        if (kv.first.empty() || kv.second.empty()) continue;
+        std::wstring lineW = kv.first + L"\t" + kv.second + L"\r\n";
+        int n = WideCharToMultiByte(CP_UTF8, 0, lineW.c_str(), static_cast<int>(lineW.size()), nullptr, 0, nullptr, nullptr);
+        if (n > 0) {
+            std::string utf8(static_cast<size_t>(n), '\0');
+            WideCharToMultiByte(CP_UTF8, 0, lineW.c_str(), static_cast<int>(lineW.size()), &utf8[0], n, nullptr, nullptr);
+            fwrite(utf8.data(), 1, utf8.size(), fp);
+        }
+    }
+    fclose(fp);
+    return true;
+}
+
+std::unordered_map<std::wstring, std::wstring> LoadClipLinks(const std::wstring& linksPath) {
+    std::unordered_map<std::wstring, std::wstring> out;
+    if (linksPath.empty()) return out;
+    FILE* fp = nullptr;
+    if (_wfopen_s(&fp, linksPath.c_str(), L"rb") != 0 || !fp) return out;
+
+    fseek(fp, 0, SEEK_END);
+    long sz = ftell(fp);
+    fseek(fp, 0, SEEK_SET);
+    if (sz > 0 && sz < 4 * 1024 * 1024) {
+        std::string raw(static_cast<size_t>(sz), '\0');
+        size_t got = fread(&raw[0], 1, raw.size(), fp);
+        raw.resize(got);
+        size_t pos = 0;
+        while (pos < raw.size()) {
+            size_t nl = raw.find_first_of("\r\n", pos);
+            size_t end = (nl == std::string::npos) ? raw.size() : nl;
+            if (end > pos) {
+                std::string line = raw.substr(pos, end - pos);
+                size_t tab = line.find('\t');
+                if (tab != std::string::npos && tab > 0 && tab + 1 < line.size()) {
+                    std::string kUtf8 = line.substr(0, tab);
+                    std::string vUtf8 = line.substr(tab + 1);
+                    auto toW = [](const std::string& s) -> std::wstring {
+                        int wl = MultiByteToWideChar(CP_UTF8, 0, s.c_str(), static_cast<int>(s.size()), nullptr, 0);
+                        std::wstring w(wl > 0 ? static_cast<size_t>(wl) : 0, L'\0');
+                        if (wl > 0) MultiByteToWideChar(CP_UTF8, 0, s.c_str(), static_cast<int>(s.size()), &w[0], wl);
+                        return w;
+                    };
+                    std::wstring wk = ToLowerCopy(ExtractFileNameOnly(toW(kUtf8)));
+                    std::wstring wv = toW(vUtf8);
+                    if (!wk.empty() && !wv.empty()) out[wk] = wv;
+                }
+            }
+            pos = (nl == std::string::npos) ? raw.size() : nl + 1;
+        }
+    }
+    fclose(fp);
+    return out;
+}
+
+bool SetClipShareLink(const std::wstring& linksPath, const std::wstring& fileName, const std::wstring& url) {
+    std::wstring key = ToLowerCopy(ExtractFileNameOnly(fileName));
+    if (key.empty()) return false;
+    auto links = LoadClipLinks(linksPath);
+    if (url.empty()) links.erase(key);
+    else links[key] = url;
+    return SaveClipLinks(linksPath, links);
+}
+
+void UpdateClipLinkOnRename(const std::wstring& linksPath, const std::wstring& oldFileName, const std::wstring& newFileName) {
+    std::wstring oldKey = ToLowerCopy(ExtractFileNameOnly(oldFileName));
+    std::wstring newKey = ToLowerCopy(ExtractFileNameOnly(newFileName));
+    if (oldKey.empty() || newKey.empty() || oldKey == newKey) return;
+    auto links = LoadClipLinks(linksPath);
+    auto it = links.find(oldKey);
+    if (it != links.end()) {
+        std::wstring url = it->second;
+        links.erase(it);
+        links[newKey] = url;
+        SaveClipLinks(linksPath, links);
+    }
+}
+
 std::vector<ClipItem> ScanClipsFolder(const std::wstring& dir, const std::wstring& favPath) {
     std::vector<ClipItem> items;
     if (dir.empty()) return items;
 
     std::unordered_set<std::wstring> favs;
     if (!favPath.empty()) favs = LoadFavorites(favPath);
+    auto links = LoadClipLinks(GetClipLinksFilePath());
 
     std::wstring pattern = dir;
     if (pattern.back() != L'\\' && pattern.back() != L'/') pattern += L'\\';
@@ -204,8 +291,13 @@ std::vector<ClipItem> ScanClipsFolder(const std::wstring& dir, const std::wstrin
         item.fileSizeBytes = (static_cast<uint64_t>(fd.nFileSizeHigh) << 32) | fd.nFileSizeLow;
         item.writeTime64 = (static_cast<uint64_t>(fd.ftLastWriteTime.dwHighDateTime) << 32) |
                            fd.ftLastWriteTime.dwLowDateTime;
+        std::wstring lowerName = ToLowerCopy(name);
         if (!favs.empty()) {
-            item.isFavorite = (favs.find(ToLowerCopy(name)) != favs.end());
+            item.isFavorite = (favs.find(lowerName) != favs.end());
+        }
+        auto lit = links.find(lowerName);
+        if (lit != links.end()) {
+            item.shareUrl = lit->second;
         }
 
         FILETIME localFt{};

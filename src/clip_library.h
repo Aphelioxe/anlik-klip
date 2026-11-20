@@ -5,6 +5,7 @@
 #include <windows.h>
 #include <cstdint>
 #include <string>
+#include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
@@ -12,6 +13,7 @@ struct ClipItem {
     std::wstring filePath;
     std::wstring fileName;
     std::wstring displayDate;
+    std::wstring shareUrl;
     uint64_t fileSizeBytes = 0;
     uint64_t writeTime64 = 0;
     double durationSeconds = 0.0;
@@ -24,6 +26,11 @@ std::wstring GetFavoritesFilePath();
 std::unordered_set<std::wstring> LoadFavorites(const std::wstring& favPath);
 bool SetClipFavorite(const std::wstring& favPath, const std::wstring& fileName, bool favorite);
 void UpdateFavoriteOnRename(const std::wstring& favPath, const std::wstring& oldFileName, const std::wstring& newFileName);
+
+std::wstring GetClipLinksFilePath();
+std::unordered_map<std::wstring, std::wstring> LoadClipLinks(const std::wstring& linksPath);
+bool SetClipShareLink(const std::wstring& linksPath, const std::wstring& fileName, const std::wstring& url);
+void UpdateClipLinkOnRename(const std::wstring& linksPath, const std::wstring& oldFileName, const std::wstring& newFileName);
 
 std::vector<ClipItem> ScanClipsFolder(const std::wstring& dir, const std::wstring& favPath = L"");
 void ClearClipMetadataCache();

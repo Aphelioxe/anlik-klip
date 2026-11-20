@@ -108,6 +108,7 @@ enum CustomBtnId {
     BTN_CLIP_PLAY,
     BTN_CLIP_FAV,
     BTN_CLIP_SHARE,
+    BTN_CLIP_COPY_LINK,
     BTN_CLIP_RENAME,
     BTN_CLIP_REVEAL,
     BTN_CLIP_DELETE,
@@ -1263,6 +1264,7 @@ void MainWindow::StartUploadClip(const std::wstring& filePath) {
     if (uploadBusy_ || trimBusy_ || filePath.empty() || !hwnd_) return;
     StopUploadWorker();
     uploadBusy_ = true;
+    uploadFilePath_ = filePath;
     uploadCancel_.store(false);
     SetFooterMessage(L"Link oluşturuluyor... %0");
 
@@ -1287,6 +1289,30 @@ void MainWindow::ShareSelected() {
     }
     if (selectedIdx_ < 0 || selectedIdx_ >= static_cast<int>(filteredIndices_.size())) return;
     StartUploadClip(clips_[filteredIndices_[static_cast<size_t>(selectedIdx_)]].filePath);
+}
+
+void MainWindow::CopySelectedShareLink() {
+    if (selectedIdx_ < 0 || selectedIdx_ >= static_cast<int>(filteredIndices_.size())) return;
+    const std::wstring& url = clips_[filteredIndices_[static_cast<size_t>(selectedIdx_)]].shareUrl;
+    if (url.empty() || !hwnd_) return;
+    if (OpenClipboard(hwnd_)) {
+        EmptyClipboard();
+        size_t bytes = (url.size() + 1) * sizeof(wchar_t);
+        HGLOBAL hg = GlobalAlloc(GMEM_MOVEABLE, bytes);
+        if (hg) {
+            void* p = GlobalLock(hg);
+            if (p) {
+                memcpy(p, url.c_str(), bytes);
+                GlobalUnlock(hg);
+                SetClipboardData(CF_UNICODETEXT, hg);
+            } else {
+                GlobalFree(hg);
+            }
+        }
+        CloseClipboard();
+    }
+    copyFeedbackUntilMs_ = GetTickCount64() + 1800;
+    InvalidateRect(hwnd_, nullptr, FALSE);
 }
 
 void MainWindow::TogglePlayerFullscreen() {
@@ -1832,6 +1858,7 @@ void MainWindow::RenameSelected() {
         size_t sl = newPath.find_last_of(L"\\/");
         std::wstring newName = (sl != std::wstring::npos) ? newPath.substr(sl + 1) : newPath;
         UpdateFavoriteOnRename(GetFavoritesFilePath(), oldName, newName);
+        UpdateClipLinkOnRename(GetClipLinksFilePath(), oldName, newName);
         InvalidateClipMetadata(oldPath);
 
         auto it = thumbBmps_.find(oldPath);
@@ -1859,6 +1886,7 @@ void MainWindow::DeleteSelected() {
 
     if (TrashClipFile(c.filePath)) {
         SetClipFavorite(GetFavoritesFilePath(), c.fileName, false);
+        SetClipShareLink(GetClipLinksFilePath(), c.fileName, L"");
         InvalidateClipMetadata(c.filePath);
         auto it = thumbBmps_.find(c.filePath);
         if (it != thumbBmps_.end()) {
@@ -2700,8 +2728,26 @@ void MainWindow::PaintWindow(HDC targetDc) {
             addBtnPx(BTN_CLIP_RENAME, S(526), dockY + S(11), S(76), S(34), L"Adlandır", Gc(32, 39, 53), Gc(44, 54, 72), Gc(56, 68, 90), hasSel);
             addBtnPx(BTN_CLIP_REVEAL, S(608), dockY + S(11), S(74), S(34), L"Klasör", Gc(32, 39, 53), Gc(44, 54, 72), Gc(56, 68, 90), hasSel);
             addBtnPx(BTN_CLIP_DELETE, S(688), dockY + S(11), S(48), S(34), L"Sil", Gc(153, 27, 27), Gc(185, 28, 28), Gc(220, 38, 38), hasSel);
-            g.DrawString(footerMsg_.c_str(), -1, &fSmall,
-                Gdiplus::RectF((float)S(744), (float)(dockY + S(8)), (float)std::max(S(140), cw - S(770)), (float)S(40)), &sfLeft, &brMuted);
+            std::wstring selUrl = hasSel ? clips_[filteredIndices_[static_cast<size_t>(selectedIdx_)]].shareUrl : L"";
+            if (hasSel && !selUrl.empty() && !uploadBusy_) {
+                int boxX = S(744);
+                int boxW = std::max(S(60), cw - S(112) - boxX);
+                FillRoundRect(g, (float)boxX, (float)(dockY + S(11)), (float)boxW, (float)S(34), (float)S(8), Gc(15, 23, 38));
+                StrokeRoundRect(g, (float)boxX, (float)(dockY + S(11)), (float)boxW, (float)S(34), (float)S(8), Gc(45, 212, 191, 110));
+                Gdiplus::SolidBrush brLink(Gc(94, 234, 212));
+                g.DrawString(selUrl.c_str(), -1, &fSmall,
+                    Gdiplus::RectF((float)(boxX + S(10)), (float)(dockY + S(11)), (float)std::max(S(20), boxW - S(16)), (float)S(34)),
+                    &sfLeft, &brLink);
+                bool copiedNow = (GetTickCount64() < copyFeedbackUntilMs_);
+                addBtnPx(BTN_CLIP_COPY_LINK, cw - S(106), dockY + S(11), S(78), S(34),
+                    copiedNow ? L"✓ Kopya" : L"Kopyala",
+                    copiedNow ? Gc(21, 128, 61) : Gc(13, 148, 136),
+                    copiedNow ? Gc(22, 163, 74) : Gc(20, 184, 166),
+                    copiedNow ? Gc(74, 222, 128) : Gc(94, 234, 212), true);
+            } else {
+                g.DrawString(footerMsg_.c_str(), -1, &fSmall,
+                    Gdiplus::RectF((float)S(744), (float)(dockY + S(8)), (float)std::max(S(140), cw - S(770)), (float)S(40)), &sfLeft, &brMuted);
+            }
             g.ResetTransform();
             g.ResetClip();
         } else {
@@ -3012,6 +3058,13 @@ LRESULT MainWindow::OnMessage(UINT msg, WPARAM wParam, LPARAM lParam) {
             uploadBusy_ = false;
             if (res) {
                 if (res->ok && !res->url.empty()) {
+                    for (auto& cc : clips_) {
+                        if (_wcsicmp(cc.filePath.c_str(), uploadFilePath_.c_str()) == 0) {
+                            cc.shareUrl = res->url;
+                            SetClipShareLink(GetClipLinksFilePath(), cc.fileName, res->url);
+                            break;
+                        }
+                    }
                     if (OpenClipboard(hwnd_)) {
                         EmptyClipboard();
                         size_t bytes = (res->url.size() + 1) * sizeof(wchar_t);
@@ -3028,10 +3081,8 @@ LRESULT MainWindow::OnMessage(UINT msg, WPARAM wParam, LPARAM lParam) {
                         }
                         CloseClipboard();
                     }
+                    copyFeedbackUntilMs_ = GetTickCount64() + 2400;
                     SetFooterMessage(L"✓ Link panoya kopyalandı: " + res->url);
-                    std::wstring msg = L"Klip linki oluşturuldu ve panoya kopyalandı!\n\n" + res->url +
-                        L"\n\nBu linkten klibi doğrudan izleyebilir veya indirebilirsiniz.";
-                    MessageBoxW(hwnd_, msg.c_str(), L"Klip Linki Hazır", MB_OK | MB_ICONINFORMATION);
                 } else {
                     SetFooterMessage(res->error.empty() ? L"Link oluşturulamadı." : res->error);
                     MessageBoxW(hwnd_, res->error.empty() ? L"Klip yüklenemedi." : res->error.c_str(),
@@ -3475,6 +3526,7 @@ LRESULT MainWindow::OnMessage(UINT msg, WPARAM wParam, LPARAM lParam) {
                         case BTN_CLIP_PLAY: PlaySelected(); break;
                         case BTN_CLIP_FAV: ToggleFavoriteForViewIdx(); break;
                         case BTN_CLIP_SHARE: ShareSelected(); break;
+                        case BTN_CLIP_COPY_LINK: CopySelectedShareLink(); break;
                         case BTN_CLIP_RENAME: RenameSelected(); break;
                         case BTN_CLIP_REVEAL: RevealSelected(); break;
                         case BTN_CLIP_DELETE: DeleteSelected(); break;

@@ -106,6 +106,7 @@ private:
     void RenameSelected();
     void DeleteSelected();
     void ShareSelected();
+    void CopySelectedShareLink();
     void StartUploadClip(const std::wstring& filePath);
     void StopUploadWorker();
     void PickOutputFolder();
@@ -203,6 +204,8 @@ private:
     bool uploadBusy_ = false;
     std::atomic<bool> uploadCancel_{false};
     std::thread uploadThread_;
+    std::wstring uploadFilePath_;
+    ULONGLONG copyFeedbackUntilMs_ = 0;
 
     // Gallery search & favorites state
     bool favOnly_ = false;
