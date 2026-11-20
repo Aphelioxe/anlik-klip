@@ -182,13 +182,13 @@ struct DesktopCapture {
     }
 
     // Returns false if duplication was lost and needs recreation
-    bool GrabLatest(ID3D11DeviceContext* ctx) {
+    bool GrabLatest(ID3D11DeviceContext* ctx, UINT firstWaitMs = 0) {
         if (!dupl) return false;
         // Drain any queued desktop frames up to 4 so we encode the freshest frame
         for (int iter = 0; iter < 4; ++iter) {
             DXGI_OUTDUPL_FRAME_INFO fi{};
             ComPtr<IDXGIResource> res;
-            HRESULT hr = dupl->AcquireNextFrame(0, &fi, res.Put());
+            HRESULT hr = dupl->AcquireNextFrame(iter == 0 ? firstWaitMs : 0, &fi, res.Put());
             if (hr == DXGI_ERROR_WAIT_TIMEOUT) {
                 return true; // keep using previous srcCopyTex
             }
@@ -249,6 +249,7 @@ void VideoEngine::SetStatus(bool capturing, bool hw, uint32_t sw, uint32_t sh, d
 }
 
 void VideoEngine::ThreadMain(int64_t masterStartQpc, uint32_t dstW, uint32_t dstH, uint32_t fps, uint32_t bitrateKbps) {
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);
     struct TimePeriodScope {
         TimePeriodScope() { timeBeginPeriod(1); }
         ~TimePeriodScope() { timeEndPeriod(1); }
@@ -570,12 +571,27 @@ void VideoEngine::ThreadMain(int64_t masterStartQpc, uint32_t dstW, uint32_t dst
         }
 
         if (cap.dupl) {
-            if (!cap.GrabLatest(ctx.Get())) {
+            const UINT waitMs = (wait100Ns > -20000LL) ? 2 : 0; // catch frames landing near tick boundary
+            if (!cap.GrabLatest(ctx.Get(), waitMs)) {
                 Logger::Log("VideoEngine: DXGI duplication lost, will reacquire");
-                SetStatus(false, isHw, cap.srcW, cap.srcH, measuredFps, encName,
-                    L"Ekran yenileniyor...");
-                ++frameIdx;
-                continue;
+                lastRetryQpc = 0;
+                if (cap.EnsureInitialized(dev.Get(), vdev.Get(), vctx.Get(), dstW, dstH, fps)) {
+                    if (boundEnum != cap.vpEnum.Get()) {
+                        for (int i = 0; i < kPoolSize; ++i) {
+                            outViews[i].Reset();
+                            D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC ovd{};
+                            ovd.ViewDimension = D3D11_VPOV_DIMENSION_TEXTURE2D;
+                            vdev->CreateVideoProcessorOutputView(nv12Tex[i].Get(), cap.vpEnum.Get(), &ovd, outViews[i].Put());
+                        }
+                        boundEnum = cap.vpEnum.Get();
+                    }
+                    Logger::Log("VideoEngine: DXGI duplication ready (%ux%u -> %ux%u@%u)",
+                        cap.srcW, cap.srcH, dstW, dstH, fps);
+                    cap.GrabLatest(ctx.Get(), 0);
+                } else {
+                    SetStatus(false, isHw, cap.srcW, cap.srcH, measuredFps, encName,
+                        L"Ekran yenileniyor...");
+                }
             }
         }
 
