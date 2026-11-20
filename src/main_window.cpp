@@ -109,6 +109,7 @@ enum CustomBtnId {
     BTN_CLIP_FAV,
     BTN_CLIP_SHARE,
     BTN_CLIP_COPY_LINK,
+    BTN_CLIP_OPEN_LINK,
     BTN_CLIP_RENAME,
     BTN_CLIP_REVEAL,
     BTN_CLIP_DELETE,
@@ -1313,6 +1314,16 @@ void MainWindow::CopySelectedShareLink() {
     }
     copyFeedbackUntilMs_ = GetTickCount64() + 1800;
     InvalidateRect(hwnd_, nullptr, FALSE);
+}
+
+void MainWindow::OpenSelectedShareLink() {
+    if (selectedIdx_ < 0 || selectedIdx_ >= static_cast<int>(filteredIndices_.size())) return;
+    const std::wstring& url = clips_[filteredIndices_[static_cast<size_t>(selectedIdx_)]].shareUrl;
+    if (url.empty()) return;
+    HINSTANCE res = ShellExecuteW(nullptr, L"open", L"chrome.exe", url.c_str(), nullptr, SW_SHOWNORMAL);
+    if (reinterpret_cast<INT_PTR>(res) <= 32) {
+        ShellExecuteW(nullptr, L"open", url.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+    }
 }
 
 void MainWindow::TogglePlayerFullscreen() {
@@ -2732,9 +2743,14 @@ void MainWindow::PaintWindow(HDC targetDc) {
             if (hasSel && !selUrl.empty() && !uploadBusy_) {
                 int boxX = S(744);
                 int boxW = std::max(S(60), cw - S(112) - boxX);
-                FillRoundRect(g, (float)boxX, (float)(dockY + S(11)), (float)boxW, (float)S(34), (float)S(8), Gc(15, 23, 38));
-                StrokeRoundRect(g, (float)boxX, (float)(dockY + S(11)), (float)boxW, (float)S(34), (float)S(8), Gc(45, 212, 191, 110));
-                Gdiplus::SolidBrush brLink(Gc(94, 234, 212));
+                RECT linkRc{ boxX, dockY + S(11), boxX + boxW, dockY + S(45) };
+                customButtons_.push_back({ BTN_CLIP_OPEN_LINK, linkRc, true });
+                bool linkHov = (hoverBtnId_ == BTN_CLIP_OPEN_LINK);
+                FillRoundRect(g, (float)boxX, (float)(dockY + S(11)), (float)boxW, (float)S(34), (float)S(8),
+                    linkHov ? Gc(22, 34, 56) : Gc(15, 23, 38));
+                StrokeRoundRect(g, (float)boxX, (float)(dockY + S(11)), (float)boxW, (float)S(34), (float)S(8),
+                    linkHov ? Gc(94, 234, 212, 200) : Gc(45, 212, 191, 110));
+                Gdiplus::SolidBrush brLink(linkHov ? Gc(153, 246, 228) : Gc(94, 234, 212));
                 g.DrawString(selUrl.c_str(), -1, &fSmall,
                     Gdiplus::RectF((float)(boxX + S(10)), (float)(dockY + S(11)), (float)std::max(S(20), boxW - S(16)), (float)S(34)),
                     &sfLeft, &brLink);
@@ -3527,6 +3543,7 @@ LRESULT MainWindow::OnMessage(UINT msg, WPARAM wParam, LPARAM lParam) {
                         case BTN_CLIP_FAV: ToggleFavoriteForViewIdx(); break;
                         case BTN_CLIP_SHARE: ShareSelected(); break;
                         case BTN_CLIP_COPY_LINK: CopySelectedShareLink(); break;
+                        case BTN_CLIP_OPEN_LINK: OpenSelectedShareLink(); break;
                         case BTN_CLIP_RENAME: RenameSelected(); break;
                         case BTN_CLIP_REVEAL: RevealSelected(); break;
                         case BTN_CLIP_DELETE: DeleteSelected(); break;

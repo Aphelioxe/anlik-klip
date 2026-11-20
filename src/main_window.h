@@ -107,6 +107,7 @@ private:
     void DeleteSelected();
     void ShareSelected();
     void CopySelectedShareLink();
+    void OpenSelectedShareLink();
     void StartUploadClip(const std::wstring& filePath);
     void StopUploadWorker();
     void PickOutputFolder();
