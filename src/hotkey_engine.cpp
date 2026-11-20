@@ -181,6 +181,10 @@ LRESULT CALLBACK HotkeyEngine::MsgWndProc(HWND hwnd, UINT msg, WPARAM wParam, LP
                     if (e0) self->rawAltR_ = isDown; else self->rawAltL_ = isDown;
                 } else if (vk == VK_SHIFT) {
                     if (rk.MakeCode == 0x36) self->rawShiftR_ = isDown; else self->rawShiftL_ = isDown;
+                } else {
+                    if ((GetAsyncKeyState(VK_CONTROL) & 0x8000) == 0) { self->rawCtrlL_ = false; self->rawCtrlR_ = false; }
+                    if ((GetAsyncKeyState(VK_MENU)    & 0x8000) == 0) { self->rawAltL_  = false; self->rawAltR_  = false; }
+                    if ((GetAsyncKeyState(VK_SHIFT)   & 0x8000) == 0) { self->rawShiftL_= false; self->rawShiftR_= false; }
                 }
 
                 UINT mods = 0;

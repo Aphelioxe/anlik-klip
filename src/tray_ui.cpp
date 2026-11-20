@@ -466,12 +466,15 @@ void TrayUI::ShowBalloon(const wchar_t* title, const wchar_t* text, DWORD flags)
 
 void TrayUI::TriggerSaveClip(int secondsOverride) {
     HWND target = trayHwnd_;
-    app_.SaveClipAsync(secondsOverride, [target](const ClipSaveResult& res) {
+    bool started = app_.SaveClipAsync(secondsOverride, [target](const ClipSaveResult& res) {
         auto* copy = new ClipSaveResult(res);
         if (!PostMessageW(target, WM_APP_CLIP_SAVED, 0, reinterpret_cast<LPARAM>(copy))) {
             delete copy;
         }
     });
+    if (started && app_.Config().soundNotify) {
+        PlayClipChime();
+    }
     UpdateTrayIcon();
 }
 
@@ -562,7 +565,6 @@ LRESULT TrayUI::OnMessage(UINT msg, WPARAM wParam, LPARAM lParam) {
             auto* res = reinterpret_cast<ClipSaveResult*>(lParam);
             if (res) {
                 if (res->ok) {
-                    if (app_.Config().soundNotify) PlayClipChime();
                     std::wstring durPart;
                     size_t lp = res->message.find(L'(');
                     size_t rp = res->message.find(L')', lp != std::wstring::npos ? lp : 0);
