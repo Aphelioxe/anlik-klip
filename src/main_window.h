@@ -137,6 +137,9 @@ private:
     int memH_ = 0;
     int openAnimAlpha_ = 255;
     double animPhase_ = 0.0;
+    float tabAnimT_ = 1.0f;
+    int tabAnimDir_ = 1;
+    float tabIndicatorY_ = 118.0f;
     bool trackingMouse_ = false;
     std::vector<UiButtonRect> customButtons_;
 

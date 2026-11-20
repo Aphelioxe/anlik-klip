@@ -31,10 +31,10 @@
 
 namespace {
 
-constexpr COLORREF kRgbBg      = RGB(13, 16, 23);
-constexpr COLORREF kRgbCard    = RGB(23, 28, 38);
-constexpr COLORREF kRgbInput   = RGB(32, 39, 53);
-constexpr COLORREF kRgbBorder  = RGB(45, 55, 74);
+constexpr COLORREF kRgbBg      = RGB(9, 12, 19);
+constexpr COLORREF kRgbCard    = RGB(16, 21, 33);
+constexpr COLORREF kRgbInput   = RGB(24, 31, 48);
+constexpr COLORREF kRgbBorder  = RGB(42, 54, 78);
 constexpr COLORREF kRgbText    = RGB(238, 242, 248);
 constexpr COLORREF kRgbMuted   = RGB(148, 160, 180);
 
@@ -837,6 +837,11 @@ void MainWindow::SwitchTab(int tabIndex) {
     if (nextTab == 1 && playerOpen_) {
         CloseEmbeddedPlayer();
     }
+    const bool changed = (nextTab != activeTab_);
+    if (changed) {
+        tabAnimDir_ = (nextTab > activeTab_) ? 1 : -1;
+        tabAnimT_ = 0.0f;
+    }
     activeTab_ = nextTab;
     for (HWND h : settingsCtrls_) {
         ShowWindow(h, activeTab_ == 1 ? SW_SHOW : SW_HIDE);
@@ -845,6 +850,7 @@ void MainWindow::SwitchTab(int tabIndex) {
     if (hwnd_) {
         if (activeTab_ == 1) SetTimer(hwnd_, TIMER_MIC_METER_ID, 120, nullptr);
         else KillTimer(hwnd_, TIMER_MIC_METER_ID);
+        if (changed) SetTimer(hwnd_, TIMER_UI_ANIM_ID, 16, nullptr);
         InvalidateRect(hwnd_, nullptr, FALSE);
     }
 }
@@ -1909,15 +1915,26 @@ void MainWindow::PaintWindow(HDC targetDc) {
             }
         };
 
+        // Animated sliding active tab pill in sidebar
+        {
+            float targetY = (activeTab_ == 1) ? 160.0f : 118.0f;
+            float pillY = tabIndicatorY_ + (targetY - tabIndicatorY_) * tabAnimT_;
+            FillRoundRectGrad(g, (float)S(16), (float)S(static_cast<int>(pillY)), (float)S(188), (float)S(36), (float)S(9),
+                Gc(37, 99, 235, 70), Gc(99, 102, 241, 40));
+            StrokeRoundRect(g, (float)S(16), (float)S(static_cast<int>(pillY)), (float)S(188), (float)S(36), (float)S(9),
+                Gc(96, 165, 250, 170));
+            FillRoundRect(g, (float)S(20), (float)S(static_cast<int>(pillY) + 8), (float)S(3), (float)S(20), 1.5f, Gc(56, 189, 248));
+        }
+
         // Sidebar tabs
         wchar_t cntStr[16] = {};
         swprintf(cntStr, 16, L"%zu", clips_.size());
         addBtn(BTN_TAB_CLIPS, 16, 118, 188, 36, L"Kliplerim",
-            activeTab_ == 0 ? Gc(30, 41, 66) : Gc(19, 23, 32), Gc(34, 45, 70),
-            activeTab_ == 0 ? Gc(59, 130, 246, 180) : Gc(0, 0, 0, 0), true, activeTab_ == 0, cntStr);
+            Gc(0, 0, 0, 0), Gc(34, 45, 70, 140),
+            Gc(0, 0, 0, 0), true, false, cntStr);
         addBtn(BTN_TAB_SETTINGS, 16, 160, 188, 36, L"Ayarlar",
-            activeTab_ == 1 ? Gc(30, 41, 66) : Gc(19, 23, 32), Gc(34, 45, 70),
-            activeTab_ == 1 ? Gc(59, 130, 246, 180) : Gc(0, 0, 0, 0), true, activeTab_ == 1);
+            Gc(0, 0, 0, 0), Gc(34, 45, 70, 140),
+            Gc(0, 0, 0, 0), true, false);
 
         // Telemetry card & quick controls anchored cleanly to bottom of sidebar
         const int sideAnchorY = std::max(0, (ch - S(620)));
@@ -2287,6 +2304,10 @@ void MainWindow::PaintWindow(HDC targetDc) {
             }
         } else if (activeTab_ == 0) {
             // ================= TAB 0: KLİPLERİM (GALLERY + FAVORITES + SEARCH) =================
+            const float ease0 = 1.0f - std::pow(1.0f - std::max(0.0f, std::min(1.0f, tabAnimT_)), 3.0f);
+            const float slideY0 = (1.0f - ease0) * static_cast<float>(S(16)) * static_cast<float>(tabAnimDir_);
+            g.SetClip(Gdiplus::Rect(S(222), 0, cw - S(222), ch));
+            g.TranslateTransform(0.0f, slideY0);
             g.DrawString(L"Kayıtlı Klipler", -1, &fTitle,
                 Gdiplus::RectF((float)S(242), (float)S(12), (float)S(310), (float)S(28)), &sfLeft, &brText);
 
@@ -2482,17 +2503,26 @@ void MainWindow::PaintWindow(HDC targetDc) {
             addBtnPx(BTN_CLIP_DELETE, S(656), dockY + S(11), S(52), S(34), L"Sil", Gc(153, 27, 27), Gc(185, 28, 28), Gc(220, 38, 38), hasSel);
             g.DrawString(footerMsg_.c_str(), -1, &fSmall,
                 Gdiplus::RectF((float)S(716), (float)(dockY + S(8)), (float)std::max(S(140), cw - S(746)), (float)S(40)), &sfLeft, &brMuted);
+            g.ResetTransform();
+            g.ResetClip();
         } else {
             // ================= TAB 1: AYARLAR =================
             const int sox = settingsOffsetX_;
+            const float ease = 1.0f - std::pow(1.0f - std::max(0.0f, std::min(1.0f, tabAnimT_)), 3.0f);
+            const float slideY = (1.0f - ease) * static_cast<float>(S(16)) * static_cast<float>(tabAnimDir_);
+            g.SetClip(Gdiplus::Rect(S(222), 0, cw - S(222), ch));
+            g.TranslateTransform(0.0f, slideY);
+
             g.DrawString(L"Ayarlar", -1, &fTitle,
                 Gdiplus::RectF((float)(S(242) + sox), (float)S(14), (float)S(220), (float)S(28)), &sfLeft, &brText);
             g.DrawString(L"Video, ses ve kısayol değişiklikleri anında uygulanır.", -1, &fSmall,
                 Gdiplus::RectF((float)(S(242) + sox), (float)S(42), (float)S(460), (float)S(18)), &sfLeft, &brMuted);
 
-            FillRoundRect(g, (float)(S(242) + sox), (float)S(68), (float)S(320), (float)S(180), (float)S(12), Gc(20, 25, 35));
-            StrokeRoundRect(g, (float)(S(242) + sox), (float)S(68), (float)S(320), (float)S(180), (float)S(12), Gc(44, 54, 72));
-            FillRoundRect(g, (float)(S(248) + sox), (float)S(78), (float)S(3), (float)S(16), 1.5f, Gc(59, 130, 246));
+            // Card 1: Video & Buffer (Blue glow accent)
+            FillRoundRect(g, (float)(S(242) + sox), (float)S(68), (float)S(320), (float)S(180), (float)S(12), Gc(16, 21, 33));
+            FillRoundRectGrad(g, (float)(S(242) + sox), (float)S(68), (float)S(320), (float)S(32), (float)S(12), Gc(37, 99, 235, 42), Gc(16, 21, 33, 0));
+            StrokeRoundRect(g, (float)(S(242) + sox), (float)S(68), (float)S(320), (float)S(180), (float)S(12), Gc(59, 130, 246, 110));
+            FillRoundRect(g, (float)(S(248) + sox), (float)S(78), (float)S(3), (float)S(16), 1.5f, Gc(56, 189, 248));
             g.DrawString(L"Video ve Tampon", -1, &fBold,
                 Gdiplus::RectF((float)(S(258) + sox), (float)S(76), (float)S(220), (float)S(22)), &sfLeft, &brBlueTxt);
             g.DrawString(L"Hızlı Seçim:", -1, &fSmall,
@@ -2500,18 +2530,20 @@ void MainWindow::PaintWindow(HDC targetDc) {
             {
                 bool is1080 = (app_.Config().height >= 1080);
                 addBtnPx(BTN_SET_720P, S(344) + sox, S(208), S(96), S(28), L"720p HD",
-                    !is1080 ? Gc(37, 99, 235) : Gc(32, 39, 53),
-                    !is1080 ? Gc(59, 130, 246) : Gc(44, 54, 72),
-                    !is1080 ? Gc(96, 165, 250, 160) : Gc(56, 68, 90));
+                    !is1080 ? Gc(37, 99, 235) : Gc(24, 31, 48),
+                    !is1080 ? Gc(59, 130, 246) : Gc(36, 46, 68),
+                    !is1080 ? Gc(96, 165, 250, 180) : Gc(48, 60, 84));
                 addBtnPx(BTN_SET_1080P, S(446) + sox, S(208), S(104), S(28), L"1080p Full HD",
-                    is1080 ? Gc(37, 99, 235) : Gc(32, 39, 53),
-                    is1080 ? Gc(59, 130, 246) : Gc(44, 54, 72),
-                    is1080 ? Gc(96, 165, 250, 160) : Gc(56, 68, 90));
+                    is1080 ? Gc(37, 99, 235) : Gc(24, 31, 48),
+                    is1080 ? Gc(59, 130, 246) : Gc(36, 46, 68),
+                    is1080 ? Gc(96, 165, 250, 180) : Gc(48, 60, 84));
             }
 
-            FillRoundRect(g, (float)(S(578) + sox), (float)S(68), (float)S(320), (float)S(180), (float)S(12), Gc(20, 25, 35));
-            StrokeRoundRect(g, (float)(S(578) + sox), (float)S(68), (float)S(320), (float)S(180), (float)S(12), Gc(44, 54, 72));
-            FillRoundRect(g, (float)(S(584) + sox), (float)S(76), (float)S(3), (float)S(16), 1.5f, Gc(34, 197, 94));
+            // Card 2: Audio (Emerald glow accent)
+            FillRoundRect(g, (float)(S(578) + sox), (float)S(68), (float)S(320), (float)S(180), (float)S(12), Gc(16, 21, 33));
+            FillRoundRectGrad(g, (float)(S(578) + sox), (float)S(68), (float)S(320), (float)S(32), (float)S(12), Gc(34, 197, 94, 38), Gc(16, 21, 33, 0));
+            StrokeRoundRect(g, (float)(S(578) + sox), (float)S(68), (float)S(320), (float)S(180), (float)S(12), Gc(34, 197, 94, 105));
+            FillRoundRect(g, (float)(S(584) + sox), (float)S(76), (float)S(3), (float)S(16), 1.5f, Gc(52, 211, 153));
             Gdiplus::SolidBrush brGreenTxt(Gc(134, 239, 172));
             g.DrawString(L"Ses (Oyun + Mikrofon)", -1, &fBold,
                 Gdiplus::RectF((float)(S(594) + sox), (float)S(74), (float)S(240), (float)S(22)), &sfLeft, &brGreenTxt);
@@ -2523,11 +2555,12 @@ void MainWindow::PaintWindow(HDC targetDc) {
                 float thrNorm = std::max(0.0f, std::min(1.0f, (static_cast<float>(thrDb) + 60.0f) / 60.0f));
                 float barX = static_cast<float>(S(594) + sox), barY = static_cast<float>(S(227));
                 float barW = static_cast<float>(S(212)), barH = static_cast<float>(S(8));
-                FillRoundRect(g, barX, barY, barW, barH, (float)S(4), Gc(34, 42, 58));
+                FillRoundRect(g, barX, barY, barW, barH, (float)S(4), Gc(26, 33, 48));
                 if (norm > 0.01f) {
                     bool openNow = (db >= static_cast<float>(thrDb));
-                    FillRoundRect(g, barX, barY, barW * norm, barH, (float)S(4),
-                        openNow ? Gc(34, 197, 94) : Gc(245, 158, 11));
+                    FillRoundRectGrad(g, barX, barY, barW * norm, barH, (float)S(4),
+                        openNow ? Gc(52, 211, 153) : Gc(251, 191, 36),
+                        openNow ? Gc(16, 185, 129) : Gc(217, 119, 6));
                 }
                 float markerX = barX + barW * thrNorm;
                 FillRoundRect(g, markerX - 1.5f, barY - S(2), 3.0f, barH + S(4), 1.0f, Gc(248, 250, 252));
@@ -2538,9 +2571,11 @@ void MainWindow::PaintWindow(HDC targetDc) {
                     Gdiplus::RectF((float)(S(812) + sox), (float)S(221), (float)S(76), (float)S(20)), &sfLeft, &brMuted);
             }
 
-            FillRoundRect(g, (float)(S(242) + sox), (float)S(258), (float)S(656), (float)S(270), (float)S(12), Gc(20, 25, 35));
-            StrokeRoundRect(g, (float)(S(242) + sox), (float)S(258), (float)S(656), (float)S(270), (float)S(12), Gc(44, 54, 72));
-            FillRoundRect(g, (float)(S(248) + sox), (float)S(266), (float)S(3), (float)S(16), 1.5f, Gc(168, 85, 247));
+            // Card 3: Hotkeys, Notifications & Mobile Sync (Violet glow accent)
+            FillRoundRect(g, (float)(S(242) + sox), (float)S(258), (float)S(656), (float)S(270), (float)S(12), Gc(16, 21, 33));
+            FillRoundRectGrad(g, (float)(S(242) + sox), (float)S(258), (float)S(656), (float)S(34), (float)S(12), Gc(168, 85, 247, 38), Gc(16, 21, 33, 0));
+            StrokeRoundRect(g, (float)(S(242) + sox), (float)S(258), (float)S(656), (float)S(270), (float)S(12), Gc(168, 85, 247, 105));
+            FillRoundRect(g, (float)(S(248) + sox), (float)S(266), (float)S(3), (float)S(16), 1.5f, Gc(192, 132, 252));
             Gdiplus::SolidBrush brPurpTxt(Gc(216, 180, 254));
             g.DrawString(L"Oyun İçi Kısayol, Bildirim ve Klasör", -1, &fBold,
                 Gdiplus::RectF((float)(S(258) + sox), (float)S(264), (float)S(340), (float)S(22)), &sfLeft, &brPurpTxt);
@@ -2564,6 +2599,8 @@ void MainWindow::PaintWindow(HDC targetDc) {
 
             g.DrawString(footerMsg_.c_str(), -1, &fSmall,
                 Gdiplus::RectF((float)(S(258) + sox), (float)S(498), (float)S(624), (float)S(20)), &sfLeft, &brMuted);
+            g.ResetTransform();
+            g.ResetClip();
         }
     }
 
@@ -2621,15 +2658,24 @@ LRESULT MainWindow::OnMessage(UINT msg, WPARAM wParam, LPARAM lParam) {
                 RECT mrc{ S(590) + settingsOffsetX_, S(220), S(892) + settingsOffsetX_, S(245) };
                 InvalidateRect(hwnd_, &mrc, FALSE);
             } else if (wParam == TIMER_UI_ANIM_ID) {
+                bool fastTick = false;
                 if (openAnimAlpha_ < 255) {
-                    openAnimAlpha_ = std::min(255, openAnimAlpha_ + 22);
+                    openAnimAlpha_ = std::min(255, openAnimAlpha_ + 24);
                     if (hwnd_) SetLayeredWindowAttributes(hwnd_, 0, static_cast<BYTE>(openAnimAlpha_), LWA_ALPHA);
                     if (openAnimAlpha_ >= 255 && hwnd_) {
                         LONG_PTR ex = GetWindowLongPtrW(hwnd_, GWL_EXSTYLE);
                         SetWindowLongPtrW(hwnd_, GWL_EXSTYLE, ex & ~WS_EX_LAYERED);
-                        SetTimer(hwnd_, TIMER_UI_ANIM_ID, 48, nullptr);
                     }
-                } else {
+                    fastTick = true;
+                }
+                if (tabAnimT_ < 1.0f) {
+                    tabAnimT_ = std::min(1.0f, tabAnimT_ + 0.14f);
+                    if (tabAnimT_ >= 1.0f) tabIndicatorY_ = (activeTab_ == 1) ? 160.0f : 118.0f;
+                    if (hwnd_) InvalidateRect(hwnd_, nullptr, FALSE);
+                    fastTick = true;
+                }
+                if (!fastTick) {
+                    if (hwnd_) SetTimer(hwnd_, TIMER_UI_ANIM_ID, 48, nullptr);
                     animPhase_ += 0.16;
                     if (hwnd_ && !playerFullscreen_) {
                         RECT sidePulseRc{ S(14), S(68), S(208), S(104) };
