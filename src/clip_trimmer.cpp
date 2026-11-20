@@ -348,6 +348,14 @@ bool EditMp4Clip(const ClipEditSpec& spec, std::string& outError,
         outW = (srcH >= 1080) ? 1080u : 720u;
         outH = (srcH >= 1080) ? 1920u : 1280u;
     }
+    if (!isDiscordExport) {
+        if (speed < 0.99) {
+            outFpsN = std::max<uint32_t>(15u, static_cast<uint32_t>(std::lround((static_cast<double>(fpsN) / fpsD) * speed)));
+            outFpsD = 1;
+        } else if (speed > 1.01) {
+            outBr = std::min<uint32_t>(24000000u, static_cast<uint32_t>(outBr * 1.25));
+        }
+    }
     if (isDiscordExport) {
         const double targetBits = static_cast<double>(spec.targetSizeMb) * 8.0 * 1024.0 * 1024.0 * 0.88;
         const double audioBits = foundA ? (96000.0 * totalOutDurSec) : 0.0;
@@ -369,7 +377,7 @@ bool EditMp4Clip(const ClipEditSpec& spec, std::string& outError,
         outBr = vBps;
     }
     const bool needVp = (outW != srcW || outH != srcH || spec.vertical916);
-    const bool dropHalfFps = ((fpsN / fpsD) >= 50 && (outFpsN / outFpsD) <= 30);
+    const LONGLONG outFrameDur100 = (10000000LL * outFpsD) / std::max<uint32_t>(1u, outFpsN);
 
     std::wstring tmpPath = spec.dstPath + L".tmp.mp4";
     DeleteFileW(tmpPath.c_str());
@@ -496,9 +504,9 @@ bool EditMp4Clip(const ClipEditSpec& spec, std::string& outError,
         }
     }
 
-    const LONGLONG defaultVDur = (10000000LL * fpsD) / fpsN;
+    const LONGLONG defaultVDur = outFrameDur100;
     LONGLONG outVBase100 = 0;
-    LONGLONG lastOutVTs = -1;
+    int64_t outFrameIdx = 0;
     int vWritten = 0;
     bool aborted = false;
 
@@ -580,7 +588,6 @@ bool EditMp4Clip(const ClipEditSpec& spec, std::string& outError,
         bool vDone = false;
         bool aDone[3] = { !segHasAudio, !segHasGameMic, !segHasGameMic };
         std::vector<int16_t> segPcm[3];
-        int segVRead = 0;
 
         while ((!vDone || !aDone[0] || !aDone[1] || !aDone[2]) && !aborted) {
             if (cancelFlag && cancelFlag->load()) { aborted = true; break; }
@@ -616,24 +623,22 @@ bool EditMp4Clip(const ClipEditSpec& spec, std::string& outError,
             if (ts + dur <= start100) continue;
 
             if (streamIdx == vIn && !vDone) {
-                if (dropHalfFps && ((segVRead++ & 1) != 0)) {
+                LONGLONG relIn = std::max(0LL, ts - start100);
+                LONGLONG mappedTs = outVBase100 + static_cast<LONGLONG>(static_cast<double>(relIn) / speed);
+                LONGLONG gridTs = (outFrameIdx * 10000000LL * outFpsD) / outFpsN;
+                if (mappedTs + (outFrameDur100 / 2) < gridTs) {
+                    continue; // cleanly pace to output fps without cramming or stuttering
+                }
+                if (gridTs >= outVBase100 + outSpan100) {
                     continue;
                 }
-                LONGLONG relIn = std::max(0LL, ts - start100);
-                LONGLONG newTs = outVBase100 + static_cast<LONGLONG>(static_cast<double>(relIn) / speed);
-                if (newTs <= lastOutVTs) newTs = lastOutVTs + 1;
-                LONGLONG effDur = (ts < start100) ? (ts + dur - start100) : dur;
-                if (dropHalfFps) effDur *= 2;
-                LONGLONG newDur = std::max<LONGLONG>(1, static_cast<LONGLONG>(static_cast<double>(effDur) / speed));
-                if (newTs + newDur > outVBase100 + outSpan100) {
-                    newDur = (outVBase100 + outSpan100) - newTs;
-                }
-                if (newDur <= 0) continue;
+                LONGLONG nextGridTs = ((outFrameIdx + 1) * 10000000LL * outFpsD) / outFpsN;
+                LONGLONG newDur = std::max<LONGLONG>(1, nextGridTs - gridTs);
 
                 ComPtr<IMFSample> outSmp;
                 MFCreateSample(outSmp.Put());
                 if (!outSmp) continue;
-                outSmp->SetSampleTime(newTs);
+                outSmp->SetSampleTime(gridTs);
                 outSmp->SetSampleDuration(newDur);
 
                 bool copied = false;
@@ -706,7 +711,7 @@ bool EditMp4Clip(const ClipEditSpec& spec, std::string& outError,
                 }
                 if (!copied) continue;
                 if (SUCCEEDED(sw->WriteSample(vOutIdx, outSmp.Get()))) {
-                    lastOutVTs = newTs;
+                    ++outFrameIdx;
                     ++vWritten;
                 }
             } else {

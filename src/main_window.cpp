@@ -67,6 +67,23 @@ void FillRoundRect(Gdiplus::Graphics& g, float x, float y, float w, float h, flo
     g.FillPath(&br, &path);
 }
 
+void FillRoundRectGrad(Gdiplus::Graphics& g, float x, float y, float w, float h, float r,
+                       Gdiplus::Color cTop, Gdiplus::Color cBot) {
+    Gdiplus::GraphicsPath path;
+    AddRoundedRect(path, x, y, w, h, r);
+    Gdiplus::LinearGradientBrush br(
+        Gdiplus::PointF(x, y), Gdiplus::PointF(x, y + std::max(1.0f, h)), cTop, cBot);
+    g.FillPath(&br, &path);
+}
+
+std::wstring ExtractGameTagFromName(const std::wstring& fileName) {
+    size_t us = fileName.find(L'_');
+    if (us == std::wstring::npos || us <= 1 || us > 20) return L"";
+    std::wstring prefix = fileName.substr(0, us);
+    if (_wcsicmp(prefix.c_str(), L"Klip") == 0) return L"";
+    return prefix;
+}
+
 void StrokeRoundRect(Gdiplus::Graphics& g, float x, float y, float w, float h, float r, Gdiplus::Color col, float width = 1.0f) {
     Gdiplus::GraphicsPath path;
     AddRoundedRect(path, x, y, w, h, r);
@@ -1750,12 +1767,16 @@ void MainWindow::PaintWindow(HDC targetDc) {
         g.SetTextRenderingHint(Gdiplus::TextRenderingHintClearTypeGridFit);
         g.SetPixelOffsetMode(Gdiplus::PixelOffsetModeHalf);
 
-        g.Clear(Gc(13, 16, 23));
+        g.Clear(Gc(10, 13, 20));
 
-        // Sidebar panel
-        Gdiplus::SolidBrush sbSide(Gc(19, 23, 32));
-        g.FillRectangle(&sbSide, 0, 0, S(220), ch);
-        Gdiplus::Pen sepPen(Gc(38, 46, 64), 1.0f);
+        // Sleek gradient sidebar panel
+        {
+            Gdiplus::LinearGradientBrush sbSide(
+                Gdiplus::PointF(0, 0), Gdiplus::PointF(0, (float)std::max(1, ch)),
+                Gc(17, 22, 33), Gc(13, 17, 25));
+            g.FillRectangle(&sbSide, 0, 0, S(220), ch);
+        }
+        Gdiplus::Pen sepPen(Gc(34, 42, 60), 1.0f);
         g.DrawLine(&sepPen, S(220), 0, S(220), ch);
 
         Gdiplus::FontFamily ff(L"Segoe UI");
@@ -1814,8 +1835,16 @@ void MainWindow::PaintWindow(HDC targetDc) {
             customButtons_.push_back({ id, rc, enabled });
             bool hov = enabled && (hoverBtnId_ == id);
             bool prs = enabled && (pressedBtnId_ == id);
-            Gdiplus::Color fill = !enabled ? Gc(28, 33, 45) : (prs ? hoverCol : (hov ? hoverCol : baseCol));
-            FillRoundRect(g, (float)rc.left, (float)rc.top, (float)(rc.right - rc.left), (float)(rc.bottom - rc.top), (float)S(8), fill);
+            Gdiplus::Color fill = !enabled ? Gc(26, 31, 42) : (prs ? hoverCol : (hov ? hoverCol : baseCol));
+            if (enabled && !prs) {
+                Gdiplus::Color topC(fill.GetA(),
+                    static_cast<uint8_t>(std::min(255, fill.GetR() + 12)),
+                    static_cast<uint8_t>(std::min(255, fill.GetG() + 12)),
+                    static_cast<uint8_t>(std::min(255, fill.GetB() + 14)));
+                FillRoundRectGrad(g, (float)rc.left, (float)rc.top, (float)(rc.right - rc.left), (float)(rc.bottom - rc.top), (float)S(9), topC, fill);
+            } else {
+                FillRoundRect(g, (float)rc.left, (float)rc.top, (float)(rc.right - rc.left), (float)(rc.bottom - rc.top), (float)S(9), fill);
+            }
             if (borderCol.GetA() > 0) {
                 StrokeRoundRect(g, (float)rc.left, (float)rc.top, (float)(rc.right - rc.left), (float)(rc.bottom - rc.top), (float)S(8), borderCol);
             }
@@ -1865,11 +1894,21 @@ void MainWindow::PaintWindow(HDC targetDc) {
         std::wstring hk = FormatHotkey(app_.Config().hotkeyMods, app_.Config().hotkeyVk);
         swprintf(t4, 64, L"Kısayol: %ls", hk.c_str());
         g.DrawString(t1, -1, &fSub, Gdiplus::RectF((float)S(28), (float)(telY + S(10)), (float)S(164), (float)S(20)), &sfLeft, &brText);
-        g.DrawString(t2, -1, &fSub, Gdiplus::RectF((float)S(28), (float)(telY + S(34)), (float)S(164), (float)S(20)), &sfLeft, &brMuted);
-        g.DrawString(t3, -1, &fSub, Gdiplus::RectF((float)S(28), (float)(telY + S(58)), (float)S(164), (float)S(20)), &sfLeft, &brMuted);
-        FillRoundRect(g, (float)S(28), (float)(telY + S(85)), (float)S(164), (float)S(24), (float)S(6), Gc(37, 99, 235, 55));
+        g.DrawString(t2, -1, &fSub, Gdiplus::RectF((float)S(28), (float)(telY + S(32)), (float)S(164), (float)S(20)), &sfLeft, &brMuted);
+        g.DrawString(t3, -1, &fSub, Gdiplus::RectF((float)S(28), (float)(telY + S(54)), (float)S(164), (float)S(20)), &sfLeft, &brMuted);
+        {
+            float pFrac = app_.Config().clipSeconds > 0
+                ? static_cast<float>(std::max(0.0, std::min(1.0, st.ring.bufferedSeconds / app_.Config().clipSeconds)))
+                : 0.0f;
+            FillRoundRect(g, (float)S(28), (float)(telY + S(75)), (float)S(164), (float)S(4), 2.0f, Gc(36, 44, 62));
+            if (pFrac > 0.01f) {
+                FillRoundRectGrad(g, (float)S(28), (float)(telY + S(75)), (float)S(164) * pFrac, (float)S(4), 2.0f,
+                    Gc(59, 130, 246), Gc(37, 99, 235));
+            }
+        }
+        FillRoundRect(g, (float)S(28), (float)(telY + S(87)), (float)S(164), (float)S(24), (float)S(6), Gc(37, 99, 235, 55));
         Gdiplus::SolidBrush brBlueTxt(Gc(147, 197, 253));
-        g.DrawString(t4, -1, &fSmall, Gdiplus::RectF((float)S(28), (float)(telY + S(85)), (float)S(164), (float)S(24)), &sfCenter, &brBlueTxt);
+        g.DrawString(t4, -1, &fSmall, Gdiplus::RectF((float)S(28), (float)(telY + S(87)), (float)S(164), (float)S(24)), &sfCenter, &brBlueTxt);
 
         auto addBtnPx = [&](int id, int px, int py, int pw, int ph, const std::wstring& label,
                             Gdiplus::Color baseCol, Gdiplus::Color hoverCol, Gdiplus::Color borderCol,
@@ -1878,9 +1917,17 @@ void MainWindow::PaintWindow(HDC targetDc) {
             customButtons_.push_back({ id, rc, enabled });
             bool hov = enabled && (hoverBtnId_ == id);
             bool prs = enabled && (pressedBtnId_ == id);
-            Gdiplus::Color fill = !enabled ? Gc(28, 33, 45) : (prs ? hoverCol : (hov ? hoverCol : baseCol));
-            FillRoundRect(g, (float)rc.left, (float)rc.top, (float)pw, (float)ph, (float)S(8), fill);
-            if (borderCol.GetA() > 0) StrokeRoundRect(g, (float)rc.left, (float)rc.top, (float)pw, (float)ph, (float)S(8), borderCol);
+            Gdiplus::Color fill = !enabled ? Gc(26, 31, 42) : (prs ? hoverCol : (hov ? hoverCol : baseCol));
+            if (enabled && !prs) {
+                Gdiplus::Color topC(fill.GetA(),
+                    static_cast<uint8_t>(std::min(255, fill.GetR() + 12)),
+                    static_cast<uint8_t>(std::min(255, fill.GetG() + 12)),
+                    static_cast<uint8_t>(std::min(255, fill.GetB() + 14)));
+                FillRoundRectGrad(g, (float)rc.left, (float)rc.top, (float)pw, (float)ph, (float)S(9), topC, fill);
+            } else {
+                FillRoundRect(g, (float)rc.left, (float)rc.top, (float)pw, (float)ph, (float)S(9), fill);
+            }
+            if (borderCol.GetA() > 0) StrokeRoundRect(g, (float)rc.left, (float)rc.top, (float)pw, (float)ph, (float)S(9), borderCol);
             Gdiplus::SolidBrush tb(!enabled ? Gc(100, 112, 132) : Gc(242, 246, 252));
             g.DrawString(label.c_str(), -1, &fBold, Gdiplus::RectF((float)rc.left, (float)rc.top, (float)pw, (float)ph), &sfCenter, &tb);
         };
@@ -2302,6 +2349,16 @@ void MainWindow::PaintWindow(HDC targetDc) {
                         g.FillPolygon(&triB, tri, 3);
                     }
 
+                    // Bottom gradient scrim on thumbnail so badges & duration pop cleanly
+                    {
+                        float gradH = static_cast<float>(S(42));
+                        float gradY = static_cast<float>(ty + th) - gradH;
+                        Gdiplus::LinearGradientBrush scrim(
+                            Gdiplus::PointF((float)tx, gradY), Gdiplus::PointF((float)tx, (float)(ty + th)),
+                            Gc(8, 11, 17, 0), Gc(8, 11, 17, 215));
+                        g.FillRectangle(&scrim, (float)tx, gradY, (float)tw, gradH);
+                    }
+
                     // Favorite star button badge at top-right of thumbnail
                     int stX = tx + tw - S(32), stY = ty + S(6);
                     FillRoundRect(g, (float)stX, (float)stY, (float)S(26), (float)S(24), (float)S(6),
@@ -2313,16 +2370,25 @@ void MainWindow::PaintWindow(HDC targetDc) {
                         static_cast<float>(S(7)), static_cast<float>(S(3)), c.isFavorite);
 
                     std::wstring durLbl = FormatDurClock(c.durationSeconds);
-                    FillRoundRect(g, (float)(tx + tw - S(52)), (float)(ty + th - S(26)), (float)S(44), (float)S(19), (float)S(5), Gc(10, 12, 18, 210));
+                    FillRoundRect(g, (float)(tx + tw - S(52)), (float)(ty + th - S(26)), (float)S(44), (float)S(19), (float)S(5), Gc(10, 12, 18, 220));
                     g.DrawString(durLbl.c_str(), -1, &fSmall,
                         Gdiplus::RectF((float)(tx + tw - S(52)), (float)(ty + th - S(26)), (float)S(44), (float)S(19)), &sfCenter, &brText);
 
+                    std::wstring gTag = ExtractGameTagFromName(c.fileName);
+                    int badgeX = tx + S(8);
+                    if (!gTag.empty()) {
+                        int tagW = std::min(S(120), S(18) + static_cast<int>(gTag.size()) * S(6));
+                        FillRoundRect(g, (float)badgeX, (float)(ty + S(8)), (float)tagW, (float)S(20), (float)S(6), Gc(37, 99, 235, 215));
+                        g.DrawString(gTag.c_str(), -1, &fSmall,
+                            Gdiplus::RectF((float)badgeX, (float)(ty + S(8)), (float)tagW, (float)S(20)), &sfCenter, &brText);
+                        badgeX += tagW + S(6);
+                    }
                     if (c.height > 0) {
                         wchar_t rb[16] = {};
                         swprintf(rb, 16, L"%up", c.height);
-                        FillRoundRect(g, (float)(tx + S(8)), (float)(ty + S(8)), (float)S(42), (float)S(19), (float)S(5), Gc(10, 12, 18, 195));
+                        FillRoundRect(g, (float)badgeX, (float)(ty + S(8)), (float)S(42), (float)S(20), (float)S(6), Gc(10, 12, 18, 205));
                         g.DrawString(rb, -1, &fSmall,
-                            Gdiplus::RectF((float)(tx + S(8)), (float)(ty + S(8)), (float)S(42), (float)S(19)), &sfCenter, &brText);
+                            Gdiplus::RectF((float)badgeX, (float)(ty + S(8)), (float)S(42), (float)S(20)), &sfCenter, &brText);
                     }
 
                     std::wstring title = StripMp4Ext(c.fileName);
@@ -2371,8 +2437,9 @@ void MainWindow::PaintWindow(HDC targetDc) {
             g.DrawString(L"Video, ses ve kısayol değişiklikleri anında uygulanır.", -1, &fSmall,
                 Gdiplus::RectF((float)(S(242) + sox), (float)S(42), (float)S(460), (float)S(18)), &sfLeft, &brMuted);
 
-            FillRoundRect(g, (float)(S(242) + sox), (float)S(68), (float)S(320), (float)S(180), (float)S(12), Gc(23, 28, 38));
+            FillRoundRect(g, (float)(S(242) + sox), (float)S(68), (float)S(320), (float)S(180), (float)S(12), Gc(20, 25, 35));
             StrokeRoundRect(g, (float)(S(242) + sox), (float)S(68), (float)S(320), (float)S(180), (float)S(12), Gc(44, 54, 72));
+            FillRoundRect(g, (float)(S(248) + sox), (float)S(78), (float)S(3), (float)S(16), 1.5f, Gc(59, 130, 246));
             g.DrawString(L"Video ve Tampon", -1, &fBold,
                 Gdiplus::RectF((float)(S(258) + sox), (float)S(76), (float)S(220), (float)S(22)), &sfLeft, &brBlueTxt);
             g.DrawString(L"Hızlı Seçim:", -1, &fSmall,
@@ -2389,8 +2456,9 @@ void MainWindow::PaintWindow(HDC targetDc) {
                     is1080 ? Gc(96, 165, 250, 160) : Gc(56, 68, 90));
             }
 
-            FillRoundRect(g, (float)(S(578) + sox), (float)S(68), (float)S(320), (float)S(180), (float)S(12), Gc(23, 28, 38));
+            FillRoundRect(g, (float)(S(578) + sox), (float)S(68), (float)S(320), (float)S(180), (float)S(12), Gc(20, 25, 35));
             StrokeRoundRect(g, (float)(S(578) + sox), (float)S(68), (float)S(320), (float)S(180), (float)S(12), Gc(44, 54, 72));
+            FillRoundRect(g, (float)(S(584) + sox), (float)S(76), (float)S(3), (float)S(16), 1.5f, Gc(34, 197, 94));
             Gdiplus::SolidBrush brGreenTxt(Gc(134, 239, 172));
             g.DrawString(L"Ses (Oyun + Mikrofon)", -1, &fBold,
                 Gdiplus::RectF((float)(S(594) + sox), (float)S(74), (float)S(240), (float)S(22)), &sfLeft, &brGreenTxt);
@@ -2417,8 +2485,9 @@ void MainWindow::PaintWindow(HDC targetDc) {
                     Gdiplus::RectF((float)(S(812) + sox), (float)S(221), (float)S(76), (float)S(20)), &sfLeft, &brMuted);
             }
 
-            FillRoundRect(g, (float)(S(242) + sox), (float)S(258), (float)S(656), (float)S(270), (float)S(12), Gc(23, 28, 38));
+            FillRoundRect(g, (float)(S(242) + sox), (float)S(258), (float)S(656), (float)S(270), (float)S(12), Gc(20, 25, 35));
             StrokeRoundRect(g, (float)(S(242) + sox), (float)S(258), (float)S(656), (float)S(270), (float)S(12), Gc(44, 54, 72));
+            FillRoundRect(g, (float)(S(248) + sox), (float)S(266), (float)S(3), (float)S(16), 1.5f, Gc(168, 85, 247));
             Gdiplus::SolidBrush brPurpTxt(Gc(216, 180, 254));
             g.DrawString(L"Oyun İçi Kısayol, Bildirim ve Klasör", -1, &fBold,
                 Gdiplus::RectF((float)(S(258) + sox), (float)S(264), (float)S(340), (float)S(22)), &sfLeft, &brPurpTxt);
