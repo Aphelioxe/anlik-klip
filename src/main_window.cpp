@@ -748,7 +748,7 @@ void MainWindow::CreateControls() {
     }
 
     auto makeHiddenCombo = [&](int x, int y, int w, int h, int id) {
-        HWND hw = CreateWindowExW(0, L"COMBOBOX", L"", CBS_DROPDOWNLIST | WS_VSCROLL,
+        HWND hw = CreateWindowExW(0, L"COMBOBOX", L"", WS_CHILD | CBS_DROPDOWNLIST | WS_VSCROLL,
             S(x), S(y), S(w), S(h), hwnd_, reinterpret_cast<HMENU>(static_cast<INT_PTR>(id)), hInst_, nullptr);
         if (hw) ShowWindow(hw, SW_HIDE);
         return hw;
@@ -861,8 +861,12 @@ void MainWindow::SwitchTab(int tabIndex) {
     if (hwnd_) {
         if (activeTab_ == 1) SetTimer(hwnd_, TIMER_MIC_METER_ID, 120, nullptr);
         else KillTimer(hwnd_, TIMER_MIC_METER_ID);
-        if (changed) SetTimer(hwnd_, TIMER_UI_ANIM_ID, 16, nullptr);
-        InvalidateRect(hwnd_, nullptr, FALSE);
+        if (changed) {
+            SetTimer(hwnd_, TIMER_UI_ANIM_ID, 12, nullptr);
+            RedrawWindow(hwnd_, nullptr, nullptr, RDW_INVALIDATE | RDW_NOCHILDREN);
+        } else {
+            InvalidateRect(hwnd_, nullptr, FALSE);
+        }
     }
 }
 
@@ -2705,7 +2709,7 @@ LRESULT MainWindow::OnMessage(UINT msg, WPARAM wParam, LPARAM lParam) {
             } else if (wParam == TIMER_UI_ANIM_ID) {
                 bool fastTick = false;
                 if (openAnimAlpha_ < 255) {
-                    openAnimAlpha_ = std::min(255, openAnimAlpha_ + 24);
+                    openAnimAlpha_ = std::min(255, openAnimAlpha_ + 36);
                     if (hwnd_) SetLayeredWindowAttributes(hwnd_, 0, static_cast<BYTE>(openAnimAlpha_), LWA_ALPHA);
                     if (openAnimAlpha_ >= 255 && hwnd_) {
                         LONG_PTR ex = GetWindowLongPtrW(hwnd_, GWL_EXSTYLE);
@@ -2714,9 +2718,13 @@ LRESULT MainWindow::OnMessage(UINT msg, WPARAM wParam, LPARAM lParam) {
                     fastTick = true;
                 }
                 if (tabAnimT_ < 1.0f) {
-                    tabAnimT_ = std::min(1.0f, tabAnimT_ + 0.14f);
-                    if (tabAnimT_ >= 1.0f) tabIndicatorY_ = (activeTab_ == 1) ? 160.0f : 118.0f;
-                    if (hwnd_) InvalidateRect(hwnd_, nullptr, FALSE);
+                    tabAnimT_ = std::min(1.0f, tabAnimT_ + 0.22f);
+                    if (tabAnimT_ >= 1.0f) {
+                        tabIndicatorY_ = (activeTab_ == 1) ? 160.0f : 118.0f;
+                        if (hwnd_) InvalidateRect(hwnd_, nullptr, FALSE);
+                    } else if (hwnd_) {
+                        RedrawWindow(hwnd_, nullptr, nullptr, RDW_INVALIDATE | RDW_NOCHILDREN);
+                    }
                     fastTick = true;
                 }
                 if (!fastTick) {
