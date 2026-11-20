@@ -137,7 +137,11 @@ enum CustomBtnId {
     BTN_EDIT_DISCORD25,
     BTN_TRIM_SAVE_COPY,
     BTN_TRIM_REPLACE,
-    BTN_TRIM_CANCEL
+    BTN_TRIM_CANCEL,
+    BTN_CMB_DURATION,
+    BTN_CMB_RESFPS,
+    BTN_CMB_BITRATE,
+    BTN_CMB_MIC_DEV
 };
 
 enum NativeCtrlId {
@@ -743,12 +747,16 @@ void MainWindow::CreateControls() {
         SendMessageW(edtSearch_, EM_SETCUEBANNER, TRUE, reinterpret_cast<LPARAM>(L"Klip ara..."));
     }
 
-    const DWORD comboStyle = CBS_DROPDOWNLIST | CBS_OWNERDRAWFIXED | CBS_HASSTRINGS | WS_VSCROLL | WS_TABSTOP;
+    auto makeHiddenCombo = [&](int x, int y, int w, int h, int id) {
+        HWND hw = CreateWindowExW(0, L"COMBOBOX", L"", CBS_DROPDOWNLIST | WS_VSCROLL,
+            S(x), S(y), S(w), S(h), hwnd_, reinterpret_cast<HMENU>(static_cast<INT_PTR>(id)), hInst_, nullptr);
+        if (hw) ShowWindow(hw, SW_HIDE);
+        return hw;
+    };
+
     // Card 1: Video (x=242..562, y=68..248)
     makeLbl(L"Klip Süresi:", 258, 104, 82, 20);
-    cmbDuration_ = make(L"COMBOBOX", L"", comboStyle, 344, 101, 206, 180, ID_CMB_DURATION);
-    SendMessageW(cmbDuration_, CB_SETITEMHEIGHT, static_cast<WPARAM>(-1), S(20));
-    SendMessageW(cmbDuration_, CB_SETITEMHEIGHT, 0, S(24));
+    cmbDuration_ = makeHiddenCombo(344, 101, 206, 180, ID_CMB_DURATION);
     for (int sec : kDurations) {
         wchar_t buf[64] = {};
         if (sec < 60) swprintf(buf, 64, L"Son %d sn", sec);
@@ -758,17 +766,13 @@ void MainWindow::CreateControls() {
     }
 
     makeLbl(L"Çözünürlük:", 258, 139, 82, 20);
-    cmbResFps_ = make(L"COMBOBOX", L"", comboStyle, 344, 136, 206, 180, ID_CMB_RESFPS);
-    SendMessageW(cmbResFps_, CB_SETITEMHEIGHT, static_cast<WPARAM>(-1), S(20));
-    SendMessageW(cmbResFps_, CB_SETITEMHEIGHT, 0, S(24));
+    cmbResFps_ = makeHiddenCombo(344, 136, 206, 180, ID_CMB_RESFPS);
     for (const auto& p : kResPresets) {
         SendMessageW(cmbResFps_, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(p.label));
     }
 
     makeLbl(L"Bit Hızı:", 258, 174, 82, 20);
-    cmbBitrate_ = make(L"COMBOBOX", L"", comboStyle, 344, 171, 206, 180, ID_CMB_BITRATE);
-    SendMessageW(cmbBitrate_, CB_SETITEMHEIGHT, static_cast<WPARAM>(-1), S(20));
-    SendMessageW(cmbBitrate_, CB_SETITEMHEIGHT, 0, S(24));
+    cmbBitrate_ = makeHiddenCombo(344, 171, 206, 180, ID_CMB_BITRATE);
     SendMessageW(cmbBitrate_, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"4 Mbps (Hafif RAM)"));
     SendMessageW(cmbBitrate_, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"6 Mbps (720p60 Dengeli)"));
     SendMessageW(cmbBitrate_, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"8 Mbps (Yüksek Kalite)"));
@@ -791,9 +795,7 @@ void MainWindow::CreateControls() {
     lblMicVol_ = make(L"STATIC", L"%100", SS_RIGHT, 846, 132, 38, 20);
 
     makeLbl(L"Cihaz:", 594, 163, 46, 20);
-    cmbMicDev_ = make(L"COMBOBOX", L"", comboStyle, 642, 160, 240, 180, ID_CMB_MIC_DEV);
-    SendMessageW(cmbMicDev_, CB_SETITEMHEIGHT, static_cast<WPARAM>(-1), S(20));
-    SendMessageW(cmbMicDev_, CB_SETITEMHEIGHT, 0, S(24));
+    cmbMicDev_ = makeHiddenCombo(642, 160, 240, 180, ID_CMB_MIC_DEV);
 
     chkMicGate_ = makeChk(L"Gürültü Kapısı", 594, 194, 108, 22, ID_CHK_MIC_GATE);
     trkMicGate_ = make(TRACKBAR_CLASSW, L"", TBS_HORZ | TBS_AUTOTICKS | WS_TABSTOP, 704, 192, 122, 26, ID_TRK_MIC_GATE);
@@ -813,9 +815,9 @@ void MainWindow::CreateControls() {
 
     bool elev = HotkeyEngine::IsProcessElevated();
     wchar_t hkMsg[200] = {};
-    swprintf(hkMsg, 200, L"Tuş algılama: Çift katman (RawInput + LLHook) • %ls",
-        elev ? L"Yönetici Modu Aktif" : L"Normal Mod (Yönetici açılan oyunlar için yandaki butonu kullanın)");
-    lblHotkeyStatus_ = makeLbl(hkMsg, 258, 360, 488, 20);
+    swprintf(hkMsg, 200, L"Tuş algılama: Çift katman • %ls",
+        elev ? L"Yönetici Modu Aktif" : L"Normal Mod (Yönetici oyunlar için yandaki buton)");
+    lblHotkeyStatus_ = makeLbl(hkMsg, 258, 359, 488, 22);
     btnRestartAdmin_ = make(L"BUTTON", elev ? L"Yönetici Aktif" : L"Yönetici Başlat",
         BS_OWNERDRAW | WS_TABSTOP, 752, 357, 130, 26, ID_BTN_RESTART_ADMIN);
     if (elev) EnableWindow(btnRestartAdmin_, FALSE);
@@ -2548,6 +2550,39 @@ void MainWindow::PaintWindow(HDC targetDc) {
                     is1080 ? Gc(96, 165, 250, 180) : Gc(48, 60, 84));
             }
 
+            auto drawDarkDropdown = [&](int btnId, int px, int py, int pw, int ph, HWND cmb) {
+                RECT rc{ px, py, px + pw, py + ph };
+                customButtons_.push_back({ btnId, rc, true });
+                bool hov = (hoverBtnId_ == btnId);
+                bool prs = (pressedBtnId_ == btnId);
+                FillRoundRectGrad(g, (float)rc.left, (float)rc.top, (float)pw, (float)ph, (float)S(7),
+                    prs ? Gc(32, 42, 66) : (hov ? Gc(28, 37, 58) : Gc(24, 31, 48)),
+                    Gc(19, 25, 40));
+                StrokeRoundRect(g, (float)rc.left, (float)rc.top, (float)pw, (float)ph, (float)S(7),
+                    hov ? Gc(96, 165, 250) : Gc(54, 70, 102));
+                std::wstring txt = L"Seçiniz";
+                if (cmb) {
+                    int idx = static_cast<int>(SendMessageW(cmb, CB_GETCURSEL, 0, 0));
+                    if (idx >= 0) {
+                        LRESULT len = SendMessageW(cmb, CB_GETLBTEXTLEN, idx, 0);
+                        if (len > 0 && len < 256) {
+                            std::wstring buf(static_cast<size_t>(len) + 1, L'\0');
+                            SendMessageW(cmb, CB_GETLBTEXT, idx, reinterpret_cast<LPARAM>(&buf[0]));
+                            txt = buf.c_str();
+                        }
+                    }
+                }
+                g.DrawString(txt.c_str(), -1, &fSmall,
+                    Gdiplus::RectF((float)(rc.left + S(10)), (float)rc.top, (float)(pw - S(28)), (float)ph),
+                    &sfLeft, &brText);
+                g.DrawString(L"▾", -1, &fSmall,
+                    Gdiplus::RectF((float)(rc.right - S(22)), (float)rc.top, (float)S(18), (float)ph),
+                    &sfCenter, &brMuted);
+            };
+            drawDarkDropdown(BTN_CMB_DURATION, S(344) + sox, S(101), S(206), S(24), cmbDuration_);
+            drawDarkDropdown(BTN_CMB_RESFPS, S(344) + sox, S(136), S(206), S(24), cmbResFps_);
+            drawDarkDropdown(BTN_CMB_BITRATE, S(344) + sox, S(171), S(206), S(24), cmbBitrate_);
+
             // Card 2: Audio (Emerald glow accent)
             FillRoundRect(g, (float)(S(578) + sox), (float)S(68), (float)S(320), (float)S(180), (float)S(12), Gc(16, 21, 33));
             FillRoundRectGrad(g, (float)(S(578) + sox), (float)S(68), (float)S(320), (float)S(32), (float)S(12), Gc(34, 197, 94, 38), Gc(16, 21, 33, 0));
@@ -2556,6 +2591,7 @@ void MainWindow::PaintWindow(HDC targetDc) {
             Gdiplus::SolidBrush brGreenTxt(Gc(134, 239, 172));
             g.DrawString(L"Ses (Oyun + Mikrofon)", -1, &fBold,
                 Gdiplus::RectF((float)(S(594) + sox), (float)S(74), (float)S(240), (float)S(22)), &sfLeft, &brGreenTxt);
+            drawDarkDropdown(BTN_CMB_MIC_DEV, S(642) + sox, S(160), S(240), S(24), cmbMicDev_);
 
             {
                 float db = static_cast<float>(st.micLevelDb);
@@ -3123,6 +3159,21 @@ LRESULT MainWindow::OnMessage(UINT msg, WPARAM wParam, LPARAM lParam) {
                             SetFooterMessage(msg);
                             break;
                         }
+                        case BTN_CMB_DURATION:
+                        case BTN_CMB_RESFPS:
+                        case BTN_CMB_BITRATE:
+                        case BTN_CMB_MIC_DEV: {
+                            RECT anchorRc{};
+                            for (const auto& b : customButtons_) {
+                                if (b.id == target) { anchorRc = b.rc; break; }
+                            }
+                            HWND cmb = (target == BTN_CMB_DURATION) ? cmbDuration_
+                                     : (target == BTN_CMB_RESFPS)   ? cmbResFps_
+                                     : (target == BTN_CMB_BITRATE)  ? cmbBitrate_
+                                                                    : cmbMicDev_;
+                            ShowDarkComboDropdown(cmb, anchorRc);
+                            break;
+                        }
 
                         // Embedded Player & Trim buttons
                         case BTN_PLY_BACK: CloseEmbeddedPlayer(); break;
@@ -3589,5 +3640,223 @@ void MainWindow::ShowMobileQrModal() {
     }
     EnableWindow(hwnd_, TRUE);
     SetForegroundWindow(hwnd_);
+    InvalidateRect(hwnd_, nullptr, FALSE);
+}
+
+void MainWindow::ShowDarkComboDropdown(HWND comboHwnd, RECT anchorClientRc) {
+    if (!comboHwnd) return;
+    int count = static_cast<int>(SendMessageW(comboHwnd, CB_GETCOUNT, 0, 0));
+    if (count <= 0) return;
+    int curSel = static_cast<int>(SendMessageW(comboHwnd, CB_GETCURSEL, 0, 0));
+
+    std::vector<std::wstring> items;
+    items.reserve(static_cast<size_t>(count));
+    for (int i = 0; i < count; ++i) {
+        int len = static_cast<int>(SendMessageW(comboHwnd, CB_GETLBTEXTLEN, static_cast<WPARAM>(i), 0));
+        if (len < 0) len = 0;
+        std::wstring s(static_cast<size_t>(len) + 1, L'\0');
+        SendMessageW(comboHwnd, CB_GETLBTEXT, static_cast<WPARAM>(i), reinterpret_cast<LPARAM>(&s[0]));
+        s.resize(wcslen(s.c_str()));
+        items.push_back(std::move(s));
+    }
+
+    RECT scrRc = anchorClientRc;
+    MapWindowPoints(hwnd_, HWND_DESKTOP, reinterpret_cast<POINT*>(&scrRc), 2);
+
+    const int padY = S(4);
+    const int itemH = S(26);
+    const int popW = std::max<int>(scrRc.right - scrRc.left, S(200));
+    const int popH = count * itemH + padY * 2;
+
+    int px = scrRc.left;
+    int py = scrRc.bottom + S(3);
+
+    HMONITOR mon = MonitorFromRect(&scrRc, MONITOR_DEFAULTTONEAREST);
+    MONITORINFO mi{};
+    mi.cbSize = sizeof(mi);
+    if (GetMonitorInfoW(mon, &mi)) {
+        if (py + popH > mi.rcWork.bottom && scrRc.top - S(3) - popH >= mi.rcWork.top) {
+            py = scrRc.top - S(3) - popH;
+        }
+        if (px + popW > mi.rcWork.right) px = mi.rcWork.right - popW;
+        if (px < mi.rcWork.left) px = mi.rcWork.left;
+    }
+
+    struct DropState {
+        MainWindow* mw = nullptr;
+        std::vector<std::wstring>* items = nullptr;
+        int curSel = -1;
+        int hoverIdx = -1;
+        int chosen = -1;
+        int itemH = 26;
+        int padY = 4;
+        bool done = false;
+        HWND pop = nullptr;
+    } st{ this, &items, curSel, curSel, -1, itemH, padY, false, nullptr };
+
+    static const wchar_t* kDropCls = L"AnlikKlipDarkComboPopup";
+    static bool dropReg = false;
+    if (!dropReg) {
+        WNDCLASSEXW wc{};
+        wc.cbSize = sizeof(wc);
+        wc.lpfnWndProc = [](HWND h, UINT m, WPARAM wp, LPARAM lp) -> LRESULT {
+            auto* s = reinterpret_cast<DropState*>(GetWindowLongPtrW(h, GWLP_USERDATA));
+            if (m == WM_NCCREATE) {
+                auto* cs = reinterpret_cast<CREATESTRUCTW*>(lp);
+                s = reinterpret_cast<DropState*>(cs->lpCreateParams);
+                SetWindowLongPtrW(h, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(s));
+            }
+            if (!s) return DefWindowProcW(h, m, wp, lp);
+            switch (m) {
+                case WM_ERASEBKGND: return 1;
+                case WM_ACTIVATE:
+                    if (LOWORD(wp) == WA_INACTIVE && !s->done) {
+                        s->done = true;
+                        DestroyWindow(h);
+                    }
+                    return 0;
+                case WM_MOUSEMOVE: {
+                    int my = static_cast<short>(HIWORD(lp));
+                    int idx = (my - s->padY) / s->itemH;
+                    if (my < s->padY || idx < 0 || idx >= static_cast<int>(s->items->size())) idx = -1;
+                    if (idx != s->hoverIdx) {
+                        s->hoverIdx = idx;
+                        InvalidateRect(h, nullptr, FALSE);
+                    }
+                    TRACKMOUSEEVENT tme{ sizeof(tme), TME_LEAVE, h, 0 };
+                    TrackMouseEvent(&tme);
+                    return 0;
+                }
+                case WM_MOUSELEAVE:
+                    if (s->hoverIdx != -1) {
+                        s->hoverIdx = -1;
+                        InvalidateRect(h, nullptr, FALSE);
+                    }
+                    return 0;
+                case WM_LBUTTONUP: {
+                    int my = static_cast<short>(HIWORD(lp));
+                    int idx = (my - s->padY) / s->itemH;
+                    if (my >= s->padY && idx >= 0 && idx < static_cast<int>(s->items->size())) {
+                        s->chosen = idx;
+                    }
+                    s->done = true;
+                    DestroyWindow(h);
+                    return 0;
+                }
+                case WM_KEYDOWN:
+                    if (wp == VK_ESCAPE) {
+                        s->done = true;
+                        DestroyWindow(h);
+                        return 0;
+                    } else if (wp == VK_RETURN && s->hoverIdx >= 0) {
+                        s->chosen = s->hoverIdx;
+                        s->done = true;
+                        DestroyWindow(h);
+                        return 0;
+                    } else if (wp == VK_DOWN && !s->items->empty()) {
+                        s->hoverIdx = (s->hoverIdx + 1) % static_cast<int>(s->items->size());
+                        InvalidateRect(h, nullptr, FALSE);
+                        return 0;
+                    } else if (wp == VK_UP && !s->items->empty()) {
+                        int n = static_cast<int>(s->items->size());
+                        s->hoverIdx = (s->hoverIdx <= 0) ? (n - 1) : (s->hoverIdx - 1);
+                        InvalidateRect(h, nullptr, FALSE);
+                        return 0;
+                    }
+                    return 0;
+                case WM_PAINT: {
+                    PAINTSTRUCT ps{};
+                    HDC hdc = BeginPaint(h, &ps);
+                    RECT rc{}; GetClientRect(h, &rc);
+                    HDC memDC = CreateCompatibleDC(hdc);
+                    HBITMAP memBmp = CreateCompatibleBitmap(hdc, rc.right, rc.bottom);
+                    HGDIOBJ oldBmp = SelectObject(memDC, memBmp);
+
+                    Gdiplus::Graphics g(memDC);
+                    g.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
+                    g.SetTextRenderingHint(Gdiplus::TextRenderingHintClearTypeGridFit);
+
+                    Gdiplus::SolidBrush bg(Gdiplus::Color(255, 18, 23, 36));
+                    g.FillRectangle(&bg, 0, 0, rc.right, rc.bottom);
+
+                    Gdiplus::Pen borderPen(Gdiplus::Color(255, 59, 130, 246), 1.0f);
+                    g.DrawRectangle(&borderPen, 0, 0, rc.right - 1, rc.bottom - 1);
+
+                    Gdiplus::Font fnt(memDC, s->mw->font_);
+                    Gdiplus::StringFormat sf;
+                    sf.SetLineAlignment(Gdiplus::StringAlignmentCenter);
+                    sf.SetTrimming(Gdiplus::StringTrimmingEllipsisCharacter);
+                    sf.SetFormatFlags(Gdiplus::StringFormatFlagsNoWrap);
+
+                    for (int i = 0; i < static_cast<int>(s->items->size()); ++i) {
+                        int iy = s->padY + i * s->itemH;
+                        float ix = static_cast<float>(s->mw->S(4));
+                        float iyf = static_cast<float>(iy + 1);
+                        float iw = static_cast<float>(rc.right - s->mw->S(8));
+                        float ih = static_cast<float>(s->itemH - 2);
+
+                        if (i == s->hoverIdx) {
+                            FillRoundRect(g, ix, iyf, iw, ih, 5.0f, Gdiplus::Color(255, 37, 99, 235));
+                        } else if (i == s->curSel) {
+                            FillRoundRect(g, ix, iyf, iw, ih, 5.0f, Gdiplus::Color(255, 28, 37, 58));
+                        }
+
+                        Gdiplus::Color txtCol = (i == s->hoverIdx) ? Gdiplus::Color(255, 255, 255, 255)
+                                              : (i == s->curSel)   ? Gdiplus::Color(255, 147, 197, 253)
+                                                                   : Gdiplus::Color(255, 226, 232, 240);
+                        Gdiplus::SolidBrush txtBr(txtCol);
+                        Gdiplus::RectF textRc(
+                            static_cast<Gdiplus::REAL>(s->mw->S(12)),
+                            static_cast<Gdiplus::REAL>(iy),
+                            static_cast<Gdiplus::REAL>(rc.right - s->mw->S(28)),
+                            static_cast<Gdiplus::REAL>(s->itemH));
+                        g.DrawString((*s->items)[static_cast<size_t>(i)].c_str(), -1, &fnt, textRc, &sf, &txtBr);
+
+                        if (i == s->curSel) {
+                            Gdiplus::SolidBrush dotBr(i == s->hoverIdx ? Gdiplus::Color(255, 255, 255, 255)
+                                                                       : Gdiplus::Color(255, 59, 130, 246));
+                            float dr = 3.0f;
+                            g.FillEllipse(&dotBr,
+                                static_cast<Gdiplus::REAL>(rc.right - s->mw->S(16)) - dr,
+                                static_cast<Gdiplus::REAL>(iy + s->itemH / 2) - dr,
+                                dr * 2.0f, dr * 2.0f);
+                        }
+                    }
+
+                    BitBlt(hdc, 0, 0, rc.right, rc.bottom, memDC, 0, 0, SRCCOPY);
+                    SelectObject(memDC, oldBmp);
+                    DeleteObject(memBmp);
+                    DeleteDC(memDC);
+                    EndPaint(h, &ps);
+                    return 0;
+                }
+                case WM_DESTROY:
+                    s->done = true;
+                    return 0;
+            }
+            return DefWindowProcW(h, m, wp, lp);
+        };
+        wc.hInstance = hInst_;
+        wc.lpszClassName = kDropCls;
+        wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+        RegisterClassExW(&wc);
+        dropReg = true;
+    }
+
+    st.pop = CreateWindowExW(WS_EX_TOPMOST | WS_EX_TOOLWINDOW, kDropCls, L"",
+        WS_POPUP | WS_VISIBLE, px, py, popW, popH, hwnd_, nullptr, hInst_, &st);
+    SetFocus(st.pop);
+
+    MSG msg{};
+    while (!st.done && GetMessageW(&msg, nullptr, 0, 0) > 0) {
+        TranslateMessage(&msg);
+        DispatchMessageW(&msg);
+    }
+
+    if (st.chosen >= 0 && st.chosen < count) {
+        SendMessageW(comboHwnd, CB_SETCURSEL, static_cast<WPARAM>(st.chosen), 0);
+        SendMessageW(hwnd_, WM_COMMAND, MAKEWPARAM(GetDlgCtrlID(comboHwnd), CBN_SELCHANGE),
+            reinterpret_cast<LPARAM>(comboHwnd));
+    }
     InvalidateRect(hwnd_, nullptr, FALSE);
 }

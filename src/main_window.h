@@ -104,6 +104,7 @@ private:
     void RenameSelected();
     void DeleteSelected();
     void PickOutputFolder();
+    void ShowDarkComboDropdown(HWND comboHwnd, RECT anchorClientRc);
     void OpenFolder(const std::wstring& path);
     void SetFooterMessage(const std::wstring& msg);
 
