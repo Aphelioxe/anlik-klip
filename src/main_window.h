@@ -137,6 +137,8 @@ private:
     int memW_ = 0;
     int memH_ = 0;
     int openAnimAlpha_ = 255;
+    int openTargetX_ = 0;
+    int openTargetY_ = 0;
     ULONGLONG openAnimStartMs_ = 0;
     ULONGLONG tabAnimStartMs_ = 0;
     float openAnimT_ = 1.0f;

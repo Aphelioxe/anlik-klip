@@ -532,10 +532,11 @@ bool MainWindow::Create(int initialTab) {
     settingsOffsetX_ = 0;
     openAnimAlpha_ = 0;
     openAnimT_ = 0.0f;
-    openAnimStartMs_ = GetTickCount64();
+    openTargetX_ = winX;
+    openTargetY_ = winY;
     animPhase_ = 0.0;
     hwnd_ = CreateWindowExW(WS_EX_LAYERED, cls, L"Anlık Klip", style,
-        winX, winY, winW, winH,
+        winX, winY + S(18), winW, winH,
         nullptr, nullptr, hInst_, this);
     if (!hwnd_) return false;
     SetLayeredWindowAttributes(hwnd_, 0, 0, LWA_ALPHA);
@@ -552,7 +553,9 @@ bool MainWindow::Create(int initialTab) {
     tabAnimT_ = 1.0f;
     tabIndicatorY_ = (activeTab_ == 1) ? 160.0f : 118.0f;
 
+    openAnimStartMs_ = GetTickCount64();
     ShowWindow(hwnd_, SW_SHOWNORMAL);
+    UpdateWindow(hwnd_);
     SetForegroundWindow(hwnd_);
     SetTimer(hwnd_, TIMER_UI_ANIM_ID, 10, nullptr);
     return true;
@@ -857,15 +860,17 @@ void MainWindow::SwitchTab(int tabIndex) {
         tabAnimStartMs_ = GetTickCount64();
     }
     activeTab_ = nextTab;
+    if (hwnd_) SendMessageW(hwnd_, WM_SETREDRAW, FALSE, 0);
     for (HWND h : settingsCtrls_) {
         ShowWindow(h, activeTab_ == 1 ? SW_SHOW : SW_HIDE);
     }
     UpdateGalleryControlVisibility();
     if (hwnd_) {
+        SendMessageW(hwnd_, WM_SETREDRAW, TRUE, 0);
         if (activeTab_ == 1) SetTimer(hwnd_, TIMER_MIC_METER_ID, 120, nullptr);
         else KillTimer(hwnd_, TIMER_MIC_METER_ID);
         if (changed) SetTimer(hwnd_, TIMER_UI_ANIM_ID, 10, nullptr);
-        InvalidateRect(hwnd_, nullptr, FALSE);
+        RedrawWindow(hwnd_, nullptr, nullptr, RDW_INVALIDATE | RDW_UPDATENOW | RDW_ALLCHILDREN);
     }
 }
 
@@ -2738,11 +2743,16 @@ LRESULT MainWindow::OnMessage(UINT msg, WPARAM wParam, LPARAM lParam) {
                 bool fastTick = false;
 
                 if (openAnimT_ < 1.0f) {
-                    float raw = std::min(1.0f, static_cast<float>(now - openAnimStartMs_) / 180.0f);
+                    float raw = std::min(1.0f, static_cast<float>(now - openAnimStartMs_) / 280.0f);
                     openAnimT_ = raw;
                     float ease = 1.0f - std::pow(1.0f - raw, 3.0f);
                     openAnimAlpha_ = static_cast<int>(std::round(ease * 255.0f));
-                    if (hwnd_) SetLayeredWindowAttributes(hwnd_, 0, static_cast<BYTE>(openAnimAlpha_), LWA_ALPHA);
+                    int curY = openTargetY_ + static_cast<int>(std::round((1.0f - ease) * static_cast<float>(S(18))));
+                    if (hwnd_) {
+                        SetWindowPos(hwnd_, nullptr, openTargetX_, curY, 0, 0,
+                            SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+                        SetLayeredWindowAttributes(hwnd_, 0, static_cast<BYTE>(openAnimAlpha_), LWA_ALPHA);
+                    }
                     if (raw >= 1.0f && hwnd_) {
                         LONG_PTR ex = GetWindowLongPtrW(hwnd_, GWL_EXSTYLE);
                         SetWindowLongPtrW(hwnd_, GWL_EXSTYLE, ex & ~WS_EX_LAYERED);
@@ -2887,6 +2897,11 @@ LRESULT MainWindow::OnMessage(UINT msg, WPARAM wParam, LPARAM lParam) {
             SetTextColor(hdc, kRgbText);
             SetBkColor(hdc, kRgbInput);
             return reinterpret_cast<LRESULT>(brInput_);
+        }
+        case WM_CTLCOLORBTN: {
+            HDC hdc = reinterpret_cast<HDC>(wParam);
+            SetBkMode(hdc, TRANSPARENT);
+            return reinterpret_cast<LRESULT>(brCard_);
         }
         case WM_DRAWITEM: {
             const auto* dis = reinterpret_cast<const DRAWITEMSTRUCT*>(lParam);
