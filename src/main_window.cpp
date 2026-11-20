@@ -2272,8 +2272,8 @@ void MainWindow::PaintWindow(HDC targetDc) {
             g.DrawString(L"Space: Oynat • ←/→: ±5sn • F: Tam Ekran • Esc: Geri", -1, &fSmall,
                 Gdiplus::RectF((float)S(364), (float)S(36), (float)std::max(S(180), cw - S(816)), (float)S(16)), &sfLeft, &brMuted);
 
-            addBtnPx(BTN_PLY_SHARE, cw - S(444), S(18), S(82), S(34), uploadBusy_ ? L"Yükleniyor" : L"🔗 Link Al",
-                Gc(13, 148, 136), Gc(20, 184, 166), Gc(94, 234, 212), !trimBusy_ && !uploadBusy_);
+            addBtnPx(BTN_PLY_SHARE, cw - S(444), S(18), S(82), S(34), uploadBusy_ ? L"Yükleniyor" : L"Link Al",
+                Gc(28, 34, 47), Gc(40, 49, 68), Gc(52, 64, 86), !trimBusy_ && !uploadBusy_);
             addBtnPx(BTN_PLY_FAV, cw - S(356), S(18), S(74), S(34), curFav ? L"★ Fav" : L"☆ Fav",
                 curFav ? Gc(92, 68, 14) : Gc(28, 34, 47),
                 curFav ? Gc(120, 88, 18) : Gc(40, 49, 68),
@@ -2727,42 +2727,48 @@ void MainWindow::PaintWindow(HDC targetDc) {
             bool hasSel = (selectedIdx_ >= 0 && selectedIdx_ < static_cast<int>(filteredIndices_.size()));
             bool selFav = hasSel && clips_[filteredIndices_[static_cast<size_t>(selectedIdx_)]].isFavorite;
             const int dockY = ch - S(76);
-            FillRoundRect(g, (float)S(242), (float)dockY, (float)(cw - S(264)), (float)S(56), (float)S(10), Gc(20, 25, 35));
-            StrokeRoundRect(g, (float)S(242), (float)dockY, (float)(cw - S(264)), (float)S(56), (float)S(10), Gc(40, 48, 65));
-            addBtnPx(BTN_CLIP_PLAY, S(254), dockY + S(11), S(82), S(34), L"▶  İzle", Gc(37, 99, 235), Gc(59, 130, 246), Gc(96, 165, 250, 140), hasSel);
-            addBtnPx(BTN_CLIP_FAV, S(342), dockY + S(11), S(82), S(34), selFav ? L"★ Fav" : L"☆ Fav",
-                selFav ? Gc(92, 68, 14) : Gc(32, 39, 53),
-                selFav ? Gc(120, 88, 18) : Gc(44, 54, 72),
-                selFav ? Gc(250, 204, 21) : Gc(56, 68, 90), hasSel);
-            addBtnPx(BTN_CLIP_SHARE, S(430), dockY + S(11), S(90), S(34), uploadBusy_ ? L"Yükleniyor" : L"🔗 Link Al",
-                Gc(13, 148, 136), Gc(20, 184, 166), Gc(94, 234, 212), hasSel && !uploadBusy_);
-            addBtnPx(BTN_CLIP_RENAME, S(526), dockY + S(11), S(76), S(34), L"Adlandır", Gc(32, 39, 53), Gc(44, 54, 72), Gc(56, 68, 90), hasSel);
-            addBtnPx(BTN_CLIP_REVEAL, S(608), dockY + S(11), S(74), S(34), L"Klasör", Gc(32, 39, 53), Gc(44, 54, 72), Gc(56, 68, 90), hasSel);
-            addBtnPx(BTN_CLIP_DELETE, S(688), dockY + S(11), S(48), S(34), L"Sil", Gc(153, 27, 27), Gc(185, 28, 28), Gc(220, 38, 38), hasSel);
+            FillRoundRect(g, (float)S(242), (float)dockY, (float)(cw - S(264)), (float)S(56), (float)S(12), Gc(16, 21, 33));
+            StrokeRoundRect(g, (float)S(242), (float)dockY, (float)(cw - S(264)), (float)S(56), (float)S(12), Gc(38, 48, 70));
+
+            addBtnPx(BTN_CLIP_PLAY, S(254), dockY + S(11), S(82), S(34), L"▶  İzle",
+                Gc(37, 99, 235), Gc(59, 130, 246), Gc(96, 165, 250, 130), hasSel);
+            addBtnPx(BTN_CLIP_FAV, S(342), dockY + S(11), S(78), S(34), selFav ? L"★ Fav" : L"☆ Fav",
+                selFav ? Gc(68, 52, 16) : Gc(26, 33, 49),
+                selFav ? Gc(92, 68, 18) : Gc(36, 46, 68),
+                selFav ? Gc(234, 179, 8, 140) : Gc(46, 58, 84), hasSel);
+            addBtnPx(BTN_CLIP_SHARE, S(426), dockY + S(11), S(82), S(34), uploadBusy_ ? L"Yükleniyor" : L"Link Al",
+                Gc(26, 33, 49), Gc(36, 46, 68), Gc(46, 58, 84), hasSel && !uploadBusy_);
+            addBtnPx(BTN_CLIP_RENAME, S(514), dockY + S(11), S(78), S(34), L"Adlandır",
+                Gc(26, 33, 49), Gc(36, 46, 68), Gc(46, 58, 84), hasSel);
+            addBtnPx(BTN_CLIP_REVEAL, S(598), dockY + S(11), S(74), S(34), L"Klasör",
+                Gc(26, 33, 49), Gc(36, 46, 68), Gc(46, 58, 84), hasSel);
+            addBtnPx(BTN_CLIP_DELETE, S(678), dockY + S(11), S(48), S(34), L"Sil",
+                Gc(42, 22, 28), Gc(127, 29, 29), Gc(185, 28, 28, 110), hasSel);
+
             std::wstring selUrl = hasSel ? clips_[filteredIndices_[static_cast<size_t>(selectedIdx_)]].shareUrl : L"";
             if (hasSel && !selUrl.empty() && !uploadBusy_) {
-                int boxX = S(744);
+                int boxX = S(736);
                 int boxW = std::max(S(60), cw - S(112) - boxX);
                 RECT linkRc{ boxX, dockY + S(11), boxX + boxW, dockY + S(45) };
                 customButtons_.push_back({ BTN_CLIP_OPEN_LINK, linkRc, true });
                 bool linkHov = (hoverBtnId_ == BTN_CLIP_OPEN_LINK);
                 FillRoundRect(g, (float)boxX, (float)(dockY + S(11)), (float)boxW, (float)S(34), (float)S(8),
-                    linkHov ? Gc(22, 34, 56) : Gc(15, 23, 38));
+                    linkHov ? Gc(22, 32, 52) : Gc(13, 18, 30));
                 StrokeRoundRect(g, (float)boxX, (float)(dockY + S(11)), (float)boxW, (float)S(34), (float)S(8),
-                    linkHov ? Gc(94, 234, 212, 200) : Gc(45, 212, 191, 110));
-                Gdiplus::SolidBrush brLink(linkHov ? Gc(153, 246, 228) : Gc(94, 234, 212));
+                    linkHov ? Gc(96, 165, 250, 170) : Gc(44, 58, 84));
+                Gdiplus::SolidBrush brLink(linkHov ? Gc(186, 230, 253) : Gc(125, 211, 252));
                 g.DrawString(selUrl.c_str(), -1, &fSmall,
                     Gdiplus::RectF((float)(boxX + S(10)), (float)(dockY + S(11)), (float)std::max(S(20), boxW - S(16)), (float)S(34)),
                     &sfLeft, &brLink);
                 bool copiedNow = (GetTickCount64() < copyFeedbackUntilMs_);
                 addBtnPx(BTN_CLIP_COPY_LINK, cw - S(106), dockY + S(11), S(78), S(34),
                     copiedNow ? L"✓ Kopya" : L"Kopyala",
-                    copiedNow ? Gc(21, 128, 61) : Gc(13, 148, 136),
-                    copiedNow ? Gc(22, 163, 74) : Gc(20, 184, 166),
-                    copiedNow ? Gc(74, 222, 128) : Gc(94, 234, 212), true);
+                    copiedNow ? Gc(22, 101, 52) : Gc(28, 40, 62),
+                    copiedNow ? Gc(21, 128, 61) : Gc(37, 99, 235),
+                    copiedNow ? Gc(74, 222, 128, 160) : Gc(59, 130, 246, 110), true);
             } else {
                 g.DrawString(footerMsg_.c_str(), -1, &fSmall,
-                    Gdiplus::RectF((float)S(744), (float)(dockY + S(8)), (float)std::max(S(140), cw - S(770)), (float)S(40)), &sfLeft, &brMuted);
+                    Gdiplus::RectF((float)S(736), (float)(dockY + S(8)), (float)std::max(S(140), cw - S(762)), (float)S(40)), &sfLeft, &brMuted);
             }
             g.ResetTransform();
             g.ResetClip();
