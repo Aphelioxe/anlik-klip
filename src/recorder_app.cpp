@@ -119,6 +119,54 @@ void RecorderApp::RegenerateMobilePin() {
     }
 }
 
+namespace {
+std::wstring DetectForegroundAppLabel() {
+    HWND fg = GetForegroundWindow();
+    if (!fg) return L"Masaustu";
+    DWORD pid = 0;
+    GetWindowThreadProcessId(fg, &pid);
+    if (!pid) return L"Masaustu";
+
+    HANDLE hProc = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+    std::wstring exeName;
+    if (hProc) {
+        wchar_t path[MAX_PATH] = {};
+        DWORD len = MAX_PATH;
+        if (QueryFullProcessImageNameW(hProc, 0, path, &len) && len > 0) {
+            std::wstring full(path, len);
+            size_t sl = full.find_last_of(L"\\/");
+            exeName = (sl != std::wstring::npos) ? full.substr(sl + 1) : full;
+        }
+        CloseHandle(hProc);
+    }
+    if (exeName.empty()) return L"Klip";
+
+    auto eq = [&](const wchar_t* s) { return _wcsicmp(exeName.c_str(), s) == 0; };
+    if (eq(L"VALORANT-Win64-Shipping.exe") || eq(L"VALORANT.exe")) return L"Valorant";
+    if (eq(L"League of Legends.exe")) return L"LeagueOfLegends";
+    if (eq(L"cs2.exe") || eq(L"csgo.exe")) return L"CS2";
+    if (eq(L"osu!.exe")) return L"osu";
+    if (eq(L"chrome.exe")) return L"Chrome";
+    if (eq(L"msedge.exe")) return L"Edge";
+    if (eq(L"firefox.exe")) return L"Firefox";
+    if (eq(L"Discord.exe")) return L"Discord";
+    if (eq(L"explorer.exe") || eq(L"ShellExperienceHost.exe")) return L"Masaustu";
+    if (eq(L"AnlikKlip.exe")) return L"Klip";
+
+    size_t dot = exeName.find_last_of(L'.');
+    std::wstring stem = (dot != std::wstring::npos) ? exeName.substr(0, dot) : exeName;
+    std::wstring clean;
+    for (wchar_t ch : stem) {
+        if ((ch >= L'0' && ch <= L'9') || (ch >= L'A' && ch <= L'Z') ||
+            (ch >= L'a' && ch <= L'z') || ch == L'-' || ch == L'_') {
+            clean.push_back(ch);
+        }
+        if (clean.size() >= 24) break;
+    }
+    return clean.empty() ? L"Klip" : clean;
+}
+} // namespace
+
 bool RecorderApp::SaveClipAsync(int secondsOverride, SaveCallback cb) {
     if (!running_.load()) {
         if (cb) {
@@ -143,7 +191,8 @@ bool RecorderApp::SaveClipAsync(int secondsOverride, SaveCallback cb) {
         return false;
     }
 
-    std::wstring outPath = BuildUniqueClipPath(cfg_.outputDir);
+    std::wstring appLabel = DetectForegroundAppLabel();
+    std::wstring outPath = BuildUniqueClipPath(cfg_.outputDir, appLabel);
 
     std::lock_guard<std::mutex> lk(saveThreadMutex_);
     if (saveThread_.joinable()) {

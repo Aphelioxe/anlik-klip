@@ -53,6 +53,7 @@ public class MainActivity extends AppCompatActivity implements ClipAdapter.Liste
 
     private View viewStatusDot;
     private TextView txtStatus;
+    private TextView txtStatsSummary;
     private TextView txtEmptyState;
     private TextView txtSelectedCount;
     private LinearLayout panelConnect;
@@ -114,6 +115,7 @@ public class MainActivity extends AppCompatActivity implements ClipAdapter.Liste
 
         viewStatusDot = findViewById(R.id.viewStatusDot);
         txtStatus = findViewById(R.id.txtStatus);
+        txtStatsSummary = findViewById(R.id.txtStatsSummary);
         txtEmptyState = findViewById(R.id.txtEmptyState);
         txtSelectedCount = findViewById(R.id.txtSelectedCount);
         panelConnect = findViewById(R.id.panelConnect);
@@ -341,6 +343,18 @@ public class MainActivity extends AppCompatActivity implements ClipAdapter.Liste
             filtered.add(c);
         }
         adapter.setItems(filtered);
+        long totalBytes = 0;
+        int dlCount = 0;
+        for (ClipItem c : filtered) {
+            totalBytes += c.sizeBytes;
+            if (c.downloaded) dlCount++;
+        }
+        double totalMb = totalBytes / (1024.0 * 1024.0);
+        String sizeStr = totalMb >= 1000.0
+                ? String.format(Locale.US, "%.2f GB", totalMb / 1024.0)
+                : String.format(Locale.US, "%.1f MB", totalMb);
+        txtStatsSummary.setText(filtered.size() + " klip  •  " + sizeStr + "  •  " + dlCount + " indirildi");
+
         if (!connected) {
             txtEmptyState.setVisibility(View.VISIBLE);
         } else if (filtered.isEmpty()) {

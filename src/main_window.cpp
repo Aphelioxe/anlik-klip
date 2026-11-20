@@ -114,6 +114,9 @@ enum CustomBtnId {
     BTN_EDIT_ADD_CLIP,
     BTN_EDIT_GAME_MUTE,
     BTN_EDIT_MIC_MUTE,
+    BTN_EDIT_VERTICAL,
+    BTN_EDIT_DISCORD10,
+    BTN_EDIT_DISCORD25,
     BTN_TRIM_SAVE_COPY,
     BTN_TRIM_REPLACE,
     BTN_TRIM_CANCEL
@@ -1033,6 +1036,7 @@ void MainWindow::OpenEmbeddedPlayer(int viewIdx) {
     draggingEditGameVol_ = false;
     draggingEditMicVol_ = false;
     editSpeed_ = 1.0;
+    editVertical916_ = false;
     editInsertClipPath_.clear();
 
     videoHwnd_ = CreateWindowExW(0, vCls, L"", WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS,
@@ -1200,7 +1204,7 @@ void MainWindow::PickInsertClip() {
     InvalidateRect(hwnd_, nullptr, FALSE);
 }
 
-void MainWindow::StartTrimAsync(bool replaceOriginal) {
+void MainWindow::StartTrimAsync(bool replaceOriginal, int targetSizeMb) {
     if (!playerOpen_ || trimBusy_ || playerClipPath_.empty()) return;
     double dur = (playerDurSec_ > 0.2) ? playerDurSec_ : 1.0;
     double tStart = std::max(0.0, std::min(dur - 0.2, trimStartSec_));
@@ -1249,6 +1253,8 @@ void MainWindow::StartTrimAsync(bool replaceOriginal) {
     editSpec.speed = editSpeed_;
     editSpec.gameVolPct = editGameMuted_ ? 0 : editGameVolPct_;
     editSpec.micVolPct = editMicMuted_ ? 0 : editMicVolPct_;
+    editSpec.targetSizeMb = targetSizeMb;
+    editSpec.vertical916 = editVertical916_;
 
     SetFooterMessage(replaceOriginal
         ? L"Ana klip düzenleniyor, lütfen bekleyin..."
@@ -1897,15 +1903,15 @@ void MainWindow::PaintWindow(HDC targetDc) {
 
                 wchar_t spdLbl[32] = {};
                 swprintf(spdLbl, 32, L"Kayıt Hızı: %.1fx", editSpeed_);
-                addBtn(BTN_EDIT_SPEED, 764, 244, 124, 28, spdLbl, Gc(32, 39, 53), Gc(44, 54, 72), Gc(56, 68, 90), canPlay);
-                addBtn(BTN_EDIT_ADD_CLIP, 764, 280, 124, 28,
+                addBtn(BTN_EDIT_SPEED, 764, 240, 124, 24, spdLbl, Gc(32, 39, 53), Gc(44, 54, 72), Gc(56, 68, 90), canPlay);
+                addBtn(BTN_EDIT_ADD_CLIP, 764, 268, 124, 24,
                     editInsertClipPath_.empty() ? L"+ Klip Ekle" : L"✕ Eklenen Klip",
                     editInsertClipPath_.empty() ? Gc(32, 39, 53) : Gc(30, 64, 175),
                     Gc(44, 54, 72), Gc(96, 165, 250), canPlay);
-                if (!editInsertClipPath_.empty()) {
-                    g.DrawString(L"Sona/kesime eklenecek", -1, &fSmall,
-                        Gdiplus::RectF((float)S(762), (float)S(312), (float)S(128), (float)S(16)), &sfCenter, &brMuted);
-                }
+                addBtn(BTN_EDIT_VERTICAL, 764, 296, 124, 24,
+                    editVertical916_ ? L"9:16 Dikey: Açık" : L"9:16 Dikey: Kapalı",
+                    editVertical916_ ? Gc(124, 58, 237) : Gc(32, 39, 53),
+                    editVertical916_ ? Gc(139, 92, 246) : Gc(44, 54, 72), Gc(167, 139, 250), canPlay);
 
                 // Multi-track timeline & control card (242, 342, 656, 262)
                 FillRoundRect(g, (float)S(242), (float)S(342), (float)S(656), (float)S(262), (float)S(12), Gc(20, 25, 35));
@@ -2060,10 +2066,12 @@ void MainWindow::PaintWindow(HDC targetDc) {
                 addBtn(BTN_TRIM_SAVE_COPY, 544, 508, 142, 30, L"Yeni Kopya Kaydet", Gc(37, 99, 235), Gc(59, 130, 246), Gc(96, 165, 250), validSpan);
                 addBtn(BTN_TRIM_REPLACE, 692, 508, 118, 30, L"Ana Klip Yap", Gc(13, 148, 136), Gc(20, 184, 166), Gc(94, 234, 212), validSpan);
                 addBtn(BTN_TRIM_CANCEL, 816, 508, 70, 30, L"İptal", Gc(32, 39, 53), Gc(44, 54, 72), Gc(56, 68, 90), !trimBusy_);
+                addBtn(BTN_EDIT_DISCORD10, 254, 544, 126, 28, L"Discord ≤10 MB", Gc(88, 101, 242), Gc(104, 117, 248), Gc(165, 180, 252), validSpan);
+                addBtn(BTN_EDIT_DISCORD25, 386, 544, 126, 28, L"Discord ≤25 MB", Gc(67, 56, 202), Gc(79, 70, 229), Gc(165, 180, 252), validSpan);
                 g.DrawString(trimBusy_
                     ? footerMsg_.c_str()
-                    : L"İpucu: Yeşil/turuncu tutamaçlarla baş/sonu, 'Ortadan Kes' ile kırmızı aralığı sürükleyip ortayı çıkarın.",
-                    -1, &fSmall, Gdiplus::RectF((float)S(254), (float)S(548), (float)S(632), (float)S(44)), &sfLeft, &brMuted);
+                    : L"İpucu: Seçili kesiti veya tüm klibi tek tıkla 10/25 MB Discord ya da 9:16 Dikey çıkarın.",
+                    -1, &fSmall, Gdiplus::RectF((float)S(520), (float)S(544), (float)S(366), (float)S(48)), &sfLeft, &brMuted);
             } else {
                 addBtn(BTN_PLY_EXTERNAL, 742, 566, 144, 30, L"Dış Oynatıcıda Aç", Gc(26, 32, 44), Gc(38, 46, 64), Gc(48, 58, 78));
                 g.DrawString(footerMsg_.c_str(), -1, &fSmall,
@@ -2803,7 +2811,13 @@ LRESULT MainWindow::OnMessage(UINT msg, WPARAM wParam, LPARAM lParam) {
                             if (editHasMultiTrack_) editMicMuted_ = !editMicMuted_;
                             InvalidateRect(hwnd_, nullptr, FALSE);
                             break;
-                        case BTN_TRIM_SAVE_COPY: StartTrimAsync(false); break;
+                        case BTN_EDIT_VERTICAL:
+                            editVertical916_ = !editVertical916_;
+                            InvalidateRect(hwnd_, nullptr, FALSE);
+                            break;
+                        case BTN_EDIT_DISCORD10: StartTrimAsync(false, 10); break;
+                        case BTN_EDIT_DISCORD25: StartTrimAsync(false, 25); break;
+                        case BTN_TRIM_SAVE_COPY: StartTrimAsync(false, 0); break;
                         case BTN_TRIM_REPLACE: StartTrimAsync(true); break;
                         case BTN_TRIM_CANCEL:
                             if (trimMode_) ToggleTrimMode();

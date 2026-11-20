@@ -1,6 +1,9 @@
 package com.anlikklip.mobile;
 
+import android.content.Intent;
 import android.content.pm.ActivityInfo;
+import androidx.core.content.FileProvider;
+import java.io.File;
 import android.media.MediaPlayer;
 import android.media.PlaybackParams;
 import android.net.Uri;
@@ -103,6 +106,7 @@ public class PlayerActivity extends AppCompatActivity {
         Button btnBack = findViewById(R.id.btnBack);
         TextView txtTitle = findViewById(R.id.txtPlayerTitle);
         Button btnToggleTrim = findViewById(R.id.btnToggleTrim);
+        Button btnShare10Mb = findViewById(R.id.btnShare10Mb);
         Button btnDownload = findViewById(R.id.btnPlayerDownload);
         FrameLayout videoContainer = findViewById(R.id.videoContainer);
         videoView = findViewById(R.id.videoView);
@@ -238,6 +242,34 @@ public class PlayerActivity extends AppCompatActivity {
                         btnTrimSave.setEnabled(true);
                         btnTrimSave.setText("✂ Kırp & Galeriye Kaydet");
                         Toast.makeText(this, "Kırpma hatası: " + e.getMessage(), Toast.LENGTH_LONG).show();
+                    });
+                }
+            });
+        });
+
+        btnShare10Mb.setOnClickListener(v -> {
+            btnShare10Mb.setEnabled(false);
+            btnShare10Mb.setText("Hazırlanıyor...");
+            executor.execute(() -> {
+                try {
+                    File sharedFile = DiscordCompressor.compressUrlTo10Mb(this, streamUrl, pin, file,
+                            msg -> runOnUiThread(() -> btnShare10Mb.setText(msg)));
+                    Uri contentUri = FileProvider.getUriForFile(
+                            this, getPackageName() + ".fileprovider", sharedFile);
+                    runOnUiThread(() -> {
+                        btnShare10Mb.setEnabled(true);
+                        btnShare10Mb.setText("10 MB Paylaş");
+                        Intent share = new Intent(Intent.ACTION_SEND);
+                        share.setType("video/mp4");
+                        share.putExtra(Intent.EXTRA_STREAM, contentUri);
+                        share.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);
+                        startActivity(Intent.createChooser(share, "Klibi Paylaş (≤10 MB)"));
+                    });
+                } catch (Exception e) {
+                    runOnUiThread(() -> {
+                        btnShare10Mb.setEnabled(true);
+                        btnShare10Mb.setText("10 MB Paylaş");
+                        Toast.makeText(this, "Sıkıştırma hatası: " + e.getMessage(), Toast.LENGTH_LONG).show();
                     });
                 }
             });

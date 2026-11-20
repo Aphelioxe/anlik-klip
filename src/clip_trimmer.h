@@ -23,6 +23,12 @@ struct ClipEditSpec {
     double speed = 1.0;
     int gameVolPct = 100;
     int micVolPct = 100;
+
+    // Optional target file size in MB (e.g. 10 or 25 for Discord; 0 = keep original)
+    int targetSizeMb = 0;
+
+    // Optional 9:16 vertical Shorts/Reels export (centered 16:9 gameplay + dimmed vertical background)
+    bool vertical916 = false;
 };
 
 /** Returns a non-colliding copy path alongside srcPath (e.g. "Clip_kesit.mp4"). */

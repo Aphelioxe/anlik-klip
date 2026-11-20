@@ -25,6 +25,101 @@ enum MenuId {
 
 const wchar_t* kTrayWndClass = L"AnlikKlipMainWnd";
 
+struct CornerToastData {
+    std::wstring title;
+    std::wstring sub;
+};
+
+LRESULT CALLBACK CornerToastProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+    auto* data = reinterpret_cast<CornerToastData*>(GetWindowLongPtrW(hwnd, GWLP_USERDATA));
+    switch (msg) {
+        case WM_NCCREATE: {
+            auto* cs = reinterpret_cast<CREATESTRUCTW*>(lParam);
+            SetWindowLongPtrW(hwnd, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(cs->lpCreateParams));
+            return TRUE;
+        }
+        case WM_TIMER:
+            DestroyWindow(hwnd);
+            return 0;
+        case WM_PAINT: {
+            PAINTSTRUCT ps{};
+            HDC hdc = BeginPaint(hwnd, &ps);
+            RECT rc{}; GetClientRect(hwnd, &rc);
+            HBRUSH bg = CreateSolidBrush(RGB(18, 23, 33));
+            FillRect(hdc, &rc, bg);
+            DeleteObject(bg);
+
+            RECT bar{ 0, 0, 5, rc.bottom };
+            HBRUSH acc = CreateSolidBrush(RGB(34, 197, 94));
+            FillRect(hdc, &bar, acc);
+            DeleteObject(acc);
+
+            HBRUSH brd = CreateSolidBrush(RGB(48, 60, 82));
+            FrameRect(hdc, &rc, brd);
+            DeleteObject(brd);
+
+            if (data) {
+                SetBkMode(hdc, TRANSPARENT);
+                HFONT fBold = CreateFontW(-14, 0, 0, 0, FW_BOLD, FALSE, FALSE, FALSE,
+                    DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
+                    DEFAULT_PITCH, L"Segoe UI");
+                HFONT fSmall = CreateFontW(-12, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
+                    DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
+                    DEFAULT_PITCH, L"Segoe UI");
+                HGDIOBJ oldF = SelectObject(hdc, fBold);
+                SetTextColor(hdc, RGB(240, 246, 252));
+                RECT tr{ 14, 8, rc.right - 10, 28 };
+                DrawTextW(hdc, data->title.c_str(), -1, &tr, DT_LEFT | DT_SINGLELINE | DT_END_ELLIPSIS);
+                SelectObject(hdc, fSmall);
+                SetTextColor(hdc, RGB(154, 165, 180));
+                RECT sr{ 14, 28, rc.right - 10, rc.bottom - 6 };
+                DrawTextW(hdc, data->sub.c_str(), -1, &sr, DT_LEFT | DT_SINGLELINE | DT_END_ELLIPSIS);
+                SelectObject(hdc, oldF);
+                DeleteObject(fBold);
+                DeleteObject(fSmall);
+            }
+            EndPaint(hwnd, &ps);
+            return 0;
+        }
+        case WM_NCDESTROY:
+            delete data;
+            SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
+            return 0;
+    }
+    return DefWindowProcW(hwnd, msg, wParam, lParam);
+}
+
+void ShowCornerToast(HINSTANCE hInst, const std::wstring& title, const std::wstring& sub) {
+    static bool reg = false;
+    const wchar_t* cls = L"AnlikKlipCornerToast";
+    if (!reg) {
+        WNDCLASSEXW wc{};
+        wc.cbSize = sizeof(wc);
+        wc.lpfnWndProc = CornerToastProc;
+        wc.hInstance = hInst;
+        wc.lpszClassName = cls;
+        RegisterClassExW(&wc);
+        reg = true;
+    }
+    RECT wa{};
+    SystemParametersInfoW(SPI_GETWORKAREA, 0, &wa, 0);
+    const int w = 310, h = 56;
+    const int x = wa.right - w - 18;
+    const int y = wa.top + 18;
+
+    auto* d = new CornerToastData{ title, sub };
+    HWND hw = CreateWindowExW(
+        WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_LAYERED,
+        cls, L"", WS_POPUP, x, y, w, h, nullptr, nullptr, hInst, d);
+    if (!hw) {
+        delete d;
+        return;
+    }
+    SetLayeredWindowAttributes(hw, 0, 240, LWA_ALPHA);
+    ShowWindow(hw, SW_SHOWNOACTIVATE);
+    SetTimer(hw, 1, 2000, nullptr);
+}
+
 } // namespace
 
 TrayUI::TrayUI(HINSTANCE hInst, RecorderApp& app)
@@ -360,7 +455,9 @@ LRESULT TrayUI::OnMessage(UINT msg, WPARAM wParam, LPARAM lParam) {
             if (res) {
                 if (res->ok) {
                     if (app_.Config().soundNotify) PlayClipChime();
-                    ShowBalloon(L"Anlık Klip", res->message.c_str(), NIIF_INFO);
+                    size_t sl = res->filePath.find_last_of(L"\\/");
+                    std::wstring fname = (sl != std::wstring::npos) ? res->filePath.substr(sl + 1) : res->filePath;
+                    ShowCornerToast(hInst_, L"✓  Klip Kaydedildi", fname + L"  (" + res->message + L")");
                 } else {
                     if (app_.Config().soundNotify) PlayErrorTone();
                     ShowBalloon(L"Anlık Klip Hatası", res->message.c_str(), NIIF_WARNING);

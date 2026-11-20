@@ -336,6 +336,41 @@ bool EditMp4Clip(const ClipEditSpec& spec, std::string& outError,
     avgBr = std::max<uint32_t>(2500000u, std::min<uint32_t>(20000000u, avgBr));
     probeSr.Reset();
 
+    double totalOutDurSec = 0.0;
+    for (const auto& sg : segments) {
+        totalOutDurSec += std::max(0.0, sg.endSec - sg.startSec) / speed;
+    }
+    if (totalOutDurSec < 0.2) totalOutDurSec = 0.2;
+
+    UINT32 outW = srcW, outH = srcH, outFpsN = fpsN, outFpsD = fpsD, outBr = avgBr;
+    const bool isDiscordExport = (spec.targetSizeMb > 0);
+    if (spec.vertical916) {
+        outW = (srcH >= 1080) ? 1080u : 720u;
+        outH = (srcH >= 1080) ? 1920u : 1280u;
+    }
+    if (isDiscordExport) {
+        const double targetBits = static_cast<double>(spec.targetSizeMb) * 8.0 * 1024.0 * 1024.0 * 0.88;
+        const double audioBits = foundA ? (96000.0 * totalOutDurSec) : 0.0;
+        double vBpsD = (targetBits - audioBits) / totalOutDurSec;
+        uint32_t vBps = static_cast<uint32_t>(std::max(450000.0, std::min(12000000.0, vBpsD)));
+        if (vBps < 2000000u) {
+            if (!spec.vertical916 && outH > 720) {
+                outW = 1280;
+                outH = 720;
+            } else if (spec.vertical916 && outW > 720) {
+                outW = 720;
+                outH = 1280;
+            }
+            if ((outFpsN / outFpsD) > 30) {
+                outFpsN = 30;
+                outFpsD = 1;
+            }
+        }
+        outBr = vBps;
+    }
+    const bool needVp = (outW != srcW || outH != srcH || spec.vertical916);
+    const bool dropHalfFps = ((fpsN / fpsD) >= 50 && (outFpsN / outFpsD) <= 30);
+
     std::wstring tmpPath = spec.dstPath + L".tmp.mp4";
     DeleteFileW(tmpPath.c_str());
 
@@ -366,9 +401,9 @@ bool EditMp4Clip(const ClipEditSpec& spec, std::string& outError,
     MFCreateMediaType(outV.Put());
     outV->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Video);
     outV->SetGUID(MF_MT_SUBTYPE, MFVideoFormat_H264);
-    outV->SetUINT32(MF_MT_AVG_BITRATE, avgBr);
-    MFSetAttributeSize(outV.Get(), MF_MT_FRAME_SIZE, srcW, srcH);
-    MFSetAttributeRatio(outV.Get(), MF_MT_FRAME_RATE, fpsN, fpsD);
+    outV->SetUINT32(MF_MT_AVG_BITRATE, outBr);
+    MFSetAttributeSize(outV.Get(), MF_MT_FRAME_SIZE, outW, outH);
+    MFSetAttributeRatio(outV.Get(), MF_MT_FRAME_RATE, outFpsN, outFpsD);
     outV->SetUINT32(MF_MT_MPEG2_PROFILE, eAVEncH264VProfile_High);
     setColorAttrs(outV.Get());
 
@@ -379,8 +414,8 @@ bool EditMp4Clip(const ClipEditSpec& spec, std::string& outError,
         MFCreateMediaType(inV.Put());
         inV->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Video);
         inV->SetGUID(MF_MT_SUBTYPE, MFVideoFormat_NV12);
-        MFSetAttributeSize(inV.Get(), MF_MT_FRAME_SIZE, srcW, srcH);
-        MFSetAttributeRatio(inV.Get(), MF_MT_FRAME_RATE, fpsN, fpsD);
+        MFSetAttributeSize(inV.Get(), MF_MT_FRAME_SIZE, outW, outH);
+        MFSetAttributeRatio(inV.Get(), MF_MT_FRAME_RATE, outFpsN, outFpsD);
         setColorAttrs(inV.Get());
         hr = sw->SetInputMediaType(vOutIdx, inV.Get(), nullptr);
     }
@@ -392,8 +427,8 @@ bool EditMp4Clip(const ClipEditSpec& spec, std::string& outError,
 
     DWORD aOutMix = 0, aOutGame = 0, aOutMic = 0;
     bool hasOutMix = foundA && AddAacOutputStream(sw.Get(), aOutMix);
-    bool hasOutGame = hasOutMix && srcMultiTrack && AddAacOutputStream(sw.Get(), aOutGame);
-    bool hasOutMic = hasOutGame && AddAacOutputStream(sw.Get(), aOutMic);
+    bool hasOutGame = !isDiscordExport && hasOutMix && srcMultiTrack && AddAacOutputStream(sw.Get(), aOutGame);
+    bool hasOutMic = !isDiscordExport && hasOutGame && AddAacOutputStream(sw.Get(), aOutMic);
 
     {
         ComPtr<ICodecAPI> encCodec;
@@ -401,7 +436,7 @@ bool EditMp4Clip(const ClipEditSpec& spec, std::string& outError,
             VARIANT v;
             VariantInit(&v);
             v.vt = VT_UI4;
-            v.ulVal = std::max<uint32_t>(1u, fpsN / fpsD);
+            v.ulVal = std::max<uint32_t>(1u, outFpsN / outFpsD);
             encCodec->SetValue(&CODECAPI_AVEncMPVGOPSize, &v);
         }
     }
@@ -413,10 +448,18 @@ bool EditMp4Clip(const ClipEditSpec& spec, std::string& outError,
     }
 
     ComPtr<ID3D11Texture2D> stgTex;
+    ComPtr<ID3D11VideoDevice> vdev;
+    ComPtr<ID3D11VideoContext> vctx;
+    ComPtr<ID3D11VideoProcessorEnumerator> vpEnum;
+    ComPtr<ID3D11VideoProcessor> vp;
+    ComPtr<ID3D11Texture2D> vpInTex, vpOutTex;
+    ComPtr<ID3D11VideoProcessorInputView> vpInView;
+    ComPtr<ID3D11VideoProcessorOutputView> vpOutView;
+
     if (dev) {
         D3D11_TEXTURE2D_DESC sd{};
-        sd.Width = srcW;
-        sd.Height = srcH;
+        sd.Width = outW;
+        sd.Height = outH;
         sd.MipLevels = 1;
         sd.ArraySize = 1;
         sd.Format = DXGI_FORMAT_NV12;
@@ -424,6 +467,33 @@ bool EditMp4Clip(const ClipEditSpec& spec, std::string& outError,
         sd.Usage = D3D11_USAGE_STAGING;
         sd.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
         dev->CreateTexture2D(&sd, nullptr, stgTex.Put());
+
+        if (needVp && SUCCEEDED(dev->QueryInterface(__uuidof(ID3D11VideoDevice), vdev.PutVoid())) &&
+            ctx && SUCCEEDED(ctx->QueryInterface(__uuidof(ID3D11VideoContext), vctx.PutVoid()))) {
+            D3D11_VIDEO_PROCESSOR_CONTENT_DESC cd{};
+            cd.InputFrameFormat = D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE;
+            cd.InputWidth = srcW; cd.InputHeight = srcH;
+            cd.OutputWidth = outW; cd.OutputHeight = outH;
+            cd.Usage = D3D11_VIDEO_USAGE_PLAYBACK_NORMAL;
+            if (SUCCEEDED(vdev->CreateVideoProcessorEnumerator(&cd, vpEnum.Put())) && vpEnum) {
+                vdev->CreateVideoProcessor(vpEnum.Get(), 0, vp.Put());
+            }
+            D3D11_TEXTURE2D_DESC td{};
+            td.Width = srcW; td.Height = srcH; td.MipLevels = 1; td.ArraySize = 1;
+            td.Format = DXGI_FORMAT_NV12; td.SampleDesc.Count = 1;
+            td.Usage = D3D11_USAGE_DEFAULT; td.BindFlags = D3D11_BIND_DECODER;
+            dev->CreateTexture2D(&td, nullptr, vpInTex.Put());
+            td.Width = outW; td.Height = outH; td.BindFlags = D3D11_BIND_RENDER_TARGET;
+            dev->CreateTexture2D(&td, nullptr, vpOutTex.Put());
+            if (vp && vpEnum && vpInTex && vpOutTex) {
+                D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC ivd{};
+                ivd.ViewDimension = D3D11_VPIV_DIMENSION_TEXTURE2D;
+                vdev->CreateVideoProcessorInputView(vpInTex.Get(), vpEnum.Get(), &ivd, vpInView.Put());
+                D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC ovd{};
+                ovd.ViewDimension = D3D11_VPOV_DIMENSION_TEXTURE2D;
+                vdev->CreateVideoProcessorOutputView(vpOutTex.Get(), vpEnum.Get(), &ovd, vpOutView.Put());
+            }
+        }
     }
 
     const LONGLONG defaultVDur = (10000000LL * fpsD) / fpsN;
@@ -510,6 +580,7 @@ bool EditMp4Clip(const ClipEditSpec& spec, std::string& outError,
         bool vDone = false;
         bool aDone[3] = { !segHasAudio, !segHasGameMic, !segHasGameMic };
         std::vector<int16_t> segPcm[3];
+        int segVRead = 0;
 
         while ((!vDone || !aDone[0] || !aDone[1] || !aDone[2]) && !aborted) {
             if (cancelFlag && cancelFlag->load()) { aborted = true; break; }
@@ -545,10 +616,14 @@ bool EditMp4Clip(const ClipEditSpec& spec, std::string& outError,
             if (ts + dur <= start100) continue;
 
             if (streamIdx == vIn && !vDone) {
+                if (dropHalfFps && ((segVRead++ & 1) != 0)) {
+                    continue;
+                }
                 LONGLONG relIn = std::max(0LL, ts - start100);
                 LONGLONG newTs = outVBase100 + static_cast<LONGLONG>(static_cast<double>(relIn) / speed);
                 if (newTs <= lastOutVTs) newTs = lastOutVTs + 1;
                 LONGLONG effDur = (ts < start100) ? (ts + dur - start100) : dur;
+                if (dropHalfFps) effDur *= 2;
                 LONGLONG newDur = std::max<LONGLONG>(1, static_cast<LONGLONG>(static_cast<double>(effDur) / speed));
                 if (newTs + newDur > outVBase100 + outSpan100) {
                     newDur = (outVBase100 + outSpan100) - newTs;
@@ -560,7 +635,76 @@ bool EditMp4Clip(const ClipEditSpec& spec, std::string& outError,
                 if (!outSmp) continue;
                 outSmp->SetSampleTime(newTs);
                 outSmp->SetSampleDuration(newDur);
-                if (!CopyVideoSampleBuffer(ctx.Get(), stgTex.Get(), smp.Get(), srcW, srcH, outSmp.Get())) continue;
+
+                bool copied = false;
+                if (needVp && vp && vctx && vpInTex && vpOutTex && vpInView && vpOutView && stgTex) {
+                    ComPtr<IMFMediaBuffer> buf;
+                    ComPtr<IMFDXGIBuffer> db;
+                    ComPtr<ID3D11Texture2D> dtex;
+                    UINT sub = 0;
+                    if (SUCCEEDED(smp->GetBufferByIndex(0, buf.Put())) && buf &&
+                        SUCCEEDED(buf->QueryInterface(__uuidof(IMFDXGIBuffer), db.PutVoid())) &&
+                        SUCCEEDED(db->GetResource(__uuidof(ID3D11Texture2D), dtex.PutVoid()))) {
+                        db->GetSubresourceIndex(&sub);
+                        D3D11_BOX box{ 0, 0, 0, srcW, srcH, 1 };
+                        ctx->CopySubresourceRegion(vpInTex.Get(), 0, 0, 0, 0, dtex.Get(), sub, &box);
+
+                        if (spec.vertical916) {
+                            LONG cropW = std::max<LONG>(16, (static_cast<LONG>(srcH) * static_cast<LONG>(outW)) / static_cast<LONG>(outH));
+                            LONG cropX = std::max<LONG>(0, (static_cast<LONG>(srcW) - cropW) / 2);
+                            RECT bgSrc{ cropX, 0, cropX + cropW, static_cast<LONG>(srcH) };
+                            RECT dstFull{ 0, 0, static_cast<LONG>(outW), static_cast<LONG>(outH) };
+                            LONG fgH = (static_cast<LONG>(outW) * static_cast<LONG>(srcH)) / static_cast<LONG>(srcW);
+                            LONG fgY = std::max<LONG>(0, (static_cast<LONG>(outH) - fgH) / 2);
+                            RECT fgSrc{ 0, 0, static_cast<LONG>(srcW), static_cast<LONG>(srcH) };
+                            RECT fgDst{ 0, fgY, static_cast<LONG>(outW), fgY + fgH };
+
+                            vctx->VideoProcessorSetStreamSourceRect(vp.Get(), 0, TRUE, &bgSrc);
+                            vctx->VideoProcessorSetStreamDestRect(vp.Get(), 0, TRUE, &dstFull);
+                            vctx->VideoProcessorSetStreamSourceRect(vp.Get(), 1, TRUE, &fgSrc);
+                            vctx->VideoProcessorSetStreamDestRect(vp.Get(), 1, TRUE, &fgDst);
+
+                            D3D11_VIDEO_PROCESSOR_STREAM streams[2]{};
+                            streams[0].Enable = TRUE; streams[0].pInputSurface = vpInView.Get();
+                            streams[1].Enable = TRUE; streams[1].pInputSurface = vpInView.Get();
+                            vctx->VideoProcessorBlt(vp.Get(), vpOutView.Get(), 0, 2, streams);
+                        } else {
+                            RECT srcFull{ 0, 0, static_cast<LONG>(srcW), static_cast<LONG>(srcH) };
+                            RECT dstFull{ 0, 0, static_cast<LONG>(outW), static_cast<LONG>(outH) };
+                            vctx->VideoProcessorSetStreamSourceRect(vp.Get(), 0, TRUE, &srcFull);
+                            vctx->VideoProcessorSetStreamDestRect(vp.Get(), 0, TRUE, &dstFull);
+                            D3D11_VIDEO_PROCESSOR_STREAM st{};
+                            st.Enable = TRUE; st.pInputSurface = vpInView.Get();
+                            vctx->VideoProcessorBlt(vp.Get(), vpOutView.Get(), 0, 1, &st);
+                        }
+
+                        ctx->CopyResource(stgTex.Get(), vpOutTex.Get());
+                        D3D11_MAPPED_SUBRESOURCE mapped{};
+                        if (SUCCEEDED(ctx->Map(stgTex.Get(), 0, D3D11_MAP_READ, 0, &mapped))) {
+                            const DWORD nvLen = (outW * outH * 3) / 2;
+                            ComPtr<IMFMediaBuffer> ob;
+                            if (SUCCEEDED(MFCreateMemoryBuffer(nvLen, ob.Put())) && ob) {
+                                BYTE* dst = nullptr;
+                                if (SUCCEEDED(ob->Lock(&dst, nullptr, nullptr))) {
+                                    const BYTE* srcY = reinterpret_cast<const BYTE*>(mapped.pData);
+                                    for (uint32_t y = 0; y < outH; ++y) memcpy(dst + y * outW, srcY + y * mapped.RowPitch, outW);
+                                    const BYTE* srcUV = srcY + outH * mapped.RowPitch;
+                                    BYTE* dstUV = dst + outW * outH;
+                                    for (uint32_t y = 0; y < outH / 2; ++y) memcpy(dstUV + y * outW, srcUV + y * mapped.RowPitch, outW);
+                                    ob->Unlock();
+                                    ob->SetCurrentLength(nvLen);
+                                    outSmp->AddBuffer(ob.Get());
+                                    copied = true;
+                                }
+                            }
+                            ctx->Unmap(stgTex.Get(), 0);
+                        }
+                    }
+                }
+                if (!copied && !needVp) {
+                    copied = CopyVideoSampleBuffer(ctx.Get(), stgTex.Get(), smp.Get(), outW, outH, outSmp.Get());
+                }
+                if (!copied) continue;
                 if (SUCCEEDED(sw->WriteSample(vOutIdx, outSmp.Get()))) {
                     lastOutVTs = newTs;
                     ++vWritten;

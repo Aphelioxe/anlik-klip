@@ -223,6 +223,18 @@
                 android:textColor="@color/text_secondary"
                 android:textSize="12sp" />
         </LinearLayout>
+
+        <TextView
+            android:id="@+id/txtStatsSummary"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginBottom="8dp"
+            android:background="@drawable/bg_card"
+            android:paddingHorizontal="12dp"
+            android:paddingVertical="7dp"
+            android:text="0 klip • 0 MB"
+            android:textColor="@color/text_secondary"
+            android:textSize="12sp" />
     </LinearLayout>
 
     <!-- Clip List + Empty State -->

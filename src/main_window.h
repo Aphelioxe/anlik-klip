@@ -71,7 +71,7 @@ private:
     void UpdatePlayerMetrics();
     void TogglePlayerFullscreen();
     void ToggleTrimMode();
-    void StartTrimAsync(bool replaceOriginal);
+    void StartTrimAsync(bool replaceOriginal, int targetSizeMb = 0);
     void StopTrimWorker();
     void PickInsertClip();
     RECT GetSeekBarRect() const;
@@ -169,6 +169,7 @@ private:
     bool draggingEditGameVol_ = false;
     bool draggingEditMicVol_ = false;
     double editSpeed_ = 1.0;
+    bool editVertical916_ = false;
     std::wstring editInsertClipPath_;
     bool trimBusy_ = false;
     std::atomic<bool> trimCancel_{false};

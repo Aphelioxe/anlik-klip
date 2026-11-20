@@ -10,22 +10,23 @@
 #include <cstdio>
 #include <cstring>
 
-std::wstring BuildUniqueClipPath(const std::wstring& outputDir) {
+std::wstring BuildUniqueClipPath(const std::wstring& outputDir, const std::wstring& prefix) {
     EnsureDirectoryExists(outputDir);
     SYSTEMTIME st{};
     GetLocalTime(&st);
 
-    wchar_t base[128] = {};
-    swprintf(base, 128, L"Klip_%04u-%02u-%02u_%02u-%02u-%02u",
-        st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond);
+    std::wstring cleanPrefix = prefix.empty() ? L"Klip" : prefix;
+    wchar_t base[160] = {};
+    swprintf(base, 160, L"%ls_%04u-%02u-%02u_%02u-%02u-%02u",
+        cleanPrefix.c_str(), st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond);
 
     std::wstring path = outputDir + L"\\" + base + L".mp4";
     if (GetFileAttributesW(path.c_str()) == INVALID_FILE_ATTRIBUTES) {
         return path;
     }
     for (int i = 2; i < 1000; ++i) {
-        wchar_t cand[160] = {};
-        swprintf(cand, 160, L"%ls_%d.mp4", base, i);
+        wchar_t cand[192] = {};
+        swprintf(cand, 192, L"%ls_%d.mp4", base, i);
         path = outputDir + L"\\" + cand;
         if (GetFileAttributesW(path.c_str()) == INVALID_FILE_ATTRIBUTES) {
             return path;

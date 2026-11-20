@@ -110,9 +110,10 @@ public class ClipAdapter extends RecyclerView.Adapter<ClipAdapter.Holder> {
         holder.txtSelectedBadge.setVisibility(isSelected ? View.VISIBLE : View.GONE);
 
         holder.txtTitle.setText(item.fileName);
-        holder.txtMeta.setText(item.date + " • " + item.getFormattedSize());
+        holder.txtMeta.setText(item.date + " • " + item.getFormattedSize() + " • " + item.getFormattedDuration());
         holder.txtDuration.setText(item.getFormattedDuration());
-        holder.txtResBadge.setText(item.getResolutionLabel());
+        String tag = extractGameTag(item.fileName);
+        holder.txtResBadge.setText(tag.isEmpty() ? item.getResolutionLabel() : (tag + " • " + item.getResolutionLabel()));
         holder.txtFavBadge.setVisibility(item.isFavorite ? View.VISIBLE : View.GONE);
 
         if (item.downloading) {
@@ -175,6 +176,15 @@ public class ClipAdapter extends RecyclerView.Adapter<ClipAdapter.Holder> {
         }
         notifyDataSetChanged();
         listener.onSelectionChanged(selectedFiles.size(), selectionMode);
+    }
+
+    private static String extractGameTag(String fileName) {
+        if (fileName == null) return "";
+        int us = fileName.indexOf('_');
+        if (us <= 1 || us > 20) return "";
+        String prefix = fileName.substring(0, us);
+        if ("Klip".equalsIgnoreCase(prefix)) return "";
+        return prefix;
     }
 
     @Override
