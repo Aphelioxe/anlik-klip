@@ -41,9 +41,12 @@ bool IsH264IDR(const uint8_t* p, size_t n) {
 struct DesktopCapture {
     ComPtr<IDXGIOutputDuplication> dupl;
     ComPtr<ID3D11Texture2D> srcCopyTex;
+    ComPtr<ID3D11Texture2D> composeTex;
+    ComPtr<IDXGISurface1> composeSurf1;
     ComPtr<ID3D11VideoProcessorEnumerator> vpEnum;
     ComPtr<ID3D11VideoProcessor> vp;
     ComPtr<ID3D11VideoProcessorInputView> inView;
+    RECT monRect{};
     uint32_t srcW = 0;
     uint32_t srcH = 0;
     bool hasFrame = false;
@@ -55,9 +58,12 @@ struct DesktopCapture {
     void ReleaseAll() {
         dupl.Reset();
         inView.Reset();
+        composeSurf1.Reset();
+        composeTex.Reset();
         srcCopyTex.Reset();
         vp.Reset();
         vpEnum.Reset();
+        monRect = {};
         srcW = 0;
         srcH = 0;
         hasFrame = false;
@@ -75,6 +81,11 @@ struct DesktopCapture {
 
         ComPtr<IDXGIOutput> output;
         if (FAILED(adapter->EnumOutputs(0, output.Put())) || !output) return false;
+
+        DXGI_OUTPUT_DESC od{};
+        if (SUCCEEDED(output->GetDesc(&od))) {
+            monRect = od.DesktopCoordinates;
+        }
 
         ComPtr<IDXGIOutput1> output1;
         if (FAILED(output->QueryInterface(__uuidof(IDXGIOutput1), output1.PutVoid())) || !output1) return false;
@@ -94,8 +105,10 @@ struct DesktopCapture {
             return false;
         }
 
-        if (newW != srcW || newH != srcH || !vp || !inView || !srcCopyTex) {
+        if (newW != srcW || newH != srcH || !vp || !inView || !srcCopyTex || !composeTex) {
             inView.Reset();
+            composeSurf1.Reset();
+            composeTex.Reset();
             srcCopyTex.Reset();
             vp.Reset();
             vpEnum.Reset();
@@ -117,6 +130,18 @@ struct DesktopCapture {
                 return false;
             }
 
+            D3D11_TEXTURE2D_DESC cd = sd;
+            cd.MiscFlags = D3D11_RESOURCE_MISC_GDI_COMPATIBLE;
+            if (SUCCEEDED(dev->CreateTexture2D(&cd, nullptr, composeTex.Put())) && composeTex) {
+                composeTex->QueryInterface(__uuidof(IDXGISurface1), composeSurf1.PutVoid());
+            } else {
+                composeTex.Reset();
+                if (FAILED(dev->CreateTexture2D(&sd, nullptr, composeTex.Put()))) {
+                    ReleaseAll();
+                    return false;
+                }
+            }
+
             D3D11_VIDEO_PROCESSOR_CONTENT_DESC vcd{};
             vcd.InputFrameFormat = D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE;
             vcd.InputWidth = srcW;
@@ -134,9 +159,15 @@ struct DesktopCapture {
 
             D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC ivd{};
             ivd.ViewDimension = D3D11_VPIV_DIMENSION_TEXTURE2D;
-            if (FAILED(vdev->CreateVideoProcessorInputView(srcCopyTex.Get(), vpEnum.Get(), &ivd, inView.Put()))) {
-                ReleaseAll();
-                return false;
+            if (FAILED(vdev->CreateVideoProcessorInputView(composeTex.Get(), vpEnum.Get(), &ivd, inView.Put()))) {
+                // Fallback without GDI_COMPATIBLE if driver forbids it on VideoProcessorInputView
+                composeSurf1.Reset();
+                composeTex.Reset();
+                if (FAILED(dev->CreateTexture2D(&sd, nullptr, composeTex.Put())) ||
+                    FAILED(vdev->CreateVideoProcessorInputView(composeTex.Get(), vpEnum.Get(), &ivd, inView.Put()))) {
+                    ReleaseAll();
+                    return false;
+                }
             }
 
             // Aspect-ratio preserving destination rect
@@ -205,6 +236,36 @@ struct DesktopCapture {
             dupl->ReleaseFrame();
         }
         return true;
+    }
+
+    void PrepareFrameWithCursor(ID3D11DeviceContext* ctx) {
+        if (!ctx || !srcCopyTex || !composeTex) return;
+        ctx->CopyResource(composeTex.Get(), srcCopyTex.Get());
+        if (!composeSurf1) return;
+
+        CURSORINFO ci{};
+        ci.cbSize = sizeof(ci);
+        if (!GetCursorInfo(&ci) || !(ci.flags & CURSOR_SHOWING) || !ci.hCursor) return;
+
+        int cx = ci.ptScreenPos.x - monRect.left;
+        int cy = ci.ptScreenPos.y - monRect.top;
+        if (cx < -64 || cy < -64 || cx > static_cast<int>(srcW) + 64 || cy > static_cast<int>(srcH) + 64) {
+            return;
+        }
+
+        ICONINFO ii{};
+        if (GetIconInfo(ci.hCursor, &ii)) {
+            cx -= static_cast<int>(ii.xHotspot);
+            cy -= static_cast<int>(ii.yHotspot);
+            if (ii.hbmMask) DeleteObject(ii.hbmMask);
+            if (ii.hbmColor) DeleteObject(ii.hbmColor);
+        }
+
+        HDC hdc = nullptr;
+        if (SUCCEEDED(composeSurf1->GetDC(FALSE, &hdc)) && hdc) {
+            DrawIconEx(hdc, cx, cy, ci.hCursor, 0, 0, 0, nullptr, DI_NORMAL | DI_DEFAULTSIZE);
+            composeSurf1->ReleaseDC(nullptr);
+        }
     }
 };
 
@@ -605,6 +666,8 @@ void VideoEngine::ThreadMain(int64_t masterStartQpc, uint32_t dstW, uint32_t dst
             ++frameIdx;
             continue;
         }
+
+        cap.PrepareFrameWithCursor(ctx.Get());
 
         D3D11_VIDEO_PROCESSOR_STREAM stream{};
         stream.Enable = TRUE;
