@@ -2055,7 +2055,8 @@ void MainWindow::PaintWindow(HDC targetDc) {
         wchar_t v1[32], v2[32], v3[32], t4[64];
         swprintf(v1, 32, L"%.1f MB", st.workingSetMb);
         swprintf(v2, 32, L"%.1f MB", bufMb);
-        swprintf(v3, 32, L"%.0f / %d sn", st.ring.bufferedSeconds, app_.Config().clipSeconds);
+        double dispSec = std::max(0.0, std::min(st.ring.bufferedSeconds, static_cast<double>(app_.Config().clipSeconds)));
+        swprintf(v3, 32, L"%.0f / %d sn", dispSec, app_.Config().clipSeconds);
         std::wstring hk = FormatHotkey(app_.Config().hotkeyMods, app_.Config().hotkeyVk);
         swprintf(t4, 64, L"Kısayol: %ls", hk.c_str());
         g.DrawString(L"RAM", -1, &fSmall, Gdiplus::RectF((float)S(28), (float)(telY + S(10)), (float)S(72), (float)S(20)), &sfLeft, &brMuted);
