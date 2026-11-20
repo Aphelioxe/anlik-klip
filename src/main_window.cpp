@@ -1482,8 +1482,13 @@ void MainWindow::CyclePlayerRate() {
     else if (playerRate_ < 1.75f) playerRate_ = 2.0f;
     else playerRate_ = 0.5f;
     if (player_) player_->SetRate(playerRate_);
-    RECT ctrlRc{ S(242), S(428), S(900), S(606) };
-    InvalidateRect(hwnd_, &ctrlRc, FALSE);
+    if (hwnd_) {
+        RECT cli{}; GetClientRect(hwnd_, &cli);
+        RECT ctrlRc = playerFullscreen_
+            ? RECT{ 0, std::max<LONG>(0, cli.bottom - S(72)), cli.right, cli.bottom }
+            : RECT{ S(236), std::max<LONG>(0, cli.bottom - S(276)), cli.right, cli.bottom };
+        InvalidateRect(hwnd_, &ctrlRc, FALSE);
+    }
 }
 
 void MainWindow::UpdatePlayerMetrics() {
@@ -1500,8 +1505,13 @@ void MainWindow::UpdatePlayerMetrics() {
     if (SUCCEEDED(player_->GetState(&st))) {
         playerPlaying_ = (st == MFP_MEDIAPLAYER_STATE_PLAYING);
     }
-    RECT ctrlRc{ S(242), S(428), S(900), S(606) };
-    InvalidateRect(hwnd_, &ctrlRc, FALSE);
+    if (hwnd_) {
+        RECT cli{}; GetClientRect(hwnd_, &cli);
+        RECT ctrlRc = playerFullscreen_
+            ? RECT{ 0, std::max<LONG>(0, cli.bottom - S(72)), cli.right, cli.bottom }
+            : RECT{ S(236), std::max<LONG>(0, cli.bottom - S(276)), cli.right, cli.bottom };
+        InvalidateRect(hwnd_, &ctrlRc, FALSE);
+    }
 }
 
 RECT MainWindow::GetSeekBarRect() const {
@@ -2869,8 +2879,13 @@ LRESULT MainWindow::OnMessage(UINT msg, WPARAM wParam, LPARAM lParam) {
                         playerPlaying_ = false;
                         playerEnded_ = true;
                         playerPosSec_ = playerDurSec_;
-                        RECT ctrlRc{ S(242), S(428), S(900), S(606) };
-                        InvalidateRect(hwnd_, &ctrlRc, FALSE);
+                        if (hwnd_) {
+                            RECT cli{}; GetClientRect(hwnd_, &cli);
+                            RECT ctrlRc = playerFullscreen_
+                                ? RECT{ 0, std::max<LONG>(0, cli.bottom - S(72)), cli.right, cli.bottom }
+                                : RECT{ S(236), std::max<LONG>(0, cli.bottom - S(276)), cli.right, cli.bottom };
+                            InvalidateRect(hwnd_, &ctrlRc, FALSE);
+                        }
                     } else if (ev->type == MFP_EVENT_TYPE_PLAY) {
                         playerPlaying_ = true;
                         playerEnded_ = false;
