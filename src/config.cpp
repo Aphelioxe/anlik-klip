@@ -67,6 +67,10 @@ AppConfig LoadConfig(const std::wstring& iniPath) {
     cfg.soundNotify = GetPrivateProfileIntW(L"General", L"SoundNotify", 1, iniPath.c_str()) != 0;
     cfg.startMinimized = GetPrivateProfileIntW(L"General", L"StartMinimized", 1, iniPath.c_str()) != 0;
 
+    cfg.mobileSyncEnabled = GetPrivateProfileIntW(L"Mobile", L"Enabled", 0, iniPath.c_str()) != 0;
+    cfg.mobileSyncPort = ClampInt(GetPrivateProfileIntW(L"Mobile", L"Port", 47820, iniPath.c_str()), 1024, 65535);
+    cfg.mobilePin = ReadIniString(L"Mobile", L"Pin", L"", iniPath);
+
     EnsureDirectoryExists(cfg.outputDir);
     return cfg;
 }
@@ -101,6 +105,10 @@ bool SaveConfig(const std::wstring& iniPath, const AppConfig& cfg) {
     WritePrivateProfileStringW(L"General", L"OutputDir", cfg.outputDir.c_str(), iniPath.c_str());
     WriteIniInt(L"General", L"SoundNotify", cfg.soundNotify ? 1 : 0, iniPath);
     WriteIniInt(L"General", L"StartMinimized", cfg.startMinimized ? 1 : 0, iniPath);
+
+    WriteIniInt(L"Mobile", L"Enabled", cfg.mobileSyncEnabled ? 1 : 0, iniPath);
+    WriteIniInt(L"Mobile", L"Port", cfg.mobileSyncPort, iniPath);
+    WritePrivateProfileStringW(L"Mobile", L"Pin", cfg.mobilePin.c_str(), iniPath.c_str());
     return true;
 }
 

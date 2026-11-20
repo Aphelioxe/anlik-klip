@@ -2,6 +2,7 @@
 #include "clip_trimmer.h"
 #include "com_ptr.h"
 #include "hotkey_engine.h"
+#include "qr_code.h"
 #include "sound_fx.h"
 
 #include <objidl.h>
@@ -134,6 +135,8 @@ enum NativeCtrlId {
     ID_CHK_SOUND,
     ID_BTN_TEST_SOUND,
     ID_CHK_AUTOSTART,
+    ID_CHK_MOBILE_SYNC,
+    ID_BTN_MOBILE_QR,
     ID_BTN_APPLY,
     ID_BTN_EXIT_APP,
 
@@ -701,6 +704,8 @@ void MainWindow::CreateControls() {
     chkSound_ = makeChk(L"Klip alınca \"çıng\" bildirim sesi çal", 258, 432, 246, 22, ID_CHK_SOUND);
     btnTestSound_ = make(L"BUTTON", L"Sesi Test Et", BS_OWNERDRAW | WS_TABSTOP, 512, 429, 98, 26, ID_BTN_TEST_SOUND);
     chkAutoStart_ = makeChk(L"Windows açılışında arka planda başlat", 258, 466, 290, 22, ID_CHK_AUTOSTART);
+    chkMobileSync_ = makeChk(L"Telefon Aktarımı (Wi-Fi)", 620, 432, 148, 22, ID_CHK_MOBILE_SYNC);
+    btnShowQr_ = make(L"BUTTON", L"QR Kod / Bağlan", BS_OWNERDRAW | WS_TABSTOP, 772, 429, 110, 26, ID_BTN_MOBILE_QR);
 
     btnApply_ = make(L"BUTTON", L"Ayarları Kaydet ve Uygula", BS_OWNERDRAW | WS_TABSTOP, 242, 540, 224, 38, ID_BTN_APPLY);
     btnExitApp_ = make(L"BUTTON", L"Uygulamayı Tamamen Kapat", BS_OWNERDRAW | WS_TABSTOP, 684, 540, 214, 38, ID_BTN_EXIT_APP);
@@ -786,6 +791,7 @@ void MainWindow::LoadSettingsControls() {
     SetWindowTextW(edtOutDir_, cfg.outputDir.c_str());
     SendMessageW(chkSound_, BM_SETCHECK, cfg.soundNotify ? BST_CHECKED : BST_UNCHECKED, 0);
     SendMessageW(chkAutoStart_, BM_SETCHECK, IsAutoStartEnabled() ? BST_CHECKED : BST_UNCHECKED, 0);
+    SendMessageW(chkMobileSync_, BM_SETCHECK, cfg.mobileSyncEnabled ? BST_CHECKED : BST_UNCHECKED, 0);
 }
 
 void MainWindow::ReadSettingsControls(AppConfig& out) {
@@ -827,6 +833,7 @@ void MainWindow::ReadSettingsControls(AppConfig& out) {
     if (wcslen(dirBuf) > 0) out.outputDir = dirBuf;
 
     out.soundNotify = (SendMessageW(chkSound_, BM_GETCHECK, 0, 0) == BST_CHECKED);
+    out.mobileSyncEnabled = (SendMessageW(chkMobileSync_, BM_GETCHECK, 0, 0) == BST_CHECKED);
 }
 
 void MainWindow::ClearThumbnails() {
@@ -1961,6 +1968,23 @@ void MainWindow::PaintWindow(HDC targetDc) {
             g.DrawString(L"Oyun İçi Kısayol, Bildirim ve Klasör", -1, &fBold,
                 Gdiplus::RectF((float)S(258), (float)S(264), (float)S(340), (float)S(22)), &sfLeft, &brPurpTxt);
 
+            {
+                const AppConfig& mc = app_.Config();
+                wchar_t mobTxt[160] = {};
+                if (app_.IsMobileSyncRunning()) {
+                    swprintf(mobTxt, 160, L"Wi-Fi Aktif: %ls:%d  •  PIN: %ls",
+                        app_.GetMobileLanIp().c_str(), mc.mobileSyncPort, mc.mobilePin.c_str());
+                    Gdiplus::SolidBrush brMobOk(Gc(134, 239, 172));
+                    g.DrawString(mobTxt, -1, &fSmall,
+                        Gdiplus::RectF((float)S(560), (float)S(468), (float)S(326), (float)S(20)), &sfLeft, &brMobOk);
+                } else {
+                    std::wstring merr = app_.GetMobileError();
+                    const wchar_t* msg = !merr.empty() ? merr.c_str() : L"Telefon aktarımı kapalı (0 RAM)";
+                    g.DrawString(msg, -1, &fSmall,
+                        Gdiplus::RectF((float)S(560), (float)S(468), (float)S(326), (float)S(20)), &sfLeft, &brMuted);
+                }
+            }
+
             g.DrawString(footerMsg_.c_str(), -1, &fSmall,
                 Gdiplus::RectF((float)S(258), (float)S(498), (float)S(624), (float)S(20)), &sfLeft, &brMuted);
         }
@@ -2564,6 +2588,16 @@ LRESULT MainWindow::OnMessage(UINT msg, WPARAM wParam, LPARAM lParam) {
                 case ID_BTN_TEST_SOUND:
                     PlayClipChime();
                     break;
+                case ID_CHK_MOBILE_SYNC: {
+                    AppConfig cfg = app_.Config();
+                    cfg.mobileSyncEnabled = (SendMessageW(chkMobileSync_, BM_GETCHECK, 0, 0) == BST_CHECKED);
+                    if (cb_.onConfigApplied) cb_.onConfigApplied(cfg);
+                    InvalidateRect(hwnd_, nullptr, FALSE);
+                    break;
+                }
+                case ID_BTN_MOBILE_QR:
+                    ShowMobileQrModal();
+                    break;
                 case ID_BTN_APPLY: {
                     AppConfig newCfg;
                     ReadSettingsControls(newCfg);
@@ -2588,4 +2622,180 @@ LRESULT MainWindow::OnMessage(UINT msg, WPARAM wParam, LPARAM lParam) {
             return 0;
     }
     return DefWindowProcW(hwnd_, msg, wParam, lParam);
+}
+
+void MainWindow::ShowMobileQrModal() {
+    if (!app_.IsMobileSyncRunning()) {
+        AppConfig cfg = app_.Config();
+        cfg.mobileSyncEnabled = true;
+        if (chkMobileSync_) SendMessageW(chkMobileSync_, BM_SETCHECK, BST_CHECKED, 0);
+        if (cb_.onConfigApplied) cb_.onConfigApplied(cfg);
+        InvalidateRect(hwnd_, nullptr, FALSE);
+    }
+
+    struct QrModalState {
+        MainWindow* mw = nullptr;
+        HWND dlg = nullptr;
+        bool done = false;
+        QrCode::Matrix qr;
+        std::wstring url;
+        std::wstring ipPort;
+        std::wstring pin;
+    } st{ this };
+
+    auto refreshQr = [&]() {
+        st.url = app_.GetMobilePairUrl();
+        const AppConfig& mc = app_.Config();
+        wchar_t buf[96] = {};
+        swprintf(buf, 96, L"%ls:%d", app_.GetMobileLanIp().c_str(), mc.mobileSyncPort);
+        st.ipPort = buf;
+        st.pin = mc.mobilePin;
+        int n = WideCharToMultiByte(CP_UTF8, 0, st.url.c_str(), static_cast<int>(st.url.size()), nullptr, 0, nullptr, nullptr);
+        std::string utf8(n > 0 ? static_cast<size_t>(n) : 0, '\0');
+        if (n > 0) WideCharToMultiByte(CP_UTF8, 0, st.url.c_str(), static_cast<int>(st.url.size()), &utf8[0], n, nullptr, nullptr);
+        QrCode::Encode(utf8, st.qr);
+    };
+    refreshQr();
+
+    static const wchar_t* kQrCls = L"AnlikKlipQrModal";
+    static bool qrReg = false;
+    if (!qrReg) {
+        WNDCLASSEXW wc{};
+        wc.cbSize = sizeof(wc);
+        wc.lpfnWndProc = [](HWND h, UINT m, WPARAM wp, LPARAM lp) -> LRESULT {
+            auto* s = reinterpret_cast<QrModalState*>(GetWindowLongPtrW(h, GWLP_USERDATA));
+            if (m == WM_NCCREATE) {
+                auto* cs = reinterpret_cast<CREATESTRUCTW*>(lp);
+                s = reinterpret_cast<QrModalState*>(cs->lpCreateParams);
+                SetWindowLongPtrW(h, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(s));
+            }
+            if (!s) return DefWindowProcW(h, m, wp, lp);
+            switch (m) {
+                case WM_ERASEBKGND: return 1;
+                case WM_PAINT: {
+                    PAINTSTRUCT ps{};
+                    HDC hdc = BeginPaint(h, &ps);
+                    RECT rc{}; GetClientRect(h, &rc);
+                    Gdiplus::Graphics g(hdc);
+                    g.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
+                    Gdiplus::SolidBrush bg(Gdiplus::Color(255, 16, 20, 29));
+                    g.FillRectangle(&bg, 0, 0, rc.right, rc.bottom);
+
+                    int qrBox = s->mw->S(220);
+                    int qrX = (rc.right - qrBox) / 2;
+                    int qrY = s->mw->S(48);
+                    Gdiplus::SolidBrush whiteBr(Gdiplus::Color(255, 255, 255, 255));
+                    g.FillRectangle(&whiteBr, qrX, qrY, qrBox, qrBox);
+                    if (s->qr.size > 0) {
+                        int quiet = 3;
+                        int totalMod = s->qr.size + quiet * 2;
+                        float cell = static_cast<float>(qrBox) / static_cast<float>(totalMod);
+                        Gdiplus::SolidBrush darkBr(Gdiplus::Color(255, 12, 16, 24));
+                        for (int y = 0; y < s->qr.size; ++y) {
+                            for (int x = 0; x < s->qr.size; ++x) {
+                                if (s->qr.Get(x, y)) {
+                                    g.FillRectangle(&darkBr,
+                                        qrX + (x + quiet) * cell,
+                                        qrY + (y + quiet) * cell,
+                                        cell + 0.4f, cell + 0.4f);
+                                }
+                            }
+                        }
+                    }
+
+                    Gdiplus::FontFamily ff(L"Segoe UI");
+                    Gdiplus::Font fTitle(&ff, 12.0f, Gdiplus::FontStyleBold, Gdiplus::UnitPoint);
+                    Gdiplus::Font fInfo(&ff, 10.5f, Gdiplus::FontStyleBold, Gdiplus::UnitPoint);
+                    Gdiplus::Font fSub(&ff, 8.8f, Gdiplus::FontStyleRegular, Gdiplus::UnitPoint);
+                    Gdiplus::StringFormat sfC;
+                    sfC.SetAlignment(Gdiplus::StringAlignmentCenter);
+                    Gdiplus::SolidBrush txtBr(Gdiplus::Color(255, 238, 242, 255));
+                    Gdiplus::SolidBrush pinBr(Gdiplus::Color(255, 134, 239, 172));
+                    Gdiplus::SolidBrush mutBr(Gdiplus::Color(255, 148, 163, 184));
+
+                    g.DrawString(L"Telefona Klipleri Aktar (Wi-Fi)", -1, &fTitle,
+                        Gdiplus::RectF(0, (float)s->mw->S(14), (float)rc.right, (float)s->mw->S(26)), &sfC, &txtBr);
+                    wchar_t line1[160] = {};
+                    swprintf(line1, 160, L"Adres: %ls   •   PIN: %ls", s->ipPort.c_str(), s->pin.c_str());
+                    g.DrawString(line1, -1, &fInfo,
+                        Gdiplus::RectF(0, (float)(qrY + qrBox + s->mw->S(14)), (float)rc.right, (float)s->mw->S(24)), &sfC, &pinBr);
+                    g.DrawString(L"Anlık Klip Android uygulamasından QR okutun veya\ntelefon tarayıcısında bu adresi açın.", -1, &fSub,
+                        Gdiplus::RectF((float)s->mw->S(16), (float)(qrY + qrBox + s->mw->S(42)),
+                            (float)(rc.right - s->mw->S(32)), (float)s->mw->S(38)), &sfC, &mutBr);
+
+                    EndPaint(h, &ps);
+                    return 0;
+                }
+                case WM_COMMAND:
+                    if (LOWORD(wp) == 9001) {
+                        s->mw->app_.RegenerateMobilePin();
+                        // Refresh parent settings & QR
+                        const AppConfig& mc = s->mw->app_.Config();
+                        s->url = s->mw->app_.GetMobilePairUrl();
+                        wchar_t buf[96] = {};
+                        swprintf(buf, 96, L"%ls:%d", s->mw->app_.GetMobileLanIp().c_str(), mc.mobileSyncPort);
+                        s->ipPort = buf;
+                        s->pin = mc.mobilePin;
+                        int n = WideCharToMultiByte(CP_UTF8, 0, s->url.c_str(), static_cast<int>(s->url.size()), nullptr, 0, nullptr, nullptr);
+                        std::string utf8(n > 0 ? static_cast<size_t>(n) : 0, '\0');
+                        if (n > 0) WideCharToMultiByte(CP_UTF8, 0, s->url.c_str(), static_cast<int>(s->url.size()), &utf8[0], n, nullptr, nullptr);
+                        QrCode::Encode(utf8, s->qr);
+                        InvalidateRect(h, nullptr, FALSE);
+                        InvalidateRect(s->mw->hwnd_, nullptr, FALSE);
+                        return 0;
+                    }
+                    if (LOWORD(wp) == 9002 || LOWORD(wp) == IDCANCEL) {
+                        s->done = true;
+                        DestroyWindow(h);
+                        return 0;
+                    }
+                    break;
+                case WM_CLOSE:
+                    s->done = true;
+                    DestroyWindow(h);
+                    return 0;
+            }
+            return DefWindowProcW(h, m, wp, lp);
+        };
+        wc.hInstance = hInst_;
+        wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+        wc.lpszClassName = kQrCls;
+        RegisterClassExW(&wc);
+        qrReg = true;
+    }
+
+    int dw = S(360), dh = S(415);
+    RECT prc{}; GetWindowRect(hwnd_, &prc);
+    int dx = prc.left + (prc.right - prc.left - dw) / 2;
+    int dy = prc.top + (prc.bottom - prc.top - dh) / 2;
+    EnableWindow(hwnd_, FALSE);
+
+    st.dlg = CreateWindowExW(WS_EX_DLGMODALFRAME, kQrCls, L"QR Kod ile Bağlan",
+        WS_POPUP | WS_CAPTION | WS_SYSMENU | WS_VISIBLE,
+        dx, dy, dw, dh, hwnd_, nullptr, hInst_, &st);
+    ApplyDarkTitleBarAndControls(st.dlg);
+
+    RECT crc{}; GetClientRect(st.dlg, &crc);
+    HWND b1 = CreateWindowExW(0, L"BUTTON", L"Yeni PIN", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+        S(62), crc.bottom - S(44), S(108), S(30), st.dlg, reinterpret_cast<HMENU>(9001), hInst_, nullptr);
+    HWND b2 = CreateWindowExW(0, L"BUTTON", L"Kapat", WS_CHILD | WS_VISIBLE | BS_DEFPUSHBUTTON,
+        S(190), crc.bottom - S(44), S(108), S(30), st.dlg, reinterpret_cast<HMENU>(9002), hInst_, nullptr);
+    SendMessageW(b1, WM_SETFONT, reinterpret_cast<WPARAM>(font_), TRUE);
+    SendMessageW(b2, WM_SETFONT, reinterpret_cast<WPARAM>(font_), TRUE);
+
+    MSG msg{};
+    while (!st.done && GetMessageW(&msg, nullptr, 0, 0) > 0) {
+        if (msg.message == WM_KEYDOWN && msg.wParam == VK_ESCAPE) {
+            st.done = true;
+            DestroyWindow(st.dlg);
+            break;
+        }
+        if (!IsDialogMessageW(st.dlg, &msg)) {
+            TranslateMessage(&msg);
+            DispatchMessageW(&msg);
+        }
+    }
+    EnableWindow(hwnd_, TRUE);
+    SetForegroundWindow(hwnd_);
+    InvalidateRect(hwnd_, nullptr, FALSE);
 }

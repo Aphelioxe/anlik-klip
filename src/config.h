@@ -31,6 +31,10 @@ struct AppConfig {
     std::wstring outputDir;
     bool soundNotify = true;
     bool startMinimized = true;
+
+    bool mobileSyncEnabled = false;
+    int mobileSyncPort = 47820;
+    std::wstring mobilePin;
 };
 
 std::wstring GetExeDirectory();

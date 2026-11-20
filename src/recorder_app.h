@@ -2,6 +2,7 @@
 
 #include "audio_engine.h"
 #include "config.h"
+#include "mobile_sync.h"
 #include "ring_buffer.h"
 #include "video_engine.h"
 
@@ -49,12 +50,21 @@ public:
     bool SaveClipAsync(int secondsOverride, SaveCallback cb);
     AppRuntimeStats GetStats() const;
 
+    bool IsMobileSyncRunning() const { return mobile_.IsRunning(); }
+    std::wstring GetMobileLanIp() const { return mobile_.LanIp(); }
+    std::wstring GetMobilePairUrl() const { return mobile_.PairUrl(); }
+    std::wstring GetMobileError() const { return mobile_.LastError(); }
+    void RegenerateMobilePin();
+
 private:
+    void SyncMobileServer();
+
     std::wstring iniPath_;
     AppConfig cfg_;
     RingBuffer ring_;
     AudioEngine audio_;
     VideoEngine video_;
+    MobileSyncServer mobile_;
 
     std::atomic<bool> running_{false};
     std::atomic<bool> saving_{false};

@@ -66,7 +66,9 @@ $args = @(
     "-lgdi32",
     "-lgdiplus",
     "-lwinmm",
-    "-lpsapi"
+    "-lpsapi",
+    "-lws2_32",
+    "-liphlpapi"
 )
 
 & $clang @args

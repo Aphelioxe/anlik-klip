@@ -11,9 +11,14 @@ RecorderApp::RecorderApp(std::wstring iniPath)
       cfg_(LoadConfig(iniPath_)),
       ring_(cfg_.clipSeconds),
       audio_(ring_),
-      video_(ring_) {}
+      video_(ring_) {
+    if (cfg_.mobileSyncEnabled) {
+        SyncMobileServer();
+    }
+}
 
 RecorderApp::~RecorderApp() {
+    mobile_.Stop();
     StopBuffering();
     std::lock_guard<std::mutex> lk(saveThreadMutex_);
     if (saveThread_.joinable()) {
@@ -85,6 +90,32 @@ void RecorderApp::ApplyConfig(const AppConfig& newCfg) {
     if (wasRunning && needRestart) {
         StopBuffering();
         StartBuffering();
+    }
+    SyncMobileServer();
+}
+
+void RecorderApp::SyncMobileServer() {
+    if (!cfg_.mobileSyncEnabled) {
+        mobile_.Stop();
+        return;
+    }
+    if (cfg_.mobilePin.empty()) {
+        cfg_.mobilePin = MobileSyncServer::GenerateRandomPin();
+        SaveConfig(iniPath_, cfg_);
+    }
+    uint16_t port = static_cast<uint16_t>(cfg_.mobileSyncPort);
+    if (!mobile_.IsRunning() || mobile_.Port() != port) {
+        mobile_.Start(cfg_.outputDir, port, cfg_.mobilePin);
+    } else {
+        mobile_.UpdateConfig(cfg_.outputDir, port, cfg_.mobilePin);
+    }
+}
+
+void RecorderApp::RegenerateMobilePin() {
+    cfg_.mobilePin = MobileSyncServer::GenerateRandomPin();
+    SaveConfig(iniPath_, cfg_);
+    if (cfg_.mobileSyncEnabled) {
+        mobile_.UpdateConfig(cfg_.outputDir, static_cast<uint16_t>(cfg_.mobileSyncPort), cfg_.mobilePin);
     }
 }
 

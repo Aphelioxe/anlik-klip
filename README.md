@@ -4,7 +4,8 @@ Windows 10/11 için hafif, tamamen native (C++17 / Win32 / Direct3D 11 / DXGI / 
 
 ## İndirme
 
-- **Hazır sürüm:** [Releases](https://github.com/Aphelioxe/anlik-klip/releases) sayfasından `AnlikKlip.exe` dosyasını indirip doğrudan çalıştırabilirsin. Kurulum gerektirmez.
+- **PC (Windows 10/11):** [Releases](https://github.com/Aphelioxe/anlik-klip/releases) sayfasından `AnlikKlip.exe` dosyasını indirip doğrudan çalıştırabilirsin. Kurulum gerektirmez.
+- **Android (Telefon):** Aynı [Releases](https://github.com/Aphelioxe/anlik-klip/releases) sayfasından `AnlikKlip.apk` dosyasını telefonuna indirip kurabilirsin.
 - **Kaynak koddan derleme:** aşağıdaki [Derleme](#derleme) bölümüne bak.
 
 ## Özellikler
@@ -16,6 +17,7 @@ Windows 10/11 için hafif, tamamen native (C++17 / Win32 / Direct3D 11 / DXGI / 
 - **Çift ses kanalı ve gürültü kapısı:** Oyun / sistem sesi (WASAPI loopback) + mikrofon yakalama, ayrı ses seviyesi (`%0`–`%200`), mikrofon cihaz seçimi, mikrofon susturma ve klavye/arka plan sesini kesen ayarlanabilir **Mikrofon Gürültü Kapısı** (`-60` – `-15 dB` eşik + canlı seviye ölçer).
 - **Oyun içi kısayol algılama:** Çift katmanlı algılama (RawInput + Low-Level Keyboard Hook + `RegisterHotKey` yedeği) ile klip alma (varsayılan `F9`) ve isteğe bağlı mikrofon susturma kısayolu. Yönetici yetkisiyle çalışan oyunlar için uygulama içinden **Yönetici Başlat** seçeneği mevcuttur.
 - **Klip galerisi, favoriler, arama ve hızlı kırpma (trim):** Küçük resimli klip listesi, isimle canlı arama, favori yıldızı (`★` + Favoriler görünümü), yeniden adlandırma, klasörde açma, Çöp Kutusu'na silme ve uygulama içi Media Foundation oynatıcı (`Space` oynat/duraklat, `←` / `→` 5 sn ileri/geri sar, `Esc` geri, hız ve ses kontrolü). Oynatıcıdaki **✂ Kırp** aracıyla seçili aralığı **Yeni Kopya Kaydet** veya **Ana Klip Yap** (eski kopyayı Çöp Kutusu'na alarak üzerine yaz) seçenekleriyle kırpabilirsin.
+- **Telefon Aktarımı (Wi-Fi + Android APK):** İsteğe bağlı yerel Wi-Fi sunucusu (kapalıyken `0` ekstra RAM / açık port) ve QR kod ile eşleşen `AnlikKlip.apk` Android uygulaması. Aynı Wi-Fi ağında PC'deki klipleri telefondan önizleyebilir, tek dokunuşla telefon galerisine (`Movies/AnlikKlip`) indirebilir veya **Oto İndir** ile yeni klipleri otomatik olarak telefona aktarabilirsin.
 - **Sistem tepsisi & düşük bellek:** Pencere kapatıldığında sistem tepsisinde çalışmaya devam eder; isteğe bağlı Windows açılışında arka planda başlatma ve klip alma bildirim sesi bulunur.
 
 ## Hızlı Başlangıç
@@ -23,6 +25,13 @@ Windows 10/11 için hafif, tamamen native (C++17 / Win32 / Direct3D 11 / DXGI / 
 1. `AnlikKlip.exe` dosyasını boş bir klasöre koyup çalıştır. İlk açılışta yanına otomatik olarak `settings.ini`, `diag.log` ve `klipler\` klasörü oluşturulur.
 2. Varsayılan klip alma tuşu `F9`'dur (**Ayarlar** sekmesinden değiştirebilirsin).
 3. **Kliplerim** sekmesinden kaydedilen klipleri doğrudan uygulama içinde izleyebilir, adını değiştirebilir veya klasörde açabilirsin.
+
+## Telefon Aktarımı (Android APK)
+
+1. PC'de **Ayarlar** sekmesinden **Telefon Aktarımı (Wi-Fi)** kutucuğunu aç ve **QR Kod / Bağlan** butonuna tıkla.
+2. Telefona `AnlikKlip.apk` dosyasını kur (`minSdk 26` / Android 8.0+).
+3. Aynı Wi-Fi ağındayken telefon uygulamasından **QR Tara** ile PC ekranındaki QR kodu okut (veya **Wi-Fi ile PC Bul** + 6 haneli PIN ile bağlan).
+4. Klipleri telefondan izleyebilir, **Galeriye İndir** ile `Movies/AnlikKlip` klasörüne kaydedebilir veya **Oto İndir** anahtarını açabilirsin.
 
 ## Derleme
 

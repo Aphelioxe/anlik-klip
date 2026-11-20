@@ -204,8 +204,12 @@ private:
     HWND chkSound_ = nullptr;
     HWND btnTestSound_ = nullptr;
     HWND chkAutoStart_ = nullptr;
+    HWND chkMobileSync_ = nullptr;
+    HWND btnShowQr_ = nullptr;
     HWND btnApply_ = nullptr;
     HWND btnExitApp_ = nullptr;
+
+    void ShowMobileQrModal();
 
     int S(int px) const { return MulDiv(px, static_cast<int>(dpi_), 96); }
 };

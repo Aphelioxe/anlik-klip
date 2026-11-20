@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">Anlık Klip</string>
+    <string name="status_disconnected">Bağlı Değil</string>
+    <string name="scan_qr">QR Tara</string>
+    <string name="discover_pc">Wi-Fi ile PC Bul</string>
+    <string name="connect">Bağlan</string>
+    <string name="disconnect">Bağlantıyı Kes</string>
+    <string name="search_hint">Klip ara...</string>
+    <string name="auto_download">Yeni klipleri otomatik indir</string>
+    <string name="download_to_gallery">Galeriye İndir</string>
+    <string name="downloaded">İndirildi ✓</string>
+</resources>
