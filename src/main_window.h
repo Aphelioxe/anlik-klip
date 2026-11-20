@@ -140,7 +140,6 @@ private:
     ULONGLONG openAnimStartMs_ = 0;
     ULONGLONG tabAnimStartMs_ = 0;
     float openAnimT_ = 1.0f;
-    bool tabCtrlsPendingShow_ = false;
     double animPhase_ = 0.0;
     float tabAnimT_ = 1.0f;
     int tabAnimDir_ = 1;
