@@ -88,6 +88,8 @@ enum CustomBtnId {
     BTN_CLIP_RENAME,
     BTN_CLIP_REVEAL,
     BTN_CLIP_DELETE,
+    BTN_SET_720P,
+    BTN_SET_1080P,
 
     // Player & Trim controls
     BTN_PLY_BACK = 50,
@@ -205,12 +207,12 @@ struct PlayerEventMsg {
 constexpr int kDurations[] = { 30, 60, 120, 180, 300 };
 struct ResPreset { int w, h, fps; const wchar_t* label; };
 constexpr ResPreset kResPresets[] = {
-    { 1280, 720, 60, L"1280x720 (720p) @ 60 FPS — Önerilen" },
-    { 1280, 720, 30, L"1280x720 (720p) @ 30 FPS — En Hafif" },
-    { 1920, 1080, 60, L"1920x1080 (1080p) @ 60 FPS" },
-    { 1920, 1080, 30, L"1920x1080 (1080p) @ 30 FPS" }
+    { 1280, 720, 60, L"720p HD (1280x720) @ 60 FPS" },
+    { 1280, 720, 30, L"720p HD (1280x720) @ 30 FPS" },
+    { 1920, 1080, 60, L"1080p Full HD (1920x1080) @ 60" },
+    { 1920, 1080, 30, L"1080p Full HD (1920x1080) @ 30" }
 };
-constexpr int kBitrates[] = { 4000, 6000, 8000, 10000 };
+constexpr int kBitrates[] = { 4000, 6000, 8000, 10000, 12000, 15000 };
 
 void ApplyDarkTitleBarAndControls(HWND hwnd) {
     if (HMODULE dwm = LoadLibraryW(L"dwmapi.dll")) {
@@ -624,28 +626,30 @@ void MainWindow::CreateControls() {
     }
 
     // Card 1: Video (x=242..562, y=68..248)
-    makeLbl(L"Klip Süresi:", 258, 106, 95, 20);
-    cmbDuration_ = make(L"COMBOBOX", L"", CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP, 360, 103, 186, 180, ID_CMB_DURATION);
+    makeLbl(L"Klip Süresi:", 258, 104, 82, 20);
+    cmbDuration_ = make(L"COMBOBOX", L"", CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP, 344, 101, 206, 180, ID_CMB_DURATION);
     for (int sec : kDurations) {
         wchar_t buf[64] = {};
-        if (sec < 60) swprintf(buf, 64, L"Son %d sn (~23 MB)", sec);
+        if (sec < 60) swprintf(buf, 64, L"Son %d sn", sec);
         else if (sec == 60) swprintf(buf, 64, L"Son 1 dk (60 sn) — Önerilen");
-        else swprintf(buf, 64, L"Son %d dk (~%d MB)", sec / 60, (sec / 60) * 45);
+        else swprintf(buf, 64, L"Son %d dk", sec / 60);
         SendMessageW(cmbDuration_, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(buf));
     }
 
-    makeLbl(L"Çözünürlük:", 258, 144, 95, 20);
-    cmbResFps_ = make(L"COMBOBOX", L"", CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP, 360, 141, 186, 180, ID_CMB_RESFPS);
+    makeLbl(L"Çözünürlük:", 258, 139, 82, 20);
+    cmbResFps_ = make(L"COMBOBOX", L"", CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP, 344, 136, 206, 180, ID_CMB_RESFPS);
     for (const auto& p : kResPresets) {
         SendMessageW(cmbResFps_, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(p.label));
     }
 
-    makeLbl(L"Bit Hızı:", 258, 182, 95, 20);
-    cmbBitrate_ = make(L"COMBOBOX", L"", CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP, 360, 179, 186, 180, ID_CMB_BITRATE);
-    SendMessageW(cmbBitrate_, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"4 Mbps (En Hafif RAM)"));
-    SendMessageW(cmbBitrate_, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"6 Mbps (Dengeli 720p60)"));
+    makeLbl(L"Bit Hızı:", 258, 174, 82, 20);
+    cmbBitrate_ = make(L"COMBOBOX", L"", CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP, 344, 171, 206, 180, ID_CMB_BITRATE);
+    SendMessageW(cmbBitrate_, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"4 Mbps (Hafif RAM)"));
+    SendMessageW(cmbBitrate_, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"6 Mbps (720p60 Dengeli)"));
     SendMessageW(cmbBitrate_, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"8 Mbps (Yüksek Kalite)"));
-    SendMessageW(cmbBitrate_, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"10 Mbps (Çok Yüksek)"));
+    SendMessageW(cmbBitrate_, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"10 Mbps (1080p30 / Yüksek)"));
+    SendMessageW(cmbBitrate_, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"12 Mbps (1080p60 Önerilen)"));
+    SendMessageW(cmbBitrate_, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"15 Mbps (1080p60 Çok Yüksek)"));
 
     // Card 2: Audio & Mic Noise Gate (x=578..898, y=68..248)
     chkGameAudio_ = makeChk(L"Oyun / Sistem Sesi", 594, 98, 134, 22, ID_CHK_GAME_AUDIO);
@@ -732,7 +736,7 @@ void MainWindow::LoadSettingsControls() {
     SendMessageW(cmbDuration_, CB_SETCURSEL, durIdx, 0);
 
     int resIdx = 0;
-    for (int i = 0; i < 4; ++i) {
+    for (int i = 0; i < static_cast<int>(sizeof(kResPresets) / sizeof(kResPresets[0])); ++i) {
         if (kResPresets[i].w == cfg.width && kResPresets[i].h == cfg.height && kResPresets[i].fps == cfg.fps) {
             resIdx = i; break;
         }
@@ -740,7 +744,9 @@ void MainWindow::LoadSettingsControls() {
     SendMessageW(cmbResFps_, CB_SETCURSEL, resIdx, 0);
 
     int brIdx = 1;
-    for (int i = 0; i < 4; ++i) if (kBitrates[i] == cfg.bitrateKbps) { brIdx = i; break; }
+    for (int i = 0; i < static_cast<int>(sizeof(kBitrates) / sizeof(kBitrates[0])); ++i) {
+        if (kBitrates[i] == cfg.bitrateKbps) { brIdx = i; break; }
+    }
     SendMessageW(cmbBitrate_, CB_SETCURSEL, brIdx, 0);
 
     SendMessageW(chkGameAudio_, BM_SETCHECK, cfg.captureGameAudio ? BST_CHECKED : BST_UNCHECKED, 0);
@@ -788,14 +794,16 @@ void MainWindow::ReadSettingsControls(AppConfig& out) {
     if (dIdx >= 0 && dIdx < 5) out.clipSeconds = kDurations[dIdx];
 
     int rIdx = static_cast<int>(SendMessageW(cmbResFps_, CB_GETCURSEL, 0, 0));
-    if (rIdx >= 0 && rIdx < 4) {
+    constexpr int kNumRes = static_cast<int>(sizeof(kResPresets) / sizeof(kResPresets[0]));
+    if (rIdx >= 0 && rIdx < kNumRes) {
         out.width = kResPresets[rIdx].w;
         out.height = kResPresets[rIdx].h;
         out.fps = kResPresets[rIdx].fps;
     }
 
     int bIdx = static_cast<int>(SendMessageW(cmbBitrate_, CB_GETCURSEL, 0, 0));
-    if (bIdx >= 0 && bIdx < 4) out.bitrateKbps = kBitrates[bIdx];
+    constexpr int kNumBr = static_cast<int>(sizeof(kBitrates) / sizeof(kBitrates[0]));
+    if (bIdx >= 0 && bIdx < kNumBr) out.bitrateKbps = kBitrates[bIdx];
 
     out.captureGameAudio = (SendMessageW(chkGameAudio_, BM_GETCHECK, 0, 0) == BST_CHECKED);
     out.gameVolumePct = static_cast<int>(SendMessageW(trkGameVol_, TBM_GETPOS, 0, 0));
@@ -1897,13 +1905,26 @@ void MainWindow::PaintWindow(HDC targetDc) {
             // ================= TAB 1: AYARLAR =================
             g.DrawString(L"Ayarlar", -1, &fTitle,
                 Gdiplus::RectF((float)S(242), (float)S(14), (float)S(220), (float)S(28)), &sfLeft, &brText);
-            g.DrawString(L"Değişiklikleri uygulamak için alttaki Kaydet butonunu kullanın.", -1, &fSmall,
+            g.DrawString(L"Video, ses ve kısayol değişiklikleri anında uygulanır.", -1, &fSmall,
                 Gdiplus::RectF((float)S(242), (float)S(42), (float)S(460), (float)S(18)), &sfLeft, &brMuted);
 
             FillRoundRect(g, (float)S(242), (float)S(68), (float)S(320), (float)S(180), (float)S(12), Gc(23, 28, 38));
             StrokeRoundRect(g, (float)S(242), (float)S(68), (float)S(320), (float)S(180), (float)S(12), Gc(44, 54, 72));
             g.DrawString(L"Video ve Tampon", -1, &fBold,
                 Gdiplus::RectF((float)S(258), (float)S(76), (float)S(220), (float)S(22)), &sfLeft, &brBlueTxt);
+            g.DrawString(L"Hızlı Seçim:", -1, &fSmall,
+                Gdiplus::RectF((float)S(258), (float)S(211), (float)S(84), (float)S(22)), &sfLeft, &brMuted);
+            {
+                bool is1080 = (app_.Config().height >= 1080);
+                addBtn(BTN_SET_720P, 344, 208, 96, 28, L"720p HD",
+                    !is1080 ? Gc(37, 99, 235) : Gc(32, 39, 53),
+                    !is1080 ? Gc(59, 130, 246) : Gc(44, 54, 72),
+                    !is1080 ? Gc(96, 165, 250, 160) : Gc(56, 68, 90));
+                addBtn(BTN_SET_1080P, 446, 208, 104, 28, L"1080p Full HD",
+                    is1080 ? Gc(37, 99, 235) : Gc(32, 39, 53),
+                    is1080 ? Gc(59, 130, 246) : Gc(44, 54, 72),
+                    is1080 ? Gc(96, 165, 250, 160) : Gc(56, 68, 90));
+            }
 
             FillRoundRect(g, (float)S(578), (float)S(68), (float)S(320), (float)S(180), (float)S(12), Gc(23, 28, 38));
             StrokeRoundRect(g, (float)S(578), (float)S(68), (float)S(320), (float)S(180), (float)S(12), Gc(44, 54, 72));
@@ -2310,6 +2331,25 @@ LRESULT MainWindow::OnMessage(UINT msg, WPARAM wParam, LPARAM lParam) {
                         case BTN_CLIP_RENAME: RenameSelected(); break;
                         case BTN_CLIP_REVEAL: RevealSelected(); break;
                         case BTN_CLIP_DELETE: DeleteSelected(); break;
+                        case BTN_SET_720P:
+                        case BTN_SET_1080P: {
+                            AppConfig cfg = app_.Config();
+                            bool want1080 = (target == BTN_SET_1080P);
+                            int keepFps = (cfg.fps == 30) ? 30 : 60;
+                            cfg.width = want1080 ? 1920 : 1280;
+                            cfg.height = want1080 ? 1080 : 720;
+                            cfg.fps = keepFps;
+                            if (want1080 && cfg.bitrateKbps <= 6000) {
+                                cfg.bitrateKbps = (keepFps == 60) ? 12000 : 10000;
+                            }
+                            if (cb_.onConfigApplied) cb_.onConfigApplied(cfg);
+                            LoadSettingsControls();
+                            wchar_t msg[96] = {};
+                            swprintf(msg, 96, L"Kayıt kalitesi: %dp @ %d FPS (%d Mbps) uygulandı.",
+                                cfg.height, cfg.fps, cfg.bitrateKbps / 1000);
+                            SetFooterMessage(msg);
+                            break;
+                        }
 
                         // Embedded Player & Trim buttons
                         case BTN_PLY_BACK: CloseEmbeddedPlayer(); break;
@@ -2440,6 +2480,29 @@ LRESULT MainWindow::OnMessage(UINT msg, WPARAM wParam, LPARAM lParam) {
                 case ID_CTX_RENAME: RenameSelected(); break;
                 case ID_CTX_REVEAL: RevealSelected(); break;
                 case ID_CTX_DELETE: DeleteSelected(); break;
+                case ID_CMB_DURATION:
+                case ID_CMB_RESFPS:
+                case ID_CMB_BITRATE:
+                    if (code == CBN_SELCHANGE) {
+                        AppConfig prev = app_.Config();
+                        AppConfig cfg = prev;
+                        ReadSettingsControls(cfg);
+                        if (id == ID_CMB_RESFPS && prev.height < 1080 && cfg.height >= 1080 && cfg.bitrateKbps <= 6000) {
+                            cfg.bitrateKbps = (cfg.fps == 60) ? 12000 : 10000;
+                            for (int i = 0; i < static_cast<int>(sizeof(kBitrates) / sizeof(kBitrates[0])); ++i) {
+                                if (kBitrates[i] == cfg.bitrateKbps) {
+                                    SendMessageW(cmbBitrate_, CB_SETCURSEL, i, 0);
+                                    break;
+                                }
+                            }
+                        }
+                        if (cb_.onConfigApplied) cb_.onConfigApplied(cfg);
+                        wchar_t msg[96] = {};
+                        swprintf(msg, 96, L"Video ayarı güncellendi: %dp @ %d FPS (%d Mbps).",
+                            cfg.height, cfg.fps, cfg.bitrateKbps / 1000);
+                        SetFooterMessage(msg);
+                    }
+                    break;
                 case ID_CHK_GAME_AUDIO:
                 case ID_CHK_MIC_AUDIO:
                 case ID_CHK_MIC_MUTE:
