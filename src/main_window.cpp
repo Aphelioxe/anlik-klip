@@ -1199,16 +1199,23 @@ void MainWindow::OpenEmbeddedPlayer(int viewIdx) {
             BOOL hasA = FALSE, selA = FALSE;
             item->HasAudio(&hasA, &selA);
             if (SUCCEEDED(item->GetNumberOfStreams(&nStreams)) && nStreams > 1) {
-                bool pickedAudio = false;
+                std::vector<DWORD> audioStreams;
                 for (DWORD si = 0; si < nStreams; ++si) {
                     PROPVARIANT vt;
                     PropVariantInit(&vt);
                     if (SUCCEEDED(item->GetStreamAttribute(si, MF_MT_MAJOR_TYPE, &vt)) &&
                         vt.vt == VT_CLSID && vt.puuid && *vt.puuid == MFMediaType_Audio) {
-                        item->SetStreamSelection(si, !pickedAudio ? TRUE : FALSE);
-                        pickedAudio = true;
+                        audioStreams.push_back(si);
                     }
                     PropVariantClear(&vt);
+                }
+                if (!audioStreams.empty()) {
+                    // MPEG4MediaSource enumerates SinkWriter audio tracks in reverse (Mic, Game, Mix),
+                    // so the last audio stream is the full Mix track.
+                    DWORD chosenAudio = audioStreams.back();
+                    for (DWORD asi : audioStreams) {
+                        item->SetStreamSelection(asi, (asi == chosenAudio) ? TRUE : FALSE);
+                    }
                 }
             }
             Logger::Log("OpenEmbeddedPlayer: streams=%lu hasAudio=%d selAudio=%d",
