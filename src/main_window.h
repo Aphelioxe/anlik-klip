@@ -222,6 +222,7 @@ private:
     HWND cmbResFps_ = nullptr;
     HWND cmbBitrate_ = nullptr;
     HWND chkGameAudio_ = nullptr;
+    HWND chkSpotifyAudio_ = nullptr;
     HWND trkGameVol_ = nullptr;
     HWND lblGameVol_ = nullptr;
     HWND chkMicAudio_ = nullptr;

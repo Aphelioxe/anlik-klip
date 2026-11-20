@@ -39,7 +39,8 @@ void RecorderApp::StartBuffering() {
         cfg_.captureGameAudio, cfg_.gameVolumePct,
         cfg_.captureMic, cfg_.micVolumePct, cfg_.micMuted,
         cfg_.micDeviceId,
-        cfg_.micNoiseGate, cfg_.micGateThresholdDb);
+        cfg_.micNoiseGate, cfg_.micGateThresholdDb,
+        cfg_.captureSpotify);
     video_.Start(masterStartQpc,
         static_cast<uint32_t>(cfg_.width),
         static_cast<uint32_t>(cfg_.height),
@@ -65,7 +66,8 @@ bool RecorderApp::ToggleMicMute() {
     cfg_.micMuted = !cfg_.micMuted;
     audio_.UpdateMixSettings(cfg_.captureGameAudio, cfg_.gameVolumePct,
         cfg_.captureMic, cfg_.micVolumePct, cfg_.micMuted,
-        cfg_.micNoiseGate, cfg_.micGateThresholdDb);
+        cfg_.micNoiseGate, cfg_.micGateThresholdDb,
+        cfg_.captureSpotify);
     SaveConfig(iniPath_, cfg_);
     return cfg_.micMuted;
 }
@@ -85,7 +87,8 @@ void RecorderApp::ApplyConfig(const AppConfig& newCfg) {
     ring_.SetTargetSeconds(cfg_.clipSeconds);
     audio_.UpdateMixSettings(cfg_.captureGameAudio, cfg_.gameVolumePct,
         cfg_.captureMic, cfg_.micVolumePct, cfg_.micMuted,
-        cfg_.micNoiseGate, cfg_.micGateThresholdDb);
+        cfg_.micNoiseGate, cfg_.micGateThresholdDb,
+        cfg_.captureSpotify);
 
     if (wasRunning && needRestart) {
         StopBuffering();

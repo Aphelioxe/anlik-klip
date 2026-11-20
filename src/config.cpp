@@ -55,6 +55,7 @@ AppConfig LoadConfig(const std::wstring& iniPath) {
 
     cfg.captureGameAudio = GetPrivateProfileIntW(L"Audio", L"CaptureGame", 1, iniPath.c_str()) != 0;
     cfg.gameVolumePct = ClampInt(GetPrivateProfileIntW(L"Audio", L"GameVolumePct", 100, iniPath.c_str()), 0, 200);
+    cfg.captureSpotify = GetPrivateProfileIntW(L"Audio", L"CaptureSpotify", 1, iniPath.c_str()) != 0;
     cfg.captureMic = GetPrivateProfileIntW(L"Audio", L"CaptureMic", 1, iniPath.c_str()) != 0;
     cfg.micVolumePct = ClampInt(GetPrivateProfileIntW(L"Audio", L"MicVolumePct", 100, iniPath.c_str()), 0, 200);
     cfg.micMuted = GetPrivateProfileIntW(L"Audio", L"MicMuted", 0, iniPath.c_str()) != 0;
@@ -95,6 +96,7 @@ bool SaveConfig(const std::wstring& iniPath, const AppConfig& cfg) {
 
     WriteIniInt(L"Audio", L"CaptureGame", cfg.captureGameAudio ? 1 : 0, iniPath);
     WriteIniInt(L"Audio", L"GameVolumePct", cfg.gameVolumePct, iniPath);
+    WriteIniInt(L"Audio", L"CaptureSpotify", cfg.captureSpotify ? 1 : 0, iniPath);
     WriteIniInt(L"Audio", L"CaptureMic", cfg.captureMic ? 1 : 0, iniPath);
     WriteIniInt(L"Audio", L"MicVolumePct", cfg.micVolumePct, iniPath);
     WriteIniInt(L"Audio", L"MicMuted", cfg.micMuted ? 1 : 0, iniPath);

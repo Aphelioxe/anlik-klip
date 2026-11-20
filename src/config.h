@@ -20,6 +20,7 @@ struct AppConfig {
 
     bool captureGameAudio = true;
     int gameVolumePct = 100;
+    bool captureSpotify = true;
 
     bool captureMic = true;
     int micVolumePct = 100;

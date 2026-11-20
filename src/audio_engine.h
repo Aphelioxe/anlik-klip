@@ -22,12 +22,14 @@ public:
         bool captureGame, int gameVolPct,
         bool captureMic, int micVolPct, bool micMuted,
         const std::wstring& micDeviceId,
-        bool micNoiseGate = true, int micGateThresholdDb = -36);
+        bool micNoiseGate = true, int micGateThresholdDb = -36,
+        bool captureSpotify = true);
     void Stop();
 
     void UpdateMixSettings(bool captureGame, int gameVolPct,
         bool captureMic, int micVolPct, bool micMuted,
-        bool micNoiseGate = true, int micGateThresholdDb = -36);
+        bool micNoiseGate = true, int micGateThresholdDb = -36,
+        bool captureSpotify = true);
 
     float GetMicLevelDb() const { return micLevelDb_.load(std::memory_order_relaxed); }
     std::wstring GetLastError() const;
@@ -40,6 +42,7 @@ private:
     std::atomic<bool> stop_{false};
 
     std::atomic<bool> captureGame_{true};
+    std::atomic<bool> captureSpotify_{true};
     std::atomic<int> gameVolPct_{100};
     std::atomic<bool> captureMic_{true};
     std::atomic<int> micVolPct_{100};

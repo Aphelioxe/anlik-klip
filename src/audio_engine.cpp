@@ -9,12 +9,14 @@
 #include <mftransform.h>
 #include <mferror.h>
 #include <propvarutil.h>
+#include <tlhelp32.h>
 
 #include <algorithm>
 #include <array>
 #include <cmath>
 #include <cstring>
 #include <deque>
+#include <unordered_set>
 
 namespace {
 
@@ -147,6 +149,8 @@ struct WasapiStream {
     std::wstring deviceId;
     bool active = false;
     bool isLoopback = false;
+    bool isProcessLoopback = false;
+    DWORD excludedPid = 0;
 
     // Resampler state for non-48kHz sources
     double resamplePos = 0.0;
@@ -163,8 +167,180 @@ struct WasapiStream {
         device.Reset();
         deviceId.clear();
         active = false;
+        isProcessLoopback = false;
+        excludedPid = 0;
         resamplePos = 0.0;
         prevSample = {0.0f, 0.0f};
+    }
+
+    static DWORD FindSpotifyRootPid() {
+        HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+        if (snap == INVALID_HANDLE_VALUE) return 0;
+
+        struct ProcEntry { DWORD pid; DWORD ppid; };
+        std::vector<ProcEntry> spProcs;
+        std::unordered_set<DWORD> spPids;
+
+        PROCESSENTRY32W pe{};
+        pe.dwSize = sizeof(pe);
+        if (Process32FirstW(snap, &pe)) {
+            do {
+                if (_wcsicmp(pe.szExeFile, L"Spotify.exe") == 0) {
+                    spProcs.push_back({ pe.th32ProcessID, pe.th32ParentProcessID });
+                    spPids.insert(pe.th32ProcessID);
+                }
+            } while (Process32NextW(snap, &pe));
+        }
+        CloseHandle(snap);
+
+        if (spProcs.empty()) return 0;
+        for (const auto& p : spProcs) {
+            if (spPids.find(p.ppid) == spPids.end()) {
+                return p.pid;
+            }
+        }
+        return spProcs[0].pid;
+    }
+
+    bool OpenProcessLoopbackExclude(DWORD excludePid) {
+        if (excludePid == 0) return false;
+
+        // Windows 10 2004+ (Build 19041) virtual process loopback device
+        static constexpr wchar_t kVadProcessLoopback[] = L"VAD\\Process_Loopback";
+        enum AkActivationType { AK_ACT_DEFAULT = 0, AK_ACT_PROCESS_LOOPBACK = 1 };
+        enum AkLoopbackMode { AK_MODE_INCLUDE_TREE = 0, AK_MODE_EXCLUDE_TREE = 1 };
+        struct AkProcessLoopbackParams {
+            DWORD TargetProcessId;
+            AkLoopbackMode ProcessLoopbackMode;
+        };
+        struct AkActivationParams {
+            AkActivationType ActivationType;
+            union {
+                AkProcessLoopbackParams ProcessLoopbackParams;
+            };
+        };
+
+        using FnActivateAudioInterfaceAsync = HRESULT (WINAPI*)(
+            LPCWSTR, REFIID, PROPVARIANT*, IActivateAudioInterfaceCompletionHandler*, IActivateAudioInterfaceAsyncOperation**);
+
+        HMODULE mmdev = GetModuleHandleW(L"mmdevapi.dll");
+        if (!mmdev) mmdev = LoadLibraryW(L"mmdevapi.dll");
+        if (!mmdev) return false;
+        auto fnActivate = reinterpret_cast<FnActivateAudioInterfaceAsync>(
+            GetProcAddress(mmdev, "ActivateAudioInterfaceAsync"));
+        if (!fnActivate) return false;
+
+        class CompletionHandler final : public IActivateAudioInterfaceCompletionHandler, public IAgileObject {
+        public:
+            CompletionHandler() : ref_(1), ev_(CreateEventW(nullptr, TRUE, FALSE, nullptr)) {}
+            ~CompletionHandler() { if (ev_) CloseHandle(ev_); }
+            HANDLE Event() const { return ev_; }
+
+            HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void** ppv) override {
+                if (!ppv) return E_POINTER;
+                if (riid == __uuidof(IUnknown) || riid == __uuidof(IActivateAudioInterfaceCompletionHandler)) {
+                    *ppv = static_cast<IActivateAudioInterfaceCompletionHandler*>(this);
+                    AddRef();
+                    return S_OK;
+                }
+                if (riid == __uuidof(IAgileObject)) {
+                    *ppv = static_cast<IAgileObject*>(this);
+                    AddRef();
+                    return S_OK;
+                }
+                *ppv = nullptr;
+                return E_NOINTERFACE;
+            }
+            ULONG STDMETHODCALLTYPE AddRef() override { return static_cast<ULONG>(InterlockedIncrement(&ref_)); }
+            ULONG STDMETHODCALLTYPE Release() override {
+                ULONG r = static_cast<ULONG>(InterlockedDecrement(&ref_));
+                if (r == 0) delete this;
+                return r;
+            }
+            HRESULT STDMETHODCALLTYPE ActivateCompleted(IActivateAudioInterfaceAsyncOperation* op) override {
+                if (op) {
+                    HRESULT actHr = E_FAIL;
+                    ComPtr<IUnknown> unk;
+                    if (SUCCEEDED(op->GetActivateResult(&actHr, unk.Put())) && SUCCEEDED(actHr) && unk) {
+                        unk->QueryInterface(__uuidof(IAudioClient), client.PutVoid());
+                    }
+                    hrResult = actHr;
+                }
+                if (ev_) SetEvent(ev_);
+                return S_OK;
+            }
+            ComPtr<IAudioClient> client;
+            HRESULT hrResult = E_FAIL;
+        private:
+            LONG ref_;
+            HANDLE ev_;
+        };
+
+        auto* handler = new CompletionHandler();
+        if (!handler->Event()) {
+            handler->Release();
+            return false;
+        }
+
+        AkActivationParams actParams{};
+        actParams.ActivationType = AK_ACT_PROCESS_LOOPBACK;
+        actParams.ProcessLoopbackParams.TargetProcessId = excludePid;
+        actParams.ProcessLoopbackParams.ProcessLoopbackMode = AK_MODE_EXCLUDE_TREE;
+
+        PROPVARIANT pv{};
+        pv.vt = VT_BLOB;
+        pv.blob.cbSize = sizeof(actParams);
+        pv.blob.pBlobData = reinterpret_cast<BYTE*>(&actParams);
+
+        ComPtr<IActivateAudioInterfaceAsyncOperation> asyncOp;
+        HRESULT hr = fnActivate(kVadProcessLoopback, __uuidof(IAudioClient), &pv, handler, asyncOp.Put());
+        if (FAILED(hr)) {
+            handler->Release();
+            return false;
+        }
+        if (WaitForSingleObject(handler->Event(), 3000) != WAIT_OBJECT_0 ||
+            FAILED(handler->hrResult) || !handler->client) {
+            handler->Release();
+            return false;
+        }
+
+        ComPtr<IAudioClient> newClient = handler->client;
+        handler->Release();
+
+        WAVEFORMATEX wfx{};
+        wfx.wFormatTag = WAVE_FORMAT_IEEE_FLOAT;
+        wfx.nChannels = 2;
+        wfx.nSamplesPerSec = 48000;
+        wfx.wBitsPerSample = 32;
+        wfx.nBlockAlign = 8;
+        wfx.nAvgBytesPerSec = 48000 * 8;
+        wfx.cbSize = 0;
+
+        hr = newClient->Initialize(AUDCLNT_SHAREMODE_SHARED, AUDCLNT_STREAMFLAGS_LOOPBACK, 1000000, 0, &wfx, nullptr);
+        if (FAILED(hr)) return false;
+
+        ComPtr<IAudioCaptureClient> newCap;
+        hr = newClient->GetService(__uuidof(IAudioCaptureClient), newCap.PutVoid());
+        if (FAILED(hr) || !newCap) return false;
+
+        hr = newClient->Start();
+        if (FAILED(hr)) return false;
+
+        Close();
+        isLoopback = true;
+        isProcessLoopback = true;
+        excludedPid = excludePid;
+        deviceId = kVadProcessLoopback;
+        client = newClient;
+        capture = newCap;
+        fmt.sampleRate = 48000;
+        fmt.channels = 2;
+        fmt.bitsPerSample = 32;
+        fmt.blockAlign = 8;
+        fmt.isFloat = true;
+        fmt.supported = true;
+        active = true;
+        return true;
     }
 
     bool Open(IMMDeviceEnumerator* en, bool loopback, const std::wstring& targetId) {
@@ -492,7 +668,8 @@ bool AudioEngine::Start(int64_t masterStartQpc,
     bool captureGame, int gameVolPct,
     bool captureMic, int micVolPct, bool micMuted,
     const std::wstring& micDeviceId,
-    bool micNoiseGate, int micGateThresholdDb) {
+    bool micNoiseGate, int micGateThresholdDb,
+    bool captureSpotify) {
     Stop();
     {
         std::lock_guard<std::mutex> lk(errMutex_);
@@ -500,7 +677,7 @@ bool AudioEngine::Start(int64_t masterStartQpc,
     }
     micLevelDb_.store(-60.0f, std::memory_order_relaxed);
     UpdateMixSettings(captureGame, gameVolPct, captureMic, micVolPct, micMuted,
-        micNoiseGate, micGateThresholdDb);
+        micNoiseGate, micGateThresholdDb, captureSpotify);
     stop_.store(false);
     thread_ = std::thread(&AudioEngine::ThreadMain, this, masterStartQpc, micDeviceId);
     return true;
@@ -516,8 +693,10 @@ void AudioEngine::Stop() {
 
 void AudioEngine::UpdateMixSettings(bool captureGame, int gameVolPct,
     bool captureMic, int micVolPct, bool micMuted,
-    bool micNoiseGate, int micGateThresholdDb) {
+    bool micNoiseGate, int micGateThresholdDb,
+    bool captureSpotify) {
     captureGame_.store(captureGame);
+    captureSpotify_.store(captureSpotify);
     gameVolPct_.store(std::max(0, std::min(200, gameVolPct)));
     captureMic_.store(captureMic);
     micVolPct_.store(std::max(0, std::min(200, micVolPct)));
@@ -627,9 +806,17 @@ void AudioEngine::ThreadMain(int64_t masterStartQpc, std::wstring micDeviceId) {
 
     if (en) {
         if (captureGame_.load()) {
-            if (!gameStream.Open(en.Get(), true, L"")) {
+            bool opened = false;
+            if (!captureSpotify_.load()) {
+                DWORD spPid = WasapiStream::FindSpotifyRootPid();
+                if (spPid != 0 && gameStream.OpenProcessLoopbackExclude(spPid)) {
+                    opened = true;
+                    Logger::Log("AudioEngine: process loopback opened excluding Spotify PID=%lu", (unsigned long)spPid);
+                }
+            }
+            if (!opened && !gameStream.Open(en.Get(), true, L"")) {
                 Logger::Log("AudioEngine: initial loopback open failed");
-            } else {
+            } else if (!opened) {
                 Logger::Log("AudioEngine: loopback opened rate=%u ch=%u float=%d",
                     gameStream.fmt.sampleRate, gameStream.fmt.channels, gameStream.fmt.isFloat ? 1 : 0);
             }
@@ -813,17 +1000,36 @@ void AudioEngine::ThreadMain(int64_t masterStartQpc, std::wstring micDeviceId) {
         const bool wantGame = captureGame_.load();
         const bool wantMic = captureMic_.load();
 
-        // Periodically check for endpoint switch / reconnect every ~1.5s
+        // Periodically check for endpoint switch / Spotify exclusion switch every ~1.5s
         if (en && QpcTo100Ns(nowQpc - lastDefCheckQpc) >= 15000000LL) {
             lastDefCheckQpc = nowQpc;
             if (wantGame && gameStream.active) {
-                std::wstring defId = GetCurrentDefaultEndpointId(en.Get(), eRender);
-                if (!defId.empty() && defId != gameStream.deviceId) {
-                    Logger::Log("AudioEngine: default render device changed, reopening loopback");
+                bool wantSpotify = captureSpotify_.load();
+                DWORD spPid = !wantSpotify ? WasapiStream::FindSpotifyRootPid() : 0;
+                if (!wantSpotify && spPid != 0) {
+                    if (!gameStream.isProcessLoopback || gameStream.excludedPid != spPid) {
+                        if (gameStream.OpenProcessLoopbackExclude(spPid)) {
+                            Logger::Log("AudioEngine: switched to process loopback excluding Spotify PID=%lu", (unsigned long)spPid);
+                            gameQ.clear();
+                            lastGameSample = {0.0f, 0.0f};
+                            gameSlipAccum = 0.0;
+                        }
+                    }
+                } else if (gameStream.isProcessLoopback) {
+                    Logger::Log("AudioEngine: switched back to full system loopback");
                     gameStream.Open(en.Get(), true, L"");
                     gameQ.clear();
                     lastGameSample = {0.0f, 0.0f};
                     gameSlipAccum = 0.0;
+                } else {
+                    std::wstring defId = GetCurrentDefaultEndpointId(en.Get(), eRender);
+                    if (!defId.empty() && defId != gameStream.deviceId) {
+                        Logger::Log("AudioEngine: default render device changed, reopening loopback");
+                        gameStream.Open(en.Get(), true, L"");
+                        gameQ.clear();
+                        lastGameSample = {0.0f, 0.0f};
+                        gameSlipAccum = 0.0;
+                    }
                 }
             }
             if (wantMic && micDeviceId.empty() && micStream.active) {
