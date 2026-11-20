@@ -531,6 +531,8 @@ bool MainWindow::Create(int initialTab) {
 
     settingsOffsetX_ = 0;
     openAnimAlpha_ = 0;
+    openAnimT_ = 0.0f;
+    openAnimStartMs_ = GetTickCount64();
     animPhase_ = 0.0;
     hwnd_ = CreateWindowExW(WS_EX_LAYERED, cls, L"Anlık Klip", style,
         winX, winY, winW, winH,
@@ -547,9 +549,16 @@ bool MainWindow::Create(int initialTab) {
     }
     RefreshClips();
     SwitchTab(initialTab);
+    tabAnimT_ = 1.0f;
+    tabIndicatorY_ = (activeTab_ == 1) ? 160.0f : 118.0f;
+    // Keep child controls hidden during the first 160ms of the motion-blur entrance to avoid Win32 stutter
+    tabCtrlsPendingShow_ = true;
+    for (HWND h : settingsCtrls_) ShowWindow(h, SW_HIDE);
+    if (edtSearch_) ShowWindow(edtSearch_, SW_HIDE);
+
     ShowWindow(hwnd_, SW_SHOWNORMAL);
     SetForegroundWindow(hwnd_);
-    SetTimer(hwnd_, TIMER_UI_ANIM_ID, 16, nullptr);
+    SetTimer(hwnd_, TIMER_UI_ANIM_ID, 8, nullptr);
     return true;
 }
 
@@ -849,17 +858,22 @@ void MainWindow::SwitchTab(int tabIndex) {
     if (changed) {
         tabAnimDir_ = (nextTab > activeTab_) ? 1 : -1;
         tabAnimT_ = 0.0f;
+        tabAnimStartMs_ = GetTickCount64();
+        tabCtrlsPendingShow_ = true;
     }
     activeTab_ = nextTab;
-    for (HWND h : settingsCtrls_) {
-        ShowWindow(h, activeTab_ == 1 ? SW_SHOW : SW_HIDE);
+    if (changed) {
+        for (HWND h : settingsCtrls_) ShowWindow(h, SW_HIDE);
+        if (edtSearch_) ShowWindow(edtSearch_, SW_HIDE);
+    } else {
+        for (HWND h : settingsCtrls_) ShowWindow(h, activeTab_ == 1 ? SW_SHOW : SW_HIDE);
+        UpdateGalleryControlVisibility();
     }
-    UpdateGalleryControlVisibility();
     if (hwnd_) {
         if (activeTab_ == 1) SetTimer(hwnd_, TIMER_MIC_METER_ID, 120, nullptr);
         else KillTimer(hwnd_, TIMER_MIC_METER_ID);
         if (changed) {
-            SetTimer(hwnd_, TIMER_UI_ANIM_ID, 12, nullptr);
+            SetTimer(hwnd_, TIMER_UI_ANIM_ID, 8, nullptr);
             RedrawWindow(hwnd_, nullptr, nullptr, RDW_INVALIDATE | RDW_NOCHILDREN);
         } else {
             InvalidateRect(hwnd_, nullptr, FALSE);
@@ -1863,7 +1877,13 @@ void MainWindow::PaintWindow(HDC targetDc) {
             Gdiplus::SolidBrush brInner(app_.IsRunning() ? Gc(239, 68, 68) : Gc(100, 116, 139));
             g.FillEllipse(&brInner, (float)S(29), (float)S(31), (float)S(10), (float)S(10));
         }
-        g.DrawString(L"Anlık Klip", -1, &fTitle, Gdiplus::RectF((float)S(60), (float)S(16), (float)S(146), (float)S(24)), &sfLeft, &brText);
+        g.DrawString(L"Anlık Klip", -1, &fTitle, Gdiplus::RectF((float)S(60), (float)S(16), (float)S(102), (float)S(24)), &sfLeft, &brText);
+        FillRoundRect(g, (float)S(166), (float)S(20), (float)S(38), (float)S(18), (float)S(9), Gc(59, 130, 246, 48));
+        StrokeRoundRect(g, (float)S(166), (float)S(20), (float)S(38), (float)S(18), (float)S(9), Gc(96, 165, 250, 125));
+        {
+            Gdiplus::SolidBrush brVer(Gc(147, 197, 253));
+            g.DrawString(L"v1.4", -1, &fSmall, Gdiplus::RectF((float)S(166), (float)S(20), (float)S(38), (float)S(18)), &sfCenter, &brVer);
+        }
         wchar_t resSub[48] = {};
         swprintf(resSub, 48, L"%dp • %d FPS", app_.Config().height, app_.Config().fps);
         g.DrawString(resSub, -1, &fSub, Gdiplus::RectF((float)S(60), (float)S(38), (float)S(146), (float)S(18)), &sfLeft, &brMuted);
@@ -2324,12 +2344,37 @@ void MainWindow::PaintWindow(HDC targetDc) {
             }
         } else if (activeTab_ == 0) {
             // ================= TAB 0: KLİPLERİM (GALLERY + FAVORITES + SEARCH) =================
-            const float ease0 = 1.0f - std::pow(1.0f - std::max(0.0f, std::min(1.0f, tabAnimT_)), 3.0f);
-            const float slideY0 = (1.0f - ease0) * static_cast<float>(S(16)) * static_cast<float>(tabAnimDir_);
+            const float openEase0 = 1.0f - std::pow(1.0f - std::max(0.0f, std::min(1.0f, openAnimT_)), 4.0f);
+            const float openVel0 = 1.0f - openEase0;
+            const float ease0 = 1.0f - std::pow(1.0f - std::max(0.0f, std::min(1.0f, tabAnimT_)), 4.0f);
+            const float tabVel0 = 1.0f - ease0;
+            const float slideY0 = tabVel0 * static_cast<float>(S(26)) * static_cast<float>(tabAnimDir_)
+                                + openVel0 * static_cast<float>(S(22));
             g.SetClip(Gdiplus::Rect(S(222), 0, cw - S(222), ch));
+
+            // Motion-blur ghost trails during entrance or tab transition
+            const float blurStrength0 = std::max(openVel0, tabVel0);
+            if (blurStrength0 > 0.03f) {
+                for (int gi = 2; gi >= 1; --gi) {
+                    float gy = slideY0 * (1.0f + 0.85f * gi);
+                    uint8_t ga = static_cast<uint8_t>(std::min(40.0f, blurStrength0 * (gi == 1 ? 32.0f : 16.0f)));
+                    FillRoundRect(g, (float)S(242), (float)S(88) + gy, (float)std::max(S(300), cw - S(264)), (float)S(210),
+                        (float)S(14), Gc(59, 130, 246, ga));
+                }
+            }
+
             g.TranslateTransform(0.0f, slideY0);
             g.DrawString(L"Kayıtlı Klipler", -1, &fTitle,
-                Gdiplus::RectF((float)S(242), (float)S(12), (float)S(310), (float)S(28)), &sfLeft, &brText);
+                Gdiplus::RectF((float)S(242), (float)S(12), (float)S(160), (float)S(28)), &sfLeft, &brText);
+            {
+                wchar_t totBuf[32] = {};
+                swprintf(totBuf, 32, L"%zu Klip", clips_.size());
+                FillRoundRect(g, (float)S(404), (float)S(16), (float)S(74), (float)S(22), (float)S(11), Gc(28, 36, 54));
+                StrokeRoundRect(g, (float)S(404), (float)S(16), (float)S(74), (float)S(22), (float)S(11), Gc(54, 70, 102));
+                Gdiplus::SolidBrush brBadge(Gc(148, 163, 184));
+                g.DrawString(totBuf, -1, &fSmall,
+                    Gdiplus::RectF((float)S(404), (float)S(16), (float)S(74), (float)S(22)), &sfCenter, &brBadge);
+            }
 
             addBtn(BTN_TOP_FAV_FILTER, 572, 14, 130, 30, L"★  Favoriler",
                 favOnly_ ? Gc(120, 83, 14) : Gc(28, 34, 47),
@@ -2533,9 +2578,26 @@ void MainWindow::PaintWindow(HDC targetDc) {
         } else {
             // ================= TAB 1: AYARLAR =================
             const int sox = settingsOffsetX_;
-            const float ease = 1.0f - std::pow(1.0f - std::max(0.0f, std::min(1.0f, tabAnimT_)), 3.0f);
-            const float slideY = (1.0f - ease) * static_cast<float>(S(16)) * static_cast<float>(tabAnimDir_);
+            const float openEase1 = 1.0f - std::pow(1.0f - std::max(0.0f, std::min(1.0f, openAnimT_)), 4.0f);
+            const float openVel1 = 1.0f - openEase1;
+            const float ease = 1.0f - std::pow(1.0f - std::max(0.0f, std::min(1.0f, tabAnimT_)), 4.0f);
+            const float tabVel1 = 1.0f - ease;
+            const float slideY = tabVel1 * static_cast<float>(S(26)) * static_cast<float>(tabAnimDir_)
+                               + openVel1 * static_cast<float>(S(22));
             g.SetClip(Gdiplus::Rect(S(222), 0, cw - S(222), ch));
+
+            // Motion-blur ghost trails during entrance or tab transition
+            const float blurStrength1 = std::max(openVel1, tabVel1);
+            if (blurStrength1 > 0.03f) {
+                for (int gi = 2; gi >= 1; --gi) {
+                    float gy = slideY * (1.0f + 0.85f * gi);
+                    uint8_t ga = static_cast<uint8_t>(std::min(38.0f, blurStrength1 * (gi == 1 ? 30.0f : 15.0f)));
+                    FillRoundRect(g, (float)(S(242) + sox), (float)S(68) + gy, (float)S(320), (float)S(180), (float)S(12), Gc(59, 130, 246, ga));
+                    FillRoundRect(g, (float)(S(578) + sox), (float)S(68) + gy, (float)S(320), (float)S(180), (float)S(12), Gc(34, 197, 94, ga));
+                    FillRoundRect(g, (float)(S(242) + sox), (float)S(258) + gy, (float)S(656), (float)S(270), (float)S(12), Gc(168, 85, 247, ga));
+                }
+            }
+
             g.TranslateTransform(0.0f, slideY);
 
             g.DrawString(L"Ayarlar", -1, &fTitle,
@@ -2725,19 +2787,40 @@ LRESULT MainWindow::OnMessage(UINT msg, WPARAM wParam, LPARAM lParam) {
                 RECT mrc{ S(590) + settingsOffsetX_, S(220), S(892) + settingsOffsetX_, S(245) };
                 InvalidateRect(hwnd_, &mrc, FALSE);
             } else if (wParam == TIMER_UI_ANIM_ID) {
+                ULONGLONG now = GetTickCount64();
                 bool fastTick = false;
-                if (openAnimAlpha_ < 255) {
-                    openAnimAlpha_ = std::min(255, openAnimAlpha_ + 36);
-                    if (hwnd_) SetLayeredWindowAttributes(hwnd_, 0, static_cast<BYTE>(openAnimAlpha_), LWA_ALPHA);
-                    if (openAnimAlpha_ >= 255 && hwnd_) {
+
+                if (openAnimT_ < 1.0f) {
+                    float raw = std::min(1.0f, static_cast<float>(now - openAnimStartMs_) / 230.0f);
+                    openAnimT_ = raw;
+                    float ease = 1.0f - std::pow(1.0f - raw, 4.0f);
+                    openAnimAlpha_ = static_cast<int>(std::round(ease * 255.0f));
+                    if (hwnd_) {
+                        SetLayeredWindowAttributes(hwnd_, 0, static_cast<BYTE>(openAnimAlpha_), LWA_ALPHA);
+                        RedrawWindow(hwnd_, nullptr, nullptr, RDW_INVALIDATE | RDW_NOCHILDREN);
+                    }
+                    if (raw >= 1.0f && hwnd_) {
                         LONG_PTR ex = GetWindowLongPtrW(hwnd_, GWL_EXSTYLE);
                         SetWindowLongPtrW(hwnd_, GWL_EXSTYLE, ex & ~WS_EX_LAYERED);
+                        if (tabCtrlsPendingShow_) {
+                            tabCtrlsPendingShow_ = false;
+                            for (HWND h : settingsCtrls_) ShowWindow(h, activeTab_ == 1 ? SW_SHOW : SW_HIDE);
+                            UpdateGalleryControlVisibility();
+                        }
+                        InvalidateRect(hwnd_, nullptr, FALSE);
                     }
                     fastTick = true;
                 }
+
                 if (tabAnimT_ < 1.0f) {
-                    tabAnimT_ = std::min(1.0f, tabAnimT_ + 0.22f);
-                    if (tabAnimT_ >= 1.0f) {
+                    float rawTab = std::min(1.0f, static_cast<float>(now - tabAnimStartMs_) / 185.0f);
+                    tabAnimT_ = rawTab;
+                    if (rawTab >= 0.85f && tabCtrlsPendingShow_) {
+                        tabCtrlsPendingShow_ = false;
+                        for (HWND h : settingsCtrls_) ShowWindow(h, activeTab_ == 1 ? SW_SHOW : SW_HIDE);
+                        UpdateGalleryControlVisibility();
+                    }
+                    if (rawTab >= 1.0f) {
                         tabIndicatorY_ = (activeTab_ == 1) ? 160.0f : 118.0f;
                         if (hwnd_) InvalidateRect(hwnd_, nullptr, FALSE);
                     } else if (hwnd_) {
@@ -2745,6 +2828,7 @@ LRESULT MainWindow::OnMessage(UINT msg, WPARAM wParam, LPARAM lParam) {
                     }
                     fastTick = true;
                 }
+
                 if (!fastTick) {
                     if (hwnd_) SetTimer(hwnd_, TIMER_UI_ANIM_ID, 48, nullptr);
                     animPhase_ += 0.16;
