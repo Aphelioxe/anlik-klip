@@ -4,7 +4,10 @@
 #include "sound_fx.h"
 
 #include <commctrl.h>
+#include <gdiplus.h>
 #include <shellapi.h>
+#include <algorithm>
+#include <cmath>
 #include <cstdio>
 
 namespace {
@@ -28,7 +31,21 @@ const wchar_t* kTrayWndClass = L"AnlikKlipMainWnd";
 struct CornerToastData {
     std::wstring title;
     std::wstring sub;
+    int targetX = 0;
+    int targetY = 0;
+    int w = 332;
+    int h = 66;
+    ULONGLONG startMs = 0;
 };
+
+void ToastAddRoundRect(Gdiplus::GraphicsPath& p, float x, float y, float w, float h, float r) {
+    float d = r * 2.0f;
+    p.AddArc(x, y, d, d, 180.0f, 90.0f);
+    p.AddArc(x + w - d, y, d, d, 270.0f, 90.0f);
+    p.AddArc(x + w - d, y + h - d, d, d, 0.0f, 90.0f);
+    p.AddArc(x, y + h - d, d, d, 90.0f, 90.0f);
+    p.CloseFigure();
+}
 
 LRESULT CALLBACK CornerToastProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     auto* data = reinterpret_cast<CornerToastData*>(GetWindowLongPtrW(hwnd, GWLP_USERDATA));
@@ -38,46 +55,129 @@ LRESULT CALLBACK CornerToastProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
             SetWindowLongPtrW(hwnd, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(cs->lpCreateParams));
             return TRUE;
         }
-        case WM_TIMER:
-            DestroyWindow(hwnd);
+        case WM_ERASEBKGND:
+            return 1;
+        case WM_TIMER: {
+            if (!data) {
+                DestroyWindow(hwnd);
+                return 0;
+            }
+            ULONGLONG elapsed = GetTickCount64() - data->startMs;
+            const float inMs = 180.0f;
+            const float holdMs = 2300.0f;
+            const float outMs = 240.0f;
+            const float totalMs = inMs + holdMs + outMs;
+
+            if (static_cast<float>(elapsed) >= totalMs) {
+                KillTimer(hwnd, 1);
+                DestroyWindow(hwnd);
+                return 0;
+            }
+            if (static_cast<float>(elapsed) < inMs) {
+                float t = static_cast<float>(elapsed) / inMs;
+                float ease = 1.0f - std::pow(1.0f - t, 3.0f);
+                int curX = data->targetX + static_cast<int>(std::round((1.0f - ease) * 32.0f));
+                BYTE alpha = static_cast<BYTE>(std::round(ease * 244.0f));
+                SetWindowPos(hwnd, nullptr, curX, data->targetY, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+                SetLayeredWindowAttributes(hwnd, 0, alpha, LWA_ALPHA);
+            } else if (static_cast<float>(elapsed) < inMs + holdMs) {
+                SetWindowPos(hwnd, nullptr, data->targetX, data->targetY, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+                SetLayeredWindowAttributes(hwnd, 0, 244, LWA_ALPHA);
+                InvalidateRect(hwnd, nullptr, FALSE);
+            } else {
+                float t = (static_cast<float>(elapsed) - (inMs + holdMs)) / outMs;
+                float ease = 1.0f - std::pow(t, 2.0f);
+                BYTE alpha = static_cast<BYTE>(std::max(0.0f, std::round(ease * 244.0f)));
+                SetLayeredWindowAttributes(hwnd, 0, alpha, LWA_ALPHA);
+            }
             return 0;
+        }
         case WM_PAINT: {
             PAINTSTRUCT ps{};
             HDC hdc = BeginPaint(hwnd, &ps);
             RECT rc{}; GetClientRect(hwnd, &rc);
-            HBRUSH bg = CreateSolidBrush(RGB(18, 23, 33));
-            FillRect(hdc, &rc, bg);
-            DeleteObject(bg);
+            int w = std::max<int>(1, rc.right);
+            int h = std::max<int>(1, rc.bottom);
 
-            RECT bar{ 0, 0, 5, rc.bottom };
-            HBRUSH acc = CreateSolidBrush(RGB(34, 197, 94));
-            FillRect(hdc, &bar, acc);
-            DeleteObject(acc);
+            HDC memDC = CreateCompatibleDC(hdc);
+            HBITMAP memBmp = CreateCompatibleBitmap(hdc, w, h);
+            HGDIOBJ oldBmp = SelectObject(memDC, memBmp);
 
-            HBRUSH brd = CreateSolidBrush(RGB(48, 60, 82));
-            FrameRect(hdc, &rc, brd);
-            DeleteObject(brd);
+            {
+                Gdiplus::Graphics g(memDC);
+                g.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
+                g.SetTextRenderingHint(Gdiplus::TextRenderingHintClearTypeGridFit);
 
-            if (data) {
-                SetBkMode(hdc, TRANSPARENT);
-                HFONT fBold = CreateFontW(-14, 0, 0, 0, FW_BOLD, FALSE, FALSE, FALSE,
-                    DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
-                    DEFAULT_PITCH, L"Segoe UI");
-                HFONT fSmall = CreateFontW(-12, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
-                    DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
-                    DEFAULT_PITCH, L"Segoe UI");
-                HGDIOBJ oldF = SelectObject(hdc, fBold);
-                SetTextColor(hdc, RGB(240, 246, 252));
-                RECT tr{ 14, 8, rc.right - 10, 28 };
-                DrawTextW(hdc, data->title.c_str(), -1, &tr, DT_LEFT | DT_SINGLELINE | DT_END_ELLIPSIS);
-                SelectObject(hdc, fSmall);
-                SetTextColor(hdc, RGB(154, 165, 180));
-                RECT sr{ 14, 28, rc.right - 10, rc.bottom - 6 };
-                DrawTextW(hdc, data->sub.c_str(), -1, &sr, DT_LEFT | DT_SINGLELINE | DT_END_ELLIPSIS);
-                SelectObject(hdc, oldF);
-                DeleteObject(fBold);
-                DeleteObject(fSmall);
+                // Dark glassmorphic card gradient
+                Gdiplus::LinearGradientBrush bg(
+                    Gdiplus::PointF(0, 0), Gdiplus::PointF(0, static_cast<float>(h)),
+                    Gdiplus::Color(255, 20, 27, 43), Gdiplus::Color(255, 13, 18, 30));
+                g.FillRectangle(&bg, 0, 0, w, h);
+
+                // Subtle emerald glow tint at left
+                Gdiplus::LinearGradientBrush glow(
+                    Gdiplus::PointF(0, 0), Gdiplus::PointF(150.0f, 0),
+                    Gdiplus::Color(42, 34, 197, 94), Gdiplus::Color(0, 34, 197, 94));
+                g.FillRectangle(&glow, 0, 0, 150, h);
+
+                // Rounded inner border
+                Gdiplus::GraphicsPath bp;
+                ToastAddRoundRect(bp, 0.5f, 0.5f, static_cast<float>(w - 1), static_cast<float>(h - 1), 10.0f);
+                Gdiplus::Pen borderPen(Gdiplus::Color(165, 52, 211, 153), 1.2f);
+                g.DrawPath(&borderPen, &bp);
+
+                // Circular emerald badge with crisp anti-aliased checkmark
+                Gdiplus::LinearGradientBrush badgeBr(
+                    Gdiplus::PointF(14, 15), Gdiplus::PointF(48, 49),
+                    Gdiplus::Color(255, 52, 211, 153), Gdiplus::Color(255, 16, 185, 129));
+                g.FillEllipse(&badgeBr, 14.0f, 15.0f, 34.0f, 34.0f);
+
+                Gdiplus::Pen chkPen(Gdiplus::Color(255, 255, 255, 255), 2.5f);
+                chkPen.SetStartCap(Gdiplus::LineCapRound);
+                chkPen.SetEndCap(Gdiplus::LineCapRound);
+                chkPen.SetLineJoin(Gdiplus::LineJoinRound);
+                Gdiplus::PointF pts[3] = {
+                    { 24.5f, 32.5f },
+                    { 29.2f, 37.2f },
+                    { 38.0f, 27.5f }
+                };
+                g.DrawLines(&chkPen, pts, 3);
+
+                if (data) {
+                    Gdiplus::FontFamily ff(L"Segoe UI");
+                    Gdiplus::Font fTitle(&ff, 10.2f, Gdiplus::FontStyleBold, Gdiplus::UnitPoint);
+                    Gdiplus::Font fSub(&ff, 8.6f, Gdiplus::FontStyleRegular, Gdiplus::UnitPoint);
+                    Gdiplus::StringFormat sf;
+                    sf.SetLineAlignment(Gdiplus::StringAlignmentCenter);
+                    sf.SetTrimming(Gdiplus::StringTrimmingEllipsisCharacter);
+                    sf.SetFormatFlags(Gdiplus::StringFormatFlagsNoWrap);
+
+                    Gdiplus::SolidBrush brTitle(Gdiplus::Color(255, 243, 246, 252));
+                    Gdiplus::SolidBrush brSub(Gdiplus::Color(255, 156, 168, 190));
+
+                    g.DrawString(data->title.c_str(), -1, &fTitle,
+                        Gdiplus::RectF(58.0f, 12.0f, static_cast<float>(w - 70), 22.0f), &sf, &brTitle);
+                    g.DrawString(data->sub.c_str(), -1, &fSub,
+                        Gdiplus::RectF(58.0f, 34.0f, static_cast<float>(w - 70), 20.0f), &sf, &brSub);
+
+                    // Bottom progress bar showing remaining display time
+                    ULONGLONG elapsed = GetTickCount64() - data->startMs;
+                    float frac = 1.0f - std::max(0.0f, std::min(1.0f,
+                        (static_cast<float>(elapsed) - 180.0f) / 2300.0f));
+                    Gdiplus::SolidBrush trackBr(Gdiplus::Color(255, 26, 35, 52));
+                    g.FillRectangle(&trackBr, 12.0f, static_cast<float>(h - 4), static_cast<float>(w - 24), 2.5f);
+                    if (frac > 0.01f) {
+                        Gdiplus::SolidBrush progBr(Gdiplus::Color(255, 52, 211, 153));
+                        g.FillRectangle(&progBr, 12.0f, static_cast<float>(h - 4),
+                            static_cast<float>(w - 24) * frac, 2.5f);
+                    }
+                }
             }
+
+            BitBlt(hdc, 0, 0, w, h, memDC, 0, 0, SRCCOPY);
+            SelectObject(memDC, oldBmp);
+            DeleteObject(memBmp);
+            DeleteDC(memDC);
             EndPaint(hwnd, &ps);
             return 0;
         }
@@ -90,6 +190,12 @@ LRESULT CALLBACK CornerToastProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
 }
 
 void ShowCornerToast(HINSTANCE hInst, const std::wstring& title, const std::wstring& sub) {
+    static ULONG_PTR toastGdipToken = 0;
+    if (!toastGdipToken) {
+        Gdiplus::GdiplusStartupInput gsi;
+        Gdiplus::GdiplusStartup(&toastGdipToken, &gsi, nullptr);
+    }
+
     static bool reg = false;
     const wchar_t* cls = L"AnlikKlipCornerToast";
     if (!reg) {
@@ -103,21 +209,23 @@ void ShowCornerToast(HINSTANCE hInst, const std::wstring& title, const std::wstr
     }
     RECT wa{};
     SystemParametersInfoW(SPI_GETWORKAREA, 0, &wa, 0);
-    const int w = 310, h = 56;
-    const int x = wa.right - w - 18;
-    const int y = wa.top + 18;
+    const int w = 332, h = 66;
+    const int x = wa.right - w - 20;
+    const int y = wa.top + 20;
 
-    auto* d = new CornerToastData{ title, sub };
+    auto* d = new CornerToastData{ title, sub, x, y, w, h, GetTickCount64() };
     HWND hw = CreateWindowExW(
         WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_LAYERED,
-        cls, L"", WS_POPUP, x, y, w, h, nullptr, nullptr, hInst, d);
+        cls, L"", WS_POPUP, x + 32, y, w, h, nullptr, nullptr, hInst, d);
     if (!hw) {
         delete d;
         return;
     }
-    SetLayeredWindowAttributes(hw, 0, 240, LWA_ALPHA);
+    HRGN rgn = CreateRoundRectRgn(0, 0, w + 1, h + 1, 20, 20);
+    SetWindowRgn(hw, rgn, TRUE);
+    SetLayeredWindowAttributes(hw, 0, 0, LWA_ALPHA);
     ShowWindow(hw, SW_SHOWNOACTIVATE);
-    SetTimer(hw, 1, 2000, nullptr);
+    SetTimer(hw, 1, 16, nullptr);
 }
 
 } // namespace
@@ -455,9 +563,15 @@ LRESULT TrayUI::OnMessage(UINT msg, WPARAM wParam, LPARAM lParam) {
             if (res) {
                 if (res->ok) {
                     if (app_.Config().soundNotify) PlayClipChime();
-                    size_t sl = res->filePath.find_last_of(L"\\/");
-                    std::wstring fname = (sl != std::wstring::npos) ? res->filePath.substr(sl + 1) : res->filePath;
-                    ShowCornerToast(hInst_, L"✓  Klip Kaydedildi", fname + L"  (" + res->message + L")");
+                    std::wstring durPart;
+                    size_t lp = res->message.find(L'(');
+                    size_t rp = res->message.find(L')', lp != std::wstring::npos ? lp : 0);
+                    if (lp != std::wstring::npos && rp != std::wstring::npos && rp > lp + 1) {
+                        durPart = res->message.substr(lp + 1, rp - lp - 1);
+                    }
+                    std::wstring sub = L"Klasörünüze kaydedildi";
+                    if (!durPart.empty()) sub += L" • " + durPart;
+                    ShowCornerToast(hInst_, L"Klip Kaydedildi", sub);
                 } else {
                     if (app_.Config().soundNotify) PlayErrorTone();
                     ShowBalloon(L"Anlık Klip Hatası", res->message.c_str(), NIIF_WARNING);
