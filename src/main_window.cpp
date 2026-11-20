@@ -590,7 +590,7 @@ void MainWindow::UpdateLayoutForSize(int cw, int ch) {
 
     if (edtSearch_) {
         int sw = std::max(S(240), cw - S(646));
-        SetWindowPos(edtSearch_, nullptr, S(242), S(48), sw, S(24), SWP_NOZORDER | SWP_NOACTIVATE);
+        SetWindowPos(edtSearch_, nullptr, S(248), S(52), sw - S(12), S(16), SWP_NOZORDER | SWP_NOACTIVATE);
     }
 
     if (playerOpen_ && videoHwnd_ && !playerFullscreen_) {
@@ -738,9 +738,9 @@ void MainWindow::CreateControls() {
     };
 
     // Gallery search box (not added to settingsCtrls_; toggled by UpdateGalleryControlVisibility)
-    edtSearch_ = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"",
+    edtSearch_ = CreateWindowExW(0, L"EDIT", L"",
         WS_CHILD | ES_AUTOHSCROLL | WS_TABSTOP,
-        S(242), S(48), S(256), S(24), hwnd_,
+        S(248), S(52), S(244), S(16), hwnd_,
         reinterpret_cast<HMENU>(static_cast<INT_PTR>(ID_EDT_SEARCH)), hInst_, nullptr);
     if (edtSearch_) {
         SendMessageW(edtSearch_, WM_SETFONT, reinterpret_cast<WPARAM>(font_), TRUE);
@@ -782,34 +782,31 @@ void MainWindow::CreateControls() {
 
     // Card 2: Audio & Mic Noise Gate (x=578..898, y=68..248)
     chkGameAudio_ = makeChk(L"Oyun / Sistem Sesi", 594, 98, 134, 22, ID_CHK_GAME_AUDIO);
-    trkGameVol_ = make(TRACKBAR_CLASSW, L"", TBS_HORZ | TBS_AUTOTICKS | WS_TABSTOP, 730, 96, 114, 26, ID_TRK_GAME_VOL);
+    trkGameVol_ = make(TRACKBAR_CLASSW, L"", TBS_HORZ | TBS_NOTICKS | WS_TABSTOP, 730, 96, 114, 26, ID_TRK_GAME_VOL);
     SendMessageW(trkGameVol_, TBM_SETRANGE, TRUE, MAKELPARAM(0, 200));
-    SendMessageW(trkGameVol_, TBM_SETTICFREQ, 50, 0);
     lblGameVol_ = make(L"STATIC", L"%100", SS_RIGHT, 846, 100, 38, 20);
 
     chkMicAudio_ = makeChk(L"Mikrofon", 594, 130, 72, 22, ID_CHK_MIC_AUDIO);
     chkMicMute_ = makeChk(L"Sustur", 668, 130, 58, 22, ID_CHK_MIC_MUTE);
-    trkMicVol_ = make(TRACKBAR_CLASSW, L"", TBS_HORZ | TBS_AUTOTICKS | WS_TABSTOP, 730, 128, 114, 26, ID_TRK_MIC_VOL);
+    trkMicVol_ = make(TRACKBAR_CLASSW, L"", TBS_HORZ | TBS_NOTICKS | WS_TABSTOP, 730, 128, 114, 26, ID_TRK_MIC_VOL);
     SendMessageW(trkMicVol_, TBM_SETRANGE, TRUE, MAKELPARAM(0, 200));
-    SendMessageW(trkMicVol_, TBM_SETTICFREQ, 50, 0);
     lblMicVol_ = make(L"STATIC", L"%100", SS_RIGHT, 846, 132, 38, 20);
 
     makeLbl(L"Cihaz:", 594, 163, 46, 20);
     cmbMicDev_ = makeHiddenCombo(642, 160, 240, 180, ID_CMB_MIC_DEV);
 
     chkMicGate_ = makeChk(L"Gürültü Kapısı", 594, 194, 108, 22, ID_CHK_MIC_GATE);
-    trkMicGate_ = make(TRACKBAR_CLASSW, L"", TBS_HORZ | TBS_AUTOTICKS | WS_TABSTOP, 704, 192, 122, 26, ID_TRK_MIC_GATE);
+    trkMicGate_ = make(TRACKBAR_CLASSW, L"", TBS_HORZ | TBS_NOTICKS | WS_TABSTOP, 704, 192, 122, 26, ID_TRK_MIC_GATE);
     SendMessageW(trkMicGate_, TBM_SETRANGE, TRUE, MAKELPARAM(-60, -15));
-    SendMessageW(trkMicGate_, TBM_SETTICFREQ, 5, 0);
     lblMicGate_ = make(L"STATIC", L"-36 dB", SS_RIGHT, 828, 195, 56, 20);
 
     // Card 3: Hotkeys, Folder, Notifications (x=242..898, y=258..528)
     makeLbl(L"Klip Alma Tuşu (ör. F12):", 258, 294, 165, 20);
-    edtClipHotkey_ = make(L"EDIT", L"", ES_READONLY | WS_TABSTOP, 428, 291, 196, 24, 0, WS_EX_CLIENTEDGE);
+    edtClipHotkey_ = make(L"EDIT", L"", ES_READONLY | WS_TABSTOP, 434, 295, 184, 17, 0, 0);
     btnSetClipHotkey_ = make(L"BUTTON", L"Tuş Ata", BS_OWNERDRAW | WS_TABSTOP, 632, 290, 96, 26, ID_BTN_SET_CLIP_HK);
 
     makeLbl(L"Mikrofon Susturma Tuşu:", 258, 328, 165, 20);
-    edtMicHotkey_ = make(L"EDIT", L"", ES_READONLY | WS_TABSTOP, 428, 325, 196, 24, 0, WS_EX_CLIENTEDGE);
+    edtMicHotkey_ = make(L"EDIT", L"", ES_READONLY | WS_TABSTOP, 434, 329, 184, 17, 0, 0);
     btnSetMicHotkey_ = make(L"BUTTON", L"Tuş Ata", BS_OWNERDRAW | WS_TABSTOP, 632, 324, 96, 26, ID_BTN_SET_MIC_HK);
     btnClearMicHotkey_ = make(L"BUTTON", L"Temizle", BS_OWNERDRAW | WS_TABSTOP, 736, 324, 86, 26, ID_BTN_CLR_MIC_HK);
 
@@ -823,7 +820,7 @@ void MainWindow::CreateControls() {
     if (elev) EnableWindow(btnRestartAdmin_, FALSE);
 
     makeLbl(L"Kayıt Klasörü:", 258, 396, 95, 20);
-    edtOutDir_ = make(L"EDIT", L"", ES_AUTOHSCROLL | WS_TABSTOP, 358, 393, 366, 24, 0, WS_EX_CLIENTEDGE);
+    edtOutDir_ = make(L"EDIT", L"", ES_AUTOHSCROLL | WS_TABSTOP, 364, 397, 354, 17, 0, 0);
     btnBrowseDir_ = make(L"BUTTON", L"Seç...", BS_OWNERDRAW | WS_TABSTOP, 732, 392, 72, 26, ID_BTN_BROWSE_DIR);
     btnOpenDir_ = make(L"BUTTON", L"Aç", BS_OWNERDRAW | WS_TABSTOP, 810, 392, 72, 26, ID_BTN_OPEN_DIR);
 
@@ -1850,6 +1847,11 @@ void MainWindow::PaintWindow(HDC targetDc) {
         sfCenter.SetLineAlignment(Gdiplus::StringAlignmentCenter);
         sfCenter.SetFormatFlags(Gdiplus::StringFormatFlagsNoWrap);
 
+        Gdiplus::StringFormat sfRight;
+        sfRight.SetAlignment(Gdiplus::StringAlignmentFar);
+        sfRight.SetLineAlignment(Gdiplus::StringAlignmentCenter);
+        sfRight.SetFormatFlags(Gdiplus::StringFormatFlagsNoWrap);
+
         const float pulse01 = static_cast<float>(0.5 + 0.5 * std::sin(animPhase_));
 
         // Brand emblem (blue->violet gradient + pulsing live ring)
@@ -1954,18 +1956,21 @@ void MainWindow::PaintWindow(HDC targetDc) {
         // Telemetry card & quick controls anchored cleanly to bottom of sidebar
         const int sideAnchorY = std::max(0, (ch - S(620)));
         const int telY = S(358) + sideAnchorY;
-        FillRoundRect(g, (float)S(16), (float)telY, (float)S(188), (float)S(120), (float)S(10), Gc(26, 32, 44));
-        StrokeRoundRect(g, (float)S(16), (float)telY, (float)S(188), (float)S(120), (float)S(10), Gc(44, 54, 72));
+        FillRoundRect(g, (float)S(16), (float)telY, (float)S(188), (float)S(120), (float)S(10), Gc(22, 28, 42));
+        StrokeRoundRect(g, (float)S(16), (float)telY, (float)S(188), (float)S(120), (float)S(10), Gc(44, 56, 80));
         double bufMb = static_cast<double>(st.ring.videoBytes + st.ring.audioBytes) / (1024.0 * 1024.0);
-        wchar_t t1[64], t2[64], t3[64], t4[64];
-        swprintf(t1, 64, L"RAM: %.1f MB", st.workingSetMb);
-        swprintf(t2, 64, L"Tampon: %.1f MB", bufMb);
-        swprintf(t3, 64, L"Süre: %.0f / %d sn", st.ring.bufferedSeconds, app_.Config().clipSeconds);
+        wchar_t v1[32], v2[32], v3[32], t4[64];
+        swprintf(v1, 32, L"%.1f MB", st.workingSetMb);
+        swprintf(v2, 32, L"%.1f MB", bufMb);
+        swprintf(v3, 32, L"%.0f / %d sn", st.ring.bufferedSeconds, app_.Config().clipSeconds);
         std::wstring hk = FormatHotkey(app_.Config().hotkeyMods, app_.Config().hotkeyVk);
         swprintf(t4, 64, L"Kısayol: %ls", hk.c_str());
-        g.DrawString(t1, -1, &fSub, Gdiplus::RectF((float)S(28), (float)(telY + S(10)), (float)S(164), (float)S(20)), &sfLeft, &brText);
-        g.DrawString(t2, -1, &fSub, Gdiplus::RectF((float)S(28), (float)(telY + S(32)), (float)S(164), (float)S(20)), &sfLeft, &brMuted);
-        g.DrawString(t3, -1, &fSub, Gdiplus::RectF((float)S(28), (float)(telY + S(54)), (float)S(164), (float)S(20)), &sfLeft, &brMuted);
+        g.DrawString(L"RAM", -1, &fSmall, Gdiplus::RectF((float)S(28), (float)(telY + S(10)), (float)S(72), (float)S(20)), &sfLeft, &brMuted);
+        g.DrawString(v1, -1, &fSub, Gdiplus::RectF((float)S(92), (float)(telY + S(10)), (float)S(100), (float)S(20)), &sfRight, &brText);
+        g.DrawString(L"Tampon", -1, &fSmall, Gdiplus::RectF((float)S(28), (float)(telY + S(32)), (float)S(72), (float)S(20)), &sfLeft, &brMuted);
+        g.DrawString(v2, -1, &fSub, Gdiplus::RectF((float)S(92), (float)(telY + S(32)), (float)S(100), (float)S(20)), &sfRight, &brText);
+        g.DrawString(L"Süre", -1, &fSmall, Gdiplus::RectF((float)S(28), (float)(telY + S(54)), (float)S(72), (float)S(20)), &sfLeft, &brMuted);
+        g.DrawString(v3, -1, &fSub, Gdiplus::RectF((float)S(92), (float)(telY + S(54)), (float)S(100), (float)S(20)), &sfRight, &brText);
         {
             float pFrac = app_.Config().clipSeconds > 0
                 ? static_cast<float>(std::max(0.0, std::min(1.0, st.ring.bufferedSeconds / app_.Config().clipSeconds)))
@@ -2333,6 +2338,11 @@ void MainWindow::PaintWindow(HDC targetDc) {
             addBtn(BTN_TOP_FOLDER, 710, 14, 98, 30, L"Klasörü Aç", Gc(28, 34, 47), Gc(40, 49, 68), Gc(52, 64, 86));
             addBtn(BTN_TOP_REFRESH, 816, 14, 82, 30, L"Yenile", Gc(28, 34, 47), Gc(40, 49, 68), Gc(52, 64, 86));
 
+            {
+                int sw = std::max(S(240), cw - S(646));
+                FillRoundRect(g, (float)S(242), (float)S(48), (float)sw, (float)S(24), (float)S(7), Gc(24, 30, 44));
+                StrokeRoundRect(g, (float)S(242), (float)S(48), (float)sw, (float)S(24), (float)S(7), Gc(54, 70, 102));
+            }
             if (!searchQuery_.empty()) {
                 addBtn(BTN_TOP_CLEAR_SEARCH, 504, 48, 26, 24, L"✕", Gc(44, 54, 72), Gc(64, 78, 104), Gc(82, 98, 128));
             }
@@ -2629,6 +2639,14 @@ void MainWindow::PaintWindow(HDC targetDc) {
             g.DrawString(L"Oyun İçi Kısayol, Bildirim ve Klasör", -1, &fBold,
                 Gdiplus::RectF((float)(S(258) + sox), (float)S(264), (float)S(340), (float)S(22)), &sfLeft, &brPurpTxt);
 
+            auto drawInputPill = [&](int ix, int iy, int iw, int ih) {
+                FillRoundRect(g, (float)ix, (float)iy, (float)iw, (float)ih, (float)S(7), Gc(24, 30, 44));
+                StrokeRoundRect(g, (float)ix, (float)iy, (float)iw, (float)ih, (float)S(7), Gc(54, 70, 102));
+            };
+            drawInputPill(S(428) + sox, S(291), S(196), S(24));
+            drawInputPill(S(428) + sox, S(325), S(196), S(24));
+            drawInputPill(S(358) + sox, S(393), S(366), S(24));
+
             {
                 const AppConfig& mc = app_.Config();
                 wchar_t mobTxt[160] = {};
@@ -2896,36 +2914,109 @@ LRESULT MainWindow::OnMessage(UINT msg, WPARAM wParam, LPARAM lParam) {
             }
             bool disabled = (dis->itemState & ODS_DISABLED) != 0;
             bool pressed = (dis->itemState & ODS_SELECTED) != 0;
+            bool isMainAction = (dis->CtlID == ID_BTN_APPLY || dis->CtlID == ID_BTN_EXIT_APP);
 
-            COLORREF fill = kRgbInput;
-            COLORREF border = kRgbBorder;
-            if (dis->CtlID == ID_BTN_APPLY) {
-                fill = pressed ? RGB(29, 78, 216) : RGB(37, 99, 235);
-                border = RGB(96, 165, 250);
+            Gdiplus::Graphics bgG(hdc);
+            bgG.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
+            bgG.SetTextRenderingHint(Gdiplus::TextRenderingHintClearTypeGridFit);
+
+            Gdiplus::Color parentBg = isMainAction ? Gc(11, 15, 25) : Gc(16, 21, 33);
+            Gdiplus::SolidBrush pbr(parentBg);
+            bgG.FillRectangle(&pbr, 0, 0, rc.right - rc.left, rc.bottom - rc.top);
+
+            Gdiplus::Color topCol = Gc(34, 44, 66), botCol = Gc(24, 31, 48), brdCol = Gc(64, 82, 118);
+            if (disabled) {
+                topCol = Gc(22, 28, 40);
+                botCol = Gc(19, 24, 35);
+                brdCol = Gc(44, 54, 74);
+            } else if (dis->CtlID == ID_BTN_APPLY) {
+                topCol = pressed ? Gc(30, 64, 175) : Gc(59, 130, 246);
+                botCol = pressed ? Gc(29, 78, 216) : Gc(37, 99, 235);
+                brdCol = Gc(147, 197, 253, 180);
             } else if (dis->CtlID == ID_BTN_EXIT_APP) {
-                fill = pressed ? RGB(127, 29, 29) : RGB(153, 27, 27);
-                border = RGB(220, 38, 38);
+                topCol = pressed ? Gc(127, 29, 29) : Gc(185, 28, 28);
+                botCol = pressed ? Gc(100, 22, 22) : Gc(139, 24, 24);
+                brdCol = Gc(248, 113, 113, 150);
+            } else if (dis->CtlID == ID_BTN_MOBILE_QR) {
+                topCol = pressed ? Gc(67, 24, 130) : Gc(91, 33, 182, 180);
+                botCol = pressed ? Gc(50, 18, 100) : Gc(67, 24, 130, 180);
+                brdCol = Gc(168, 85, 247, 170);
             } else if (pressed) {
-                fill = RGB(48, 58, 78);
+                topCol = Gc(46, 58, 86);
+                botCol = Gc(34, 44, 66);
+                brdCol = Gc(96, 165, 250);
             }
-            HBRUSH br = CreateSolidBrush(fill);
-            FillRect(hdc, &rc, br);
-            DeleteObject(br);
-            HPEN pen = CreatePen(PS_SOLID, 1, border);
-            HGDIOBJ op = SelectObject(hdc, pen);
-            HGDIOBJ ob = SelectObject(hdc, GetStockObject(NULL_BRUSH));
-            Rectangle(hdc, rc.left, rc.top, rc.right, rc.bottom);
-            SelectObject(hdc, ob);
-            SelectObject(hdc, op);
-            DeleteObject(pen);
+
+            float bw = static_cast<float>(rc.right - rc.left);
+            float bh = static_cast<float>(rc.bottom - rc.top);
+            float rad = isMainAction ? static_cast<float>(S(10)) : static_cast<float>(S(7));
+            FillRoundRectGrad(bgG, 0.5f, 0.5f, bw - 1.0f, bh - 1.0f, rad, topCol, botCol);
+            StrokeRoundRect(bgG, 0.5f, 0.5f, bw - 1.0f, bh - 1.0f, rad, brdCol);
 
             wchar_t txt[128] = {};
             GetWindowTextW(dis->hwndItem, txt, 128);
-            SetBkMode(hdc, TRANSPARENT);
-            SetTextColor(hdc, disabled ? kRgbMuted : kRgbText);
-            SelectObject(hdc, (dis->CtlID == ID_BTN_APPLY || dis->CtlID == ID_BTN_EXIT_APP) ? boldFont_ : font_);
-            DrawTextW(hdc, txt, -1, const_cast<RECT*>(&rc), DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+            Gdiplus::Font fBtn(hdc, isMainAction ? boldFont_ : font_);
+            Gdiplus::StringFormat sfBtn;
+            sfBtn.SetAlignment(Gdiplus::StringAlignmentCenter);
+            sfBtn.SetLineAlignment(Gdiplus::StringAlignmentCenter);
+            sfBtn.SetFormatFlags(Gdiplus::StringFormatFlagsNoWrap);
+            Gdiplus::SolidBrush tbr(disabled ? Gc(110, 124, 148) : Gc(243, 246, 252));
+            bgG.DrawString(txt, -1, &fBtn, Gdiplus::RectF(0.0f, 0.0f, bw, bh), &sfBtn, &tbr);
             return TRUE;
+        }
+
+        case WM_NOTIFY: {
+            const auto* nm = reinterpret_cast<const NMHDR*>(lParam);
+            if (nm && nm->code == NM_CUSTOMDRAW &&
+                (nm->hwndFrom == trkGameVol_ || nm->hwndFrom == trkMicVol_ || nm->hwndFrom == trkMicGate_)) {
+                const auto* cd = reinterpret_cast<const NMCUSTOMDRAW*>(lParam);
+                if (cd->dwDrawStage == CDDS_PREPAINT) {
+                    return CDRF_NOTIFYITEMDRAW;
+                }
+                if (cd->dwDrawStage == CDDS_ITEMPREPAINT) {
+                    if (cd->dwItemSpec == TBCD_TICS) {
+                        return CDRF_SKIPDEFAULT;
+                    }
+                    if (cd->dwItemSpec == TBCD_CHANNEL) {
+                        Gdiplus::Graphics tg(cd->hdc);
+                        tg.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
+                        RECT chRc = cd->rc;
+                        float cx = static_cast<float>(chRc.left);
+                        float cw = static_cast<float>(std::max<LONG>(1, chRc.right - chRc.left));
+                        float cy = static_cast<float>((chRc.top + chRc.bottom) / 2 - S(2));
+                        float ch = static_cast<float>(S(4));
+                        FillRoundRect(tg, cx, cy, cw, ch, ch * 0.5f, Gc(32, 42, 62));
+
+                        LRESULT pos = SendMessageW(nm->hwndFrom, TBM_GETPOS, 0, 0);
+                        LRESULT mn = SendMessageW(nm->hwndFrom, TBM_GETRANGEMIN, 0, 0);
+                        LRESULT mx = SendMessageW(nm->hwndFrom, TBM_GETRANGEMAX, 0, 0);
+                        float frac = (mx > mn) ? static_cast<float>(pos - mn) / static_cast<float>(mx - mn) : 0.0f;
+                        frac = std::max(0.0f, std::min(1.0f, frac));
+                        if (frac > 0.01f) {
+                            Gdiplus::Color c1 = (nm->hwndFrom == trkMicGate_) ? Gc(251, 191, 36) : Gc(52, 211, 153);
+                            Gdiplus::Color c2 = (nm->hwndFrom == trkMicGate_) ? Gc(245, 158, 11) : Gc(16, 185, 129);
+                            FillRoundRectGrad(tg, cx, cy, cw * frac, ch, ch * 0.5f, c1, c2);
+                        }
+                        return CDRF_SKIPDEFAULT;
+                    }
+                    if (cd->dwItemSpec == TBCD_THUMB) {
+                        Gdiplus::Graphics tg(cd->hdc);
+                        tg.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
+                        RECT tr = cd->rc;
+                        float cx = static_cast<float>(tr.left + tr.right) * 0.5f;
+                        float cy = static_cast<float>(tr.top + tr.bottom) * 0.5f;
+                        float r = static_cast<float>(S(6));
+                        Gdiplus::Color accent = (nm->hwndFrom == trkMicGate_) ? Gc(251, 191, 36) : Gc(52, 211, 153);
+                        Gdiplus::SolidBrush outerBr(accent);
+                        Gdiplus::SolidBrush innerBr(Gc(248, 250, 252));
+                        tg.FillEllipse(&outerBr, cx - r, cy - r, r * 2.0f, r * 2.0f);
+                        float ir = r * 0.62f;
+                        tg.FillEllipse(&innerBr, cx - ir, cy - ir, ir * 2.0f, ir * 2.0f);
+                        return CDRF_SKIPDEFAULT;
+                    }
+                }
+            }
+            break;
         }
 
         case WM_MOUSEMOVE: {
