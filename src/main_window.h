@@ -90,6 +90,8 @@ private:
     void UpdateLayoutForSize(int cw, int ch);
     RECT GetGridViewportRect() const;
     void GetGridMetrics(int& outCols, int& outCardW, int& outCardH, int& outGapX, int& outGapY) const;
+    void ComputeGalleryLayout(std::vector<RECT>& outCardRects, int& outFavHeaderY, int& outNormHeaderY,
+        int& outTotalH, int& outFavCount, int& outNormCount) const;
     int HitTestCard(int mx, int my) const;
     int HitTestCardStar(int mx, int my) const;
     int HitTestTrimHandle(int mx, int my) const;

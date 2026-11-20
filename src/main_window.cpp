@@ -1053,6 +1053,8 @@ void MainWindow::RebuildFilteredView(const std::wstring& preferPath) {
         }
         filteredIndices_.push_back(i);
     }
+    std::stable_partition(filteredIndices_.begin(), filteredIndices_.end(),
+        [&](size_t idx) { return clips_[idx].isFavorite; });
 
     selectedIdx_ = filteredIndices_.empty() ? -1 : 0;
     if (!want.empty()) {
@@ -1578,13 +1580,68 @@ void MainWindow::GetGridMetrics(int& outCols, int& outCardW, int& outCardH, int&
     outCardH = thumbH + S(58);
 }
 
+void MainWindow::ComputeGalleryLayout(std::vector<RECT>& outCardRects, int& outFavHeaderY, int& outNormHeaderY,
+                                      int& outTotalH, int& outFavCount, int& outNormCount) const {
+    outCardRects.clear();
+    outFavHeaderY = -1;
+    outNormHeaderY = -1;
+    outTotalH = 0;
+    outFavCount = 0;
+    outNormCount = 0;
+    if (filteredIndices_.empty()) return;
+
+    RECT vp = GetGridViewportRect();
+    int cols = 2, cardW = S(312), cardH = S(226), gapX = S(16), gapY = S(14);
+    GetGridMetrics(cols, cardW, cardH, gapX, gapY);
+
+    for (size_t idx : filteredIndices_) {
+        if (clips_[idx].isFavorite) ++outFavCount;
+        else break;
+    }
+    outNormCount = static_cast<int>(filteredIndices_.size()) - outFavCount;
+    outCardRects.resize(filteredIndices_.size());
+
+    int curY = vp.top;
+    if (outFavCount > 0) {
+        outFavHeaderY = curY;
+        curY += S(30);
+        for (int i = 0; i < outFavCount; ++i) {
+            int col = i % cols;
+            int row = i / cols;
+            int x = vp.left + col * (cardW + gapX);
+            int y = curY + row * (cardH + gapY);
+            outCardRects[static_cast<size_t>(i)] = RECT{ x, y, x + cardW, y + cardH };
+        }
+        int favRows = (outFavCount + cols - 1) / cols;
+        curY += favRows * cardH + (favRows - 1) * gapY;
+        if (outNormCount > 0) {
+            curY += S(20);
+        }
+    }
+
+    if (outNormCount > 0) {
+        outNormHeaderY = curY;
+        curY += S(30);
+        for (int j = 0; j < outNormCount; ++j) {
+            int col = j % cols;
+            int row = j / cols;
+            int x = vp.left + col * (cardW + gapX);
+            int y = curY + row * (cardH + gapY);
+            outCardRects[static_cast<size_t>(outFavCount + j)] = RECT{ x, y, x + cardW, y + cardH };
+        }
+        int normRows = (outNormCount + cols - 1) / cols;
+        curY += normRows * cardH + (normRows - 1) * gapY;
+    }
+
+    outTotalH = curY - vp.top;
+}
+
 void MainWindow::ClampScroll() {
     RECT vp = GetGridViewportRect();
     int vpH = vp.bottom - vp.top;
-    int cols = 2, cardW = S(312), cardH = S(226), gapX = S(16), gapY = S(14);
-    GetGridMetrics(cols, cardW, cardH, gapX, gapY);
-    int rows = (static_cast<int>(filteredIndices_.size()) + cols - 1) / cols;
-    int totalH = rows > 0 ? (rows * cardH + (rows - 1) * gapY) : 0;
+    std::vector<RECT> cardRects;
+    int favHy = -1, normHy = -1, totalH = 0, favCnt = 0, normCnt = 0;
+    ComputeGalleryLayout(cardRects, favHy, normHy, totalH, favCnt, normCnt);
     maxScrollY_ = std::max(0, totalH - vpH);
     scrollY_ = std::max(0, std::min(maxScrollY_, scrollY_));
 }
@@ -1594,15 +1651,15 @@ int MainWindow::HitTestCard(int mx, int my) const {
     RECT vp = GetGridViewportRect();
     if (mx < vp.left || mx > vp.right - S(12) || my < vp.top || my > vp.bottom) return -1;
 
-    int cols = 2, cardW = S(312), cardH = S(226), gapX = S(16), gapY = S(14);
-    GetGridMetrics(cols, cardW, cardH, gapX, gapY);
+    std::vector<RECT> cardRects;
+    int favHy = -1, normHy = -1, totalH = 0, favCnt = 0, normCnt = 0;
+    ComputeGalleryLayout(cardRects, favHy, normHy, totalH, favCnt, normCnt);
 
-    for (size_t vi = 0; vi < filteredIndices_.size(); ++vi) {
-        int col = static_cast<int>(vi % cols);
-        int row = static_cast<int>(vi / cols);
-        int x = vp.left + col * (cardW + gapX);
-        int y = vp.top + row * (cardH + gapY) - scrollY_;
-        if (mx >= x && mx <= x + cardW && my >= y && my <= y + cardH) {
+    for (size_t vi = 0; vi < cardRects.size(); ++vi) {
+        RECT r = cardRects[vi];
+        r.top -= scrollY_;
+        r.bottom -= scrollY_;
+        if (mx >= r.left && mx <= r.right && my >= r.top && my <= r.bottom) {
             return static_cast<int>(vi);
         }
     }
@@ -1614,14 +1671,14 @@ int MainWindow::HitTestCardStar(int mx, int my) const {
     RECT vp = GetGridViewportRect();
     if (mx < vp.left || mx > vp.right - S(12) || my < vp.top || my > vp.bottom) return -1;
 
-    int cols = 2, cardW = S(312), cardH = S(226), gapX = S(16), gapY = S(14);
-    GetGridMetrics(cols, cardW, cardH, gapX, gapY);
+    std::vector<RECT> cardRects;
+    int favHy = -1, normHy = -1, totalH = 0, favCnt = 0, normCnt = 0;
+    ComputeGalleryLayout(cardRects, favHy, normHy, totalH, favCnt, normCnt);
 
-    for (size_t vi = 0; vi < filteredIndices_.size(); ++vi) {
-        int col = static_cast<int>(vi % cols);
-        int row = static_cast<int>(vi / cols);
-        int cx = vp.left + col * (cardW + gapX);
-        int cy = vp.top + row * (cardH + gapY) - scrollY_;
+    for (size_t vi = 0; vi < cardRects.size(); ++vi) {
+        int cx = cardRects[vi].left;
+        int cy = cardRects[vi].top - scrollY_;
+        int cardW = cardRects[vi].right - cardRects[vi].left;
         int tx = cx + S(7), ty = cy + S(7), tw = cardW - S(14);
         int sx = tx + tw - S(32), sy = ty + S(6);
         if (mx >= sx && mx <= sx + S(26) && my >= sy && my <= sy + S(24)) {
@@ -2412,16 +2469,42 @@ void MainWindow::PaintWindow(HDC targetDc) {
                 }
             } else {
                 g.SetClip(Gdiplus::Rect(vp.left, vp.top, vp.right - vp.left, vp.bottom - vp.top));
-                const int cardW = S(312);
-                const int cardH = S(226);
-                const int gapX = S(16);
-                const int gapY = S(14);
+                std::vector<RECT> cardRects;
+                int favHy = -1, normHy = -1, totalH = 0, favCnt = 0, normCnt = 0;
+                ComputeGalleryLayout(cardRects, favHy, normHy, totalH, favCnt, normCnt);
 
-                for (size_t vi = 0; vi < filteredIndices_.size(); ++vi) {
-                    int col = static_cast<int>(vi % 2);
-                    int row = static_cast<int>(vi / 2);
-                    int cx = vp.left + col * (cardW + gapX);
-                    int cy = vp.top + row * (cardH + gapY) - scrollY_;
+                auto drawSectionHeader = [&](int hy, const wchar_t* title, int count, Gdiplus::Color accent, bool withTopDivider) {
+                    int y = hy - scrollY_;
+                    if (y + S(28) < vp.top || y > vp.bottom) return;
+                    if (withTopDivider) {
+                        Gdiplus::Pen divPen(Gc(38, 48, 68), 1.0f);
+                        g.DrawLine(&divPen, vp.left, y - S(10), vp.right - S(16), y - S(10));
+                    }
+                    FillRoundRect(g, (float)vp.left, (float)(y + S(4)), (float)S(3), (float)S(16), 1.5f, accent);
+                    Gdiplus::SolidBrush hdrBr(accent);
+                    g.DrawString(title, -1, &fBold,
+                        Gdiplus::RectF((float)(vp.left + S(10)), (float)y, (float)S(160), (float)S(24)), &sfLeft, &hdrBr);
+
+                    wchar_t cntBuf[16] = {};
+                    swprintf(cntBuf, 16, L"%d", count);
+                    FillRoundRect(g, (float)(vp.left + S(148)), (float)(y + S(3)), (float)S(32), (float)S(18), (float)S(9),
+                        Gc(accent.GetR(), accent.GetG(), accent.GetB(), 38));
+                    g.DrawString(cntBuf, -1, &fSmall,
+                        Gdiplus::RectF((float)(vp.left + S(148)), (float)(y + S(3)), (float)S(32), (float)S(18)), &sfCenter, &hdrBr);
+                };
+
+                if (favHy >= 0) {
+                    drawSectionHeader(favHy, L"★  Favoriler", favCnt, Gc(250, 204, 21), false);
+                }
+                if (normHy >= 0) {
+                    drawSectionHeader(normHy, L"Normal Klipler", normCnt, Gc(147, 197, 253), favCnt > 0);
+                }
+
+                for (size_t vi = 0; vi < cardRects.size(); ++vi) {
+                    int cx = cardRects[vi].left;
+                    int cy = cardRects[vi].top - scrollY_;
+                    int cardW = cardRects[vi].right - cardRects[vi].left;
+                    int cardH = cardRects[vi].bottom - cardRects[vi].top;
                     if (cy + cardH < vp.top || cy > vp.bottom) continue;
 
                     bool sel = (static_cast<int>(vi) == selectedIdx_);
@@ -2439,7 +2522,7 @@ void MainWindow::PaintWindow(HDC targetDc) {
                         sel ? Gc(56, 189, 248) : (hov ? Gc(96, 165, 250) : Gc(44, 54, 76)),
                         sel ? 2.0f : (hov ? 1.5f : 1.0f));
 
-                    int tx = cx + S(7), ty = cy + S(7), tw = S(298), th = S(168);
+                    int tx = cx + S(7), ty = cy + S(7), tw = std::max(S(160), cardW - S(14)), th = (tw * 9) / 16;
                     auto it = thumbBmps_.find(c.filePath);
                     if (it != thumbBmps_.end() && it->second) {
                         Gdiplus::GraphicsState saved = g.Save();
