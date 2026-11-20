@@ -1189,8 +1189,30 @@ void MainWindow::OpenEmbeddedPlayer(int viewIdx) {
     ++playerGen_;
     playerCb_ = new PlayerCallbackImpl(hwnd_, playerGen_);
     HRESULT hr = MFPCreateMediaPlayer(
-        playerClipPath_.c_str(), FALSE, MFP_OPTION_FREE_THREADED_CALLBACK,
+        nullptr, FALSE, MFP_OPTION_NONE,
         playerCb_, videoHwnd_, &player_);
+    if (SUCCEEDED(hr) && player_) {
+        IMFPMediaItem* item = nullptr;
+        hr = player_->CreateMediaItemFromURL(playerClipPath_.c_str(), FALSE, 0, &item);
+        if (SUCCEEDED(hr) && item) {
+            DWORD nStreams = 0;
+            if (SUCCEEDED(item->GetNumberOfStreams(&nStreams)) && nStreams > 1) {
+                bool pickedAudio = false;
+                for (DWORD si = 0; si < nStreams; ++si) {
+                    PROPVARIANT vt;
+                    PropVariantInit(&vt);
+                    if (SUCCEEDED(item->GetStreamAttribute(si, MF_SD_MAJOR_TYPE, &vt)) &&
+                        vt.vt == VT_CLSID && vt.puuid && *vt.puuid == MFMediaType_Audio) {
+                        item->SetStreamSelection(si, !pickedAudio ? TRUE : FALSE);
+                        pickedAudio = true;
+                    }
+                    PropVariantClear(&vt);
+                }
+            }
+            hr = player_->SetMediaItem(item);
+            item->Release();
+        }
+    }
     if (FAILED(hr) || !player_) {
         Logger::Log("OpenEmbeddedPlayer failed hr=0x%08lx", (unsigned long)hr);
         CloseEmbeddedPlayer();
@@ -3152,6 +3174,8 @@ LRESULT MainWindow::OnMessage(UINT msg, WPARAM wParam, LPARAM lParam) {
                     } else if (ev->type == MFP_EVENT_TYPE_PLAY) {
                         playerPlaying_ = true;
                         playerEnded_ = false;
+                        player_->SetVolume(playerVol_);
+                        player_->SetMute(playerMuted_ ? TRUE : FALSE);
                     } else if (ev->type == MFP_EVENT_TYPE_PAUSE) {
                         playerPlaying_ = false;
                     } else if (ev->type == MFP_EVENT_TYPE_ERROR) {
