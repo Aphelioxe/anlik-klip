@@ -1201,7 +1201,7 @@ void MainWindow::OpenEmbeddedPlayer(int viewIdx) {
                 for (DWORD si = 0; si < nStreams; ++si) {
                     PROPVARIANT vt;
                     PropVariantInit(&vt);
-                    if (SUCCEEDED(item->GetStreamAttribute(si, MF_SD_MAJOR_TYPE, &vt)) &&
+                    if (SUCCEEDED(item->GetStreamAttribute(si, MF_MT_MAJOR_TYPE, &vt)) &&
                         vt.vt == VT_CLSID && vt.puuid && *vt.puuid == MFMediaType_Audio) {
                         item->SetStreamSelection(si, !pickedAudio ? TRUE : FALSE);
                         pickedAudio = true;
