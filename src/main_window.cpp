@@ -1181,7 +1181,7 @@ void MainWindow::OpenEmbeddedPlayer(int viewIdx) {
     ++playerGen_;
     playerCb_ = new PlayerCallbackImpl(hwnd_, playerGen_);
     HRESULT hr = MFPCreateMediaPlayer(
-        playerClipPath_.c_str(), FALSE, MFP_OPTION_NONE,
+        playerClipPath_.c_str(), FALSE, MFP_OPTION_FREE_THREADED_CALLBACK,
         playerCb_, videoHwnd_, &player_);
     if (FAILED(hr) || !player_) {
         Logger::Log("OpenEmbeddedPlayer failed hr=0x%08lx", (unsigned long)hr);
@@ -1487,7 +1487,16 @@ void MainWindow::CyclePlayerRate() {
     else if (playerRate_ < 1.25f) playerRate_ = 1.5f;
     else if (playerRate_ < 1.75f) playerRate_ = 2.0f;
     else playerRate_ = 0.5f;
-    if (player_) player_->SetRate(playerRate_);
+    if (player_) {
+        HRESULT hr = player_->SetRate(playerRate_);
+        if (FAILED(hr)) {
+            float minR = 0.5f, maxR = 1.0f;
+            if (SUCCEEDED(player_->GetSupportedRates(FALSE, &minR, &maxR)) && maxR >= 0.5f) {
+                playerRate_ = std::max(minR, std::min(maxR, playerRate_));
+                player_->SetRate(playerRate_);
+            }
+        }
+    }
     if (hwnd_) {
         RECT cli{}; GetClientRect(hwnd_, &cli);
         RECT ctrlRc = playerFullscreen_
