@@ -743,9 +743,12 @@ void MainWindow::CreateControls() {
         SendMessageW(edtSearch_, EM_SETCUEBANNER, TRUE, reinterpret_cast<LPARAM>(L"Klip ara..."));
     }
 
+    const DWORD comboStyle = CBS_DROPDOWNLIST | CBS_OWNERDRAWFIXED | CBS_HASSTRINGS | WS_VSCROLL | WS_TABSTOP;
     // Card 1: Video (x=242..562, y=68..248)
     makeLbl(L"Klip Süresi:", 258, 104, 82, 20);
-    cmbDuration_ = make(L"COMBOBOX", L"", CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP, 344, 101, 206, 180, ID_CMB_DURATION);
+    cmbDuration_ = make(L"COMBOBOX", L"", comboStyle, 344, 101, 206, 180, ID_CMB_DURATION);
+    SendMessageW(cmbDuration_, CB_SETITEMHEIGHT, static_cast<WPARAM>(-1), S(20));
+    SendMessageW(cmbDuration_, CB_SETITEMHEIGHT, 0, S(24));
     for (int sec : kDurations) {
         wchar_t buf[64] = {};
         if (sec < 60) swprintf(buf, 64, L"Son %d sn", sec);
@@ -755,13 +758,17 @@ void MainWindow::CreateControls() {
     }
 
     makeLbl(L"Çözünürlük:", 258, 139, 82, 20);
-    cmbResFps_ = make(L"COMBOBOX", L"", CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP, 344, 136, 206, 180, ID_CMB_RESFPS);
+    cmbResFps_ = make(L"COMBOBOX", L"", comboStyle, 344, 136, 206, 180, ID_CMB_RESFPS);
+    SendMessageW(cmbResFps_, CB_SETITEMHEIGHT, static_cast<WPARAM>(-1), S(20));
+    SendMessageW(cmbResFps_, CB_SETITEMHEIGHT, 0, S(24));
     for (const auto& p : kResPresets) {
         SendMessageW(cmbResFps_, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(p.label));
     }
 
     makeLbl(L"Bit Hızı:", 258, 174, 82, 20);
-    cmbBitrate_ = make(L"COMBOBOX", L"", CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP, 344, 171, 206, 180, ID_CMB_BITRATE);
+    cmbBitrate_ = make(L"COMBOBOX", L"", comboStyle, 344, 171, 206, 180, ID_CMB_BITRATE);
+    SendMessageW(cmbBitrate_, CB_SETITEMHEIGHT, static_cast<WPARAM>(-1), S(20));
+    SendMessageW(cmbBitrate_, CB_SETITEMHEIGHT, 0, S(24));
     SendMessageW(cmbBitrate_, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"4 Mbps (Hafif RAM)"));
     SendMessageW(cmbBitrate_, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"6 Mbps (720p60 Dengeli)"));
     SendMessageW(cmbBitrate_, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"8 Mbps (Yüksek Kalite)"));
@@ -784,7 +791,9 @@ void MainWindow::CreateControls() {
     lblMicVol_ = make(L"STATIC", L"%100", SS_RIGHT, 846, 132, 38, 20);
 
     makeLbl(L"Cihaz:", 594, 163, 46, 20);
-    cmbMicDev_ = make(L"COMBOBOX", L"", CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP, 642, 160, 240, 180, ID_CMB_MIC_DEV);
+    cmbMicDev_ = make(L"COMBOBOX", L"", comboStyle, 642, 160, 240, 180, ID_CMB_MIC_DEV);
+    SendMessageW(cmbMicDev_, CB_SETITEMHEIGHT, static_cast<WPARAM>(-1), S(20));
+    SendMessageW(cmbMicDev_, CB_SETITEMHEIGHT, 0, S(24));
 
     chkMicGate_ = makeChk(L"Gürültü Kapısı", 594, 194, 108, 22, ID_CHK_MIC_GATE);
     trkMicGate_ = make(TRACKBAR_CLASSW, L"", TBS_HORZ | TBS_AUTOTICKS | WS_TABSTOP, 704, 192, 122, 26, ID_TRK_MIC_GATE);
@@ -2804,6 +2813,43 @@ LRESULT MainWindow::OnMessage(UINT msg, WPARAM wParam, LPARAM lParam) {
             if (!dis) break;
             HDC hdc = dis->hDC;
             RECT rc = dis->rcItem;
+            if (dis->CtlType == ODT_COMBOBOX) {
+                bool sel = (dis->itemState & ODS_SELECTED) != 0;
+                bool isEdit = (dis->itemState & ODS_COMBOBOXEDIT) != 0;
+                COLORREF bgCol = isEdit ? kRgbInput : (sel ? RGB(37, 99, 235) : RGB(20, 26, 40));
+                HBRUSH br = CreateSolidBrush(bgCol);
+                FillRect(hdc, &rc, br);
+                DeleteObject(br);
+                if (isEdit) {
+                    HBRUSH brd = CreateSolidBrush(RGB(58, 76, 108));
+                    FrameRect(hdc, &rc, brd);
+                    DeleteObject(brd);
+                }
+                if (dis->itemID != static_cast<UINT>(-1)) {
+                    LRESULT len = SendMessageW(dis->hwndItem, CB_GETLBTEXTLEN, dis->itemID, 0);
+                    if (len > 0 && len < 512) {
+                        std::wstring txt(static_cast<size_t>(len) + 1, L'\0');
+                        SendMessageW(dis->hwndItem, CB_GETLBTEXT, dis->itemID, reinterpret_cast<LPARAM>(&txt[0]));
+                        txt.resize(wcslen(txt.c_str()));
+                        SetBkMode(hdc, TRANSPARENT);
+                        SetTextColor(hdc, kRgbText);
+                        HFONT oldF = static_cast<HFONT>(SelectObject(hdc, font_));
+                        RECT tr = rc;
+                        tr.left += S(8);
+                        tr.right -= S(isEdit ? 22 : 6);
+                        DrawTextW(hdc, txt.c_str(), -1, &tr, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+                        SelectObject(hdc, oldF);
+                    }
+                }
+                if (isEdit) {
+                    SetBkMode(hdc, TRANSPARENT);
+                    SetTextColor(hdc, kRgbMuted);
+                    RECT ar = rc;
+                    ar.left = ar.right - S(20);
+                    DrawTextW(hdc, L"▾", -1, &ar, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+                }
+                return TRUE;
+            }
             bool disabled = (dis->itemState & ODS_DISABLED) != 0;
             bool pressed = (dis->itemState & ODS_SELECTED) != 0;
 
