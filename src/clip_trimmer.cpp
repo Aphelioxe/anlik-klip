@@ -87,6 +87,140 @@ bool AddAacOutputStream(IMFSinkWriter* sw, DWORD& outStreamIdx) {
     return SUCCEEDED(sw->SetInputMediaType(outStreamIdx, inA.Get(), nullptr));
 }
 
+bool FastPassthroughTrimMp4(const std::wstring& srcPath, const std::wstring& dstPath,
+                            double startSec, double endSec,
+                            std::atomic<bool>* cancelFlag) {
+    ComPtr<IMFAttributes> rAttr;
+    MFCreateAttributes(rAttr.Put(), 1);
+    if (rAttr) rAttr->SetUINT32(MF_READWRITE_DISABLE_CONVERTERS, TRUE);
+
+    ComPtr<IMFSourceReader> sr;
+    if (FAILED(MFCreateSourceReaderFromURL(srcPath.c_str(), rAttr.Get(), sr.Put())) || !sr) {
+        return false;
+    }
+
+    std::wstring tmpPath = dstPath + L".tmp.mp4";
+    DeleteFileW(tmpPath.c_str());
+
+    ComPtr<IMFAttributes> wAttr;
+    MFCreateAttributes(wAttr.Put(), 2);
+    if (wAttr) {
+        wAttr->SetUINT32(MF_READWRITE_DISABLE_CONVERTERS, TRUE);
+        wAttr->SetUINT32(MF_SINK_WRITER_DISABLE_THROTTLING, TRUE);
+    }
+    ComPtr<IMFSinkWriter> sw;
+    if (FAILED(MFCreateSinkWriterFromURL(tmpPath.c_str(), nullptr, wAttr.Get(), sw.Put())) || !sw) {
+        return false;
+    }
+
+    DWORD vIn = DWORD(-1);
+    std::vector<DWORD> outMap(16, DWORD(-1));
+    std::vector<bool> isStreamDone(16, true);
+    DWORD streamCount = 0;
+
+    for (DWORD si = 0; si < 16; ++si) {
+        ComPtr<IMFMediaType> mt;
+        if (FAILED(sr->GetNativeMediaType(si, 0, mt.Put())) || !mt) break;
+        GUID maj{};
+        mt->GetGUID(MF_MT_MAJOR_TYPE, &maj);
+        if (maj == MFMediaType_Video || maj == MFMediaType_Audio) {
+            DWORD outIdx = 0;
+            if (FAILED(sw->AddStream(mt.Get(), &outIdx)) ||
+                FAILED(sw->SetInputMediaType(outIdx, mt.Get(), nullptr))) {
+                sw.Reset();
+                DeleteFileW(tmpPath.c_str());
+                return false;
+            }
+            outMap[si] = outIdx;
+            isStreamDone[si] = false;
+            if (maj == MFMediaType_Video && vIn == DWORD(-1)) vIn = si;
+            streamCount = si + 1;
+        }
+    }
+    if (vIn == DWORD(-1) || streamCount == 0) {
+        sw.Reset();
+        DeleteFileW(tmpPath.c_str());
+        return false;
+    }
+
+    if (FAILED(sw->BeginWriting())) {
+        sw.Reset();
+        DeleteFileW(tmpPath.c_str());
+        return false;
+    }
+
+    const double seekSec = std::max(0.0, startSec - 1.2);
+    PROPVARIANT pv;
+    PropVariantInit(&pv);
+    pv.vt = VT_I8;
+    pv.hVal.QuadPart = static_cast<LONGLONG>(seekSec * 10000000.0);
+    sr->SetCurrentPosition(GUID_NULL, pv);
+    PropVariantClear(&pv);
+
+    const LONGLONG keyThresh100 = static_cast<LONGLONG>(std::max(0.0, startSec - 0.45) * 10000000.0);
+    const LONGLONG end100 = static_cast<LONGLONG>(endSec * 10000000.0);
+    bool gotFirstKey = false;
+    LONGLONG basePts = 0;
+    int vWritten = 0;
+
+    while (true) {
+        if (cancelFlag && cancelFlag->load()) {
+            sw.Reset();
+            DeleteFileW(tmpPath.c_str());
+            return false;
+        }
+        bool allDone = true;
+        for (DWORD i = 0; i < streamCount; ++i) {
+            if (!isStreamDone[i]) { allDone = false; break; }
+        }
+        if (allDone) break;
+
+        DWORD si = 0, flags = 0;
+        LONGLONG ts = 0;
+        ComPtr<IMFSample> smp;
+        if (FAILED(sr->ReadSample(static_cast<DWORD>(MF_SOURCE_READER_ANY_STREAM), 0, &si, &flags, &ts, smp.Put()))) {
+            break;
+        }
+        if (flags & MF_SOURCE_READERF_ENDOFSTREAM) {
+            if (si < streamCount) isStreamDone[si] = true;
+            continue;
+        }
+        if (!smp || si >= streamCount || outMap[si] == DWORD(-1)) continue;
+
+        if (!gotFirstKey) {
+            if (si != vIn) continue;
+            UINT32 cp = 0;
+            smp->GetUINT32(MFSampleExtension_CleanPoint, &cp);
+            if (!cp || ts < keyThresh100) continue;
+            gotFirstKey = true;
+            basePts = ts;
+        }
+
+        if (ts > end100) {
+            isStreamDone[si] = true;
+            continue;
+        }
+        if (ts < basePts) continue;
+
+        smp->SetSampleTime(ts - basePts);
+        if (SUCCEEDED(sw->WriteSample(outMap[si], smp.Get())) && si == vIn) {
+            ++vWritten;
+        }
+    }
+
+    if (!gotFirstKey || vWritten < 2 || FAILED(sw->Finalize())) {
+        sw.Reset();
+        DeleteFileW(tmpPath.c_str());
+        return false;
+    }
+    sw.Reset();
+    if (!MoveFileExW(tmpPath.c_str(), dstPath.c_str(), MOVEFILE_REPLACE_EXISTING)) {
+        DeleteFileW(tmpPath.c_str());
+        return false;
+    }
+    return true;
+}
+
 bool CopyVideoSampleBuffer(ID3D11DeviceContext* ctx, ID3D11Texture2D* stgTex,
                            IMFSample* srcSmp, uint32_t w, uint32_t h, IMFSample* dstSmp) {
     ComPtr<IMFMediaBuffer> buf;
@@ -269,6 +403,19 @@ bool EditMp4Clip(const ClipEditSpec& spec, std::string& outError,
     } else {
         segments.push_back({ spec.srcPath, startSec, endSec });
         if (hasInsert) segments.push_back({ spec.insertClipPath, 0.0, insertDur });
+    }
+
+    // Fast lossless passthrough trim (<0.3s, minimal RAM) when only start/end changed
+    if (!hasCut && !hasInsert && spec.targetSizeMb == 0 && !spec.vertical916 &&
+        std::abs(speed - 1.0) < 0.01 &&
+        spec.gameVolPct == 100 && spec.micVolPct == 100) {
+        if (FastPassthroughTrimMp4(spec.srcPath, spec.dstPath, startSec, endSec, cancelFlag)) {
+            return true;
+        }
+        if (cancelFlag && cancelFlag->load()) {
+            outError = "İşlem iptal edildi.";
+            return false;
+        }
     }
 
     D3D_FEATURE_LEVEL fl = D3D_FEATURE_LEVEL_11_0;
