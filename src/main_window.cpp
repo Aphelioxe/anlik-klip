@@ -1826,13 +1826,13 @@ RECT MainWindow::GetGridViewportRect() const {
 void MainWindow::GetGridMetrics(int& outCols, int& outCardW, int& outCardH, int& outGapX, int& outGapY) const {
     RECT vp = GetGridViewportRect();
     int availW = std::max(S(320), static_cast<int>(vp.right - vp.left - S(14)));
-    outCols = (availW >= S(920)) ? 3 : 2;
-    outGapX = S(16);
-    outGapY = S(14);
+    outCols = (availW >= S(920)) ? 4 : 3;
+    outGapX = S(12);
+    outGapY = S(12);
     outCardW = (availW - (outCols - 1) * outGapX) / outCols;
-    int thumbW = std::max(S(160), outCardW - S(14));
+    int thumbW = std::max(S(140), outCardW - S(14));
     int thumbH = (thumbW * 9) / 16;
-    outCardH = thumbH + S(58);
+    outCardH = thumbH + S(52);
 }
 
 void MainWindow::ComputeGalleryLayout(std::vector<RECT>& outCardRects, int& outFavHeaderY, int& outNormHeaderY,
@@ -2787,7 +2787,7 @@ void MainWindow::PaintWindow(HDC targetDc) {
                         sel ? Gc(56, 189, 248) : (hov ? Gc(96, 165, 250) : Gc(44, 54, 76)),
                         sel ? 2.0f : (hov ? 1.5f : 1.0f));
 
-                    int tx = cx + S(7), ty = cy + S(7), tw = std::max(S(160), cardW - S(14)), th = (tw * 9) / 16;
+                    int tx = cx + S(7), ty = cy + S(7), tw = std::max(S(140), cardW - S(14)), th = (tw * 9) / 16;
                     auto it = thumbBmps_.find(c.filePath);
                     if (it != thumbBmps_.end() && it->second) {
                         Gdiplus::GraphicsState saved = g.Save();
