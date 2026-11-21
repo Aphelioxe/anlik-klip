@@ -1650,12 +1650,24 @@ void MainWindow::CyclePlayerRate() {
     else if (playerRate_ < 1.75f) playerRate_ = 2.0f;
     else playerRate_ = 0.5f;
     if (player_) {
-        HRESULT hr = player_->SetRate(playerRate_);
-        if (FAILED(hr)) {
-            float minR = 0.5f, maxR = 1.0f;
-            if (SUCCEEDED(player_->GetSupportedRates(FALSE, &minR, &maxR)) && maxR >= 0.5f) {
-                playerRate_ = std::max(minR, std::min(maxR, playerRate_));
-                player_->SetRate(playerRate_);
+        bool rateApplied = false;
+        if (playerRate_ >= 1.9f) {
+            IMFRateControl* rc = nullptr;
+            if (SUCCEEDED(MFGetService(player_, MF_RATE_CONTROL_SERVICE, __uuidof(IMFRateControl), reinterpret_cast<void**>(&rc))) && rc) {
+                if (SUCCEEDED(rc->SetRate(TRUE, playerRate_))) {
+                    rateApplied = true;
+                }
+                rc->Release();
+            }
+        }
+        if (!rateApplied) {
+            HRESULT hr = player_->SetRate(playerRate_);
+            if (FAILED(hr)) {
+                float minR = 0.5f, maxR = 1.0f;
+                if (SUCCEEDED(player_->GetSupportedRates(FALSE, &minR, &maxR)) && maxR >= 0.5f) {
+                    playerRate_ = std::max(minR, std::min(maxR, playerRate_));
+                    player_->SetRate(playerRate_);
+                }
             }
         }
     }

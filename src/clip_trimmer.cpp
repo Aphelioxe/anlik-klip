@@ -610,6 +610,16 @@ bool EditMp4Clip(const ClipEditSpec& spec, std::string& outError,
             v.vt = VT_UI4;
             v.ulVal = std::max<uint32_t>(1u, outFpsN / outFpsD);
             encCodec->SetValue(&CODECAPI_AVEncMPVGOPSize, &v);
+
+            // Disable B-frame reordering & enable low-latency so hardware encoder never holds/overwrites queued DXGI frames
+            v.ulVal = 0;
+            encCodec->SetValue(&CODECAPI_AVEncMPVDefaultBPictureCount, &v);
+
+            VARIANT vb;
+            VariantInit(&vb);
+            vb.vt = VT_BOOL;
+            vb.boolVal = VARIANT_TRUE;
+            encCodec->SetValue(&CODECAPI_AVEncCommonLowLatency, &vb);
         }
     }
 
@@ -620,7 +630,7 @@ bool EditMp4Clip(const ClipEditSpec& spec, std::string& outError,
     }
 
     ComPtr<ID3D11Texture2D> stgTex;
-    ComPtr<ID3D11Texture2D> gpuOutPool[4];
+    ComPtr<ID3D11Texture2D> gpuOutPool[16];
     bool hasGpuPool = false;
     ComPtr<ID3D11VideoDevice> vdev;
     ComPtr<ID3D11VideoContext> vctx;
@@ -653,7 +663,7 @@ bool EditMp4Clip(const ClipEditSpec& spec, std::string& outError,
             gd.Usage = D3D11_USAGE_DEFAULT;
             gd.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
             hasGpuPool = true;
-            for (int pi = 0; pi < 4; ++pi) {
+            for (int pi = 0; pi < 16; ++pi) {
                 if (FAILED(dev->CreateTexture2D(&gd, nullptr, gpuOutPool[pi].Put()))) {
                     hasGpuPool = false;
                     break;
@@ -843,17 +853,21 @@ bool EditMp4Clip(const ClipEditSpec& spec, std::string& outError,
                         SUCCEEDED(buf->QueryInterface(__uuidof(IMFDXGIBuffer), db.PutVoid())) &&
                         SUCCEEDED(db->GetResource(__uuidof(ID3D11Texture2D), dtex.PutVoid()))) {
                         db->GetSubresourceIndex(&sub);
-                        D3D11_BOX box{ 0, 0, 0, srcW, srcH, 1 };
+                        D3D11_TEXTURE2D_DESC dDesc{};
+                        dtex->GetDesc(&dDesc);
+                        UINT copyW = std::min(srcW, dDesc.Width);
+                        UINT copyH = std::min(srcH, dDesc.Height);
+                        D3D11_BOX box{ 0, 0, 0, copyW, copyH, 1 };
                         ctx->CopySubresourceRegion(vpInTex.Get(), 0, 0, 0, 0, dtex.Get(), sub, &box);
 
                         if (spec.vertical916) {
-                            LONG cropW = std::max<LONG>(16, (static_cast<LONG>(srcH) * static_cast<LONG>(outW)) / static_cast<LONG>(outH));
-                            LONG cropX = std::max<LONG>(0, (static_cast<LONG>(srcW) - cropW) / 2);
-                            RECT bgSrc{ cropX, 0, cropX + cropW, static_cast<LONG>(srcH) };
+                            LONG cropW = std::max<LONG>(16, (static_cast<LONG>(copyH) * static_cast<LONG>(outW)) / static_cast<LONG>(outH)) & ~1L;
+                            LONG cropX = std::max<LONG>(0, (static_cast<LONG>(copyW) - cropW) / 2) & ~1L;
+                            RECT bgSrc{ cropX, 0, cropX + cropW, static_cast<LONG>(copyH) };
                             RECT dstFull{ 0, 0, static_cast<LONG>(outW), static_cast<LONG>(outH) };
-                            LONG fgH = (static_cast<LONG>(outW) * static_cast<LONG>(srcH)) / static_cast<LONG>(srcW);
-                            LONG fgY = std::max<LONG>(0, (static_cast<LONG>(outH) - fgH) / 2);
-                            RECT fgSrc{ 0, 0, static_cast<LONG>(srcW), static_cast<LONG>(srcH) };
+                            LONG fgH = ((static_cast<LONG>(outW) * static_cast<LONG>(copyH)) / static_cast<LONG>(copyW)) & ~1L;
+                            LONG fgY = std::max<LONG>(0, (static_cast<LONG>(outH) - fgH) / 2) & ~1L;
+                            RECT fgSrc{ 0, 0, static_cast<LONG>(copyW), static_cast<LONG>(copyH) };
                             RECT fgDst{ 0, fgY, static_cast<LONG>(outW), fgY + fgH };
 
                             vctx->VideoProcessorSetStreamSourceRect(vp.Get(), 0, TRUE, &bgSrc);
@@ -866,7 +880,7 @@ bool EditMp4Clip(const ClipEditSpec& spec, std::string& outError,
                             streams[1].Enable = TRUE; streams[1].pInputSurface = vpInView.Get();
                             vctx->VideoProcessorBlt(vp.Get(), vpOutView.Get(), 0, 2, streams);
                         } else {
-                            RECT srcFull{ 0, 0, static_cast<LONG>(srcW), static_cast<LONG>(srcH) };
+                            RECT srcFull{ 0, 0, static_cast<LONG>(copyW), static_cast<LONG>(copyH) };
                             RECT dstFull{ 0, 0, static_cast<LONG>(outW), static_cast<LONG>(outH) };
                             vctx->VideoProcessorSetStreamSourceRect(vp.Get(), 0, TRUE, &srcFull);
                             vctx->VideoProcessorSetStreamDestRect(vp.Get(), 0, TRUE, &dstFull);
@@ -877,7 +891,7 @@ bool EditMp4Clip(const ClipEditSpec& spec, std::string& outError,
 
                         bool dxgiAttached = false;
                         if (hasGpuPool) {
-                            const int pIdx = static_cast<int>(outFrameIdx % 4);
+                            const int pIdx = static_cast<int>(outFrameIdx % 16);
                             ctx->CopyResource(gpuOutPool[pIdx].Get(), vpOutTex.Get());
                             ComPtr<IMFMediaBuffer> dxBuf;
                             if (SUCCEEDED(MFCreateDXGISurfaceBuffer(__uuidof(ID3D11Texture2D), gpuOutPool[pIdx].Get(), 0, FALSE, dxBuf.Put())) && dxBuf) {
@@ -922,8 +936,10 @@ bool EditMp4Clip(const ClipEditSpec& spec, std::string& outError,
                             SUCCEEDED(buf->QueryInterface(__uuidof(IMFDXGIBuffer), db.PutVoid())) &&
                             SUCCEEDED(db->GetResource(__uuidof(ID3D11Texture2D), dtex.PutVoid()))) {
                             db->GetSubresourceIndex(&sub);
-                            const int pIdx = static_cast<int>(outFrameIdx % 4);
-                            D3D11_BOX box{ 0, 0, 0, outW, outH, 1 };
+                            const int pIdx = static_cast<int>(outFrameIdx % 16);
+                            D3D11_TEXTURE2D_DESC dDesc{};
+                            dtex->GetDesc(&dDesc);
+                            D3D11_BOX box{ 0, 0, 0, std::min(outW, dDesc.Width), std::min(outH, dDesc.Height), 1 };
                             ctx->CopySubresourceRegion(gpuOutPool[pIdx].Get(), 0, 0, 0, 0, dtex.Get(), sub, &box);
                             ComPtr<IMFMediaBuffer> dxBuf;
                             if (SUCCEEDED(MFCreateDXGISurfaceBuffer(__uuidof(ID3D11Texture2D), gpuOutPool[pIdx].Get(), 0, FALSE, dxBuf.Put())) && dxBuf) {
