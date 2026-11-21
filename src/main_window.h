@@ -5,6 +5,7 @@
 #include "clip_library.h"
 #include "recorder_app.h"
 #include <atomic>
+#include <condition_variable>
 #include <functional>
 #include <memory>
 #include <mutex>
@@ -201,6 +202,28 @@ private:
     bool trimBusy_ = false;
     std::atomic<bool> trimCancel_{false};
     std::thread trimThread_;
+
+    // Timeline audio waveform & hover-scrub preview (freed when player closes)
+    std::vector<float> waveGame_;
+    std::vector<float> waveMic_;
+    std::thread waveThread_;
+    std::atomic<bool> waveStop_{false};
+    void StartWaveformWorker();
+    void StopWaveformWorker();
+
+    bool hoverSeekActive_ = false;
+    int hoverSeekX_ = 0;
+    double hoverSeekSec_ = -1.0;
+    HBITMAP hoverScrubBmp_ = nullptr;
+    double hoverScrubBmpSec_ = -1.0;
+    std::thread hoverScrubThread_;
+    std::atomic<bool> hoverScrubStop_{false};
+    std::mutex hoverScrubMtx_;
+    std::condition_variable hoverScrubCv_;
+    double hoverScrubTargetSec_ = -1.0;
+    uint64_t hoverScrubReqGen_ = 0;
+    void RequestHoverScrub(double sec);
+    void StopHoverScrubWorker();
 
     // Montage tab state
     std::vector<std::wstring> montagePaths_;

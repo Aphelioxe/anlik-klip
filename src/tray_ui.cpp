@@ -215,7 +215,7 @@ void ShowCornerToast(HINSTANCE hInst, const std::wstring& title, const std::wstr
 
     auto* d = new CornerToastData{ title, sub, x, y, w, h, GetTickCount64() };
     HWND hw = CreateWindowExW(
-        WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_LAYERED,
+        WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_LAYERED | WS_EX_TRANSPARENT,
         cls, L"", WS_POPUP, x + 32, y, w, h, nullptr, nullptr, hInst, d);
     if (!hw) {
         delete d;
@@ -557,7 +557,8 @@ LRESULT TrayUI::OnMessage(UINT msg, WPARAM wParam, LPARAM lParam) {
             bool muted = app_.ToggleMicMute();
             UpdateTrayIcon();
             if (mainWin_) mainWin_->RefreshLiveStats();
-            ShowBalloon(L"Mikrofon", muted ? L"Mikrofon susturuldu." : L"Mikrofon açıldı.", NIIF_INFO);
+            ShowCornerToast(hInst_, muted ? L"Mikrofon Susturuldu" : L"Mikrofon Açıldı",
+                            muted ? L"Kayıtlarda mikrofon sesi kapatıldı" : L"Mikrofon sesi yeniden aktif");
             return 0;
         }
 
@@ -602,14 +603,19 @@ LRESULT TrayUI::OnMessage(UINT msg, WPARAM wParam, LPARAM lParam) {
                     app_.ToggleBuffering();
                     UpdateTrayIcon();
                     if (mainWin_) mainWin_->RefreshLiveStats();
+                    ShowCornerToast(hInst_, app_.IsRunning() ? L"Tampon Kayıt Aktif" : L"Kayıt Duraklatıldı",
+                                    app_.IsRunning() ? L"Arka plan klip kaydı devam ediyor" : L"Klip kaydı geçici olarak durduruldu");
                     break;
-                case ID_MENU_TOGGLE_MIC:
-                    app_.ToggleMicMute();
+                case ID_MENU_TOGGLE_MIC: {
+                    bool muted = app_.ToggleMicMute();
                     UpdateTrayIcon();
                     if (mainWin_) mainWin_->RefreshLiveStats();
+                    ShowCornerToast(hInst_, muted ? L"Mikrofon Susturuldu" : L"Mikrofon Açıldı",
+                                    muted ? L"Kayıtlarda mikrofon sesi kapatıldı" : L"Mikrofon sesi yeniden aktif");
                     break;
+                }
                 case ID_MENU_SHOW_CLIPS: ShowSettingsWindow(0); break;
-                case ID_MENU_SHOW_SETTINGS: ShowSettingsWindow(1); break;
+                case ID_MENU_SHOW_SETTINGS: ShowSettingsWindow(2); break;
                 case ID_MENU_OPEN_FOLDER: OpenFolder(app_.Config().outputDir); break;
                 case ID_MENU_EXIT: PostQuitMessage(0); break;
             }

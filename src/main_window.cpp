@@ -48,6 +48,20 @@ constexpr UINT WM_MW_PLAYER_EVENT     = WM_APP + 21;
 constexpr UINT WM_MW_TRIM_DONE        = WM_APP + 22;
 constexpr UINT WM_MW_UPLOAD_PROGRESS  = WM_APP + 24;
 constexpr UINT WM_MW_UPLOAD_DONE      = WM_APP + 25;
+constexpr UINT WM_MW_WAVE_READY       = WM_APP + 26;
+constexpr UINT WM_MW_SCRUB_READY      = WM_APP + 27;
+
+struct WaveReadyMsg {
+    uint64_t gen = 0;
+    std::vector<float> game;
+    std::vector<float> mic;
+};
+
+struct ScrubReadyMsg {
+    uint64_t gen = 0;
+    double sec = 0.0;
+    HBITMAP bmp = nullptr;
+};
 
 inline Gdiplus::Color Gc(uint8_t r, uint8_t g, uint8_t b, uint8_t a = 255) {
     return Gdiplus::Color(a, r, g, b);
@@ -1304,10 +1318,13 @@ void MainWindow::OpenEmbeddedPlayer(int viewIdx) {
         UpdateLayoutForSize(cli.right, cli.bottom);
     }
     SetTimer(hwnd_, TIMER_PLAYER_ID, 80, nullptr);
+    StartWaveformWorker();
     InvalidateRect(hwnd_, nullptr, FALSE);
 }
 
 void MainWindow::CloseEmbeddedPlayer() {
+    StopWaveformWorker();
+    StopHoverScrubWorker();
     if (playerFullscreen_) {
         TogglePlayerFullscreen();
     }
@@ -1348,6 +1365,236 @@ void MainWindow::StopTrimWorker() {
     }
     trimCancel_.store(false);
     trimBusy_ = false;
+}
+
+void MainWindow::StopWaveformWorker() {
+    waveStop_.store(true);
+    if (waveThread_.joinable()) {
+        waveThread_.join();
+    }
+    waveStop_.store(false);
+    waveGame_.clear();
+    waveMic_.clear();
+}
+
+void MainWindow::StartWaveformWorker() {
+    StopWaveformWorker();
+    if (playerClipPath_.empty() || !hwnd_) return;
+    const HWND target = hwnd_;
+    const uint64_t gen = playerGen_;
+    const std::wstring path = playerClipPath_;
+
+    waveThread_ = std::thread([this, target, gen, path]() {
+        ComScope com(COINIT_MULTITHREADED);
+        IMFSourceReader* sr = nullptr;
+        if (FAILED(MFCreateSourceReaderFromURL(path.c_str(), nullptr, &sr)) || !sr) return;
+
+        std::vector<DWORD> aStreams;
+        sr->SetStreamSelection(MF_SOURCE_READER_ALL_STREAMS, FALSE);
+        for (DWORD i = 0; i < 8; ++i) {
+            IMFMediaType* mt = nullptr;
+            if (FAILED(sr->GetNativeMediaType(i, 0, &mt)) || !mt) break;
+            GUID maj{};
+            mt->GetGUID(MF_MT_MAJOR_TYPE, &maj);
+            mt->Release();
+            if (maj == MFMediaType_Audio) aStreams.push_back(i);
+        }
+        if (aStreams.empty()) { sr->Release(); return; }
+
+        double durSec = 0.0;
+        PROPVARIANT pv{};
+        if (SUCCEEDED(sr->GetPresentationAttribute(MF_SOURCE_READER_MEDIASOURCE, MF_PD_DURATION, &pv))) {
+            if (pv.vt == VT_UI8) durSec = static_cast<double>(pv.uhVal.QuadPart) / 1e7;
+            PropVariantClear(&pv);
+        }
+        if (durSec <= 0.1) { sr->Release(); return; }
+
+        DWORD gameStream = (aStreams.size() >= 3) ? aStreams[1] : aStreams[0];
+        DWORD micStream  = (aStreams.size() >= 3) ? aStreams[2] : DWORD(-1);
+        auto cfgPcm = [&](DWORD si) {
+            sr->SetStreamSelection(si, TRUE);
+            IMFMediaType* pcm = nullptr;
+            if (SUCCEEDED(MFCreateMediaType(&pcm)) && pcm) {
+                pcm->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Audio);
+                pcm->SetGUID(MF_MT_SUBTYPE, MFAudioFormat_PCM);
+                pcm->SetUINT32(MF_MT_AUDIO_BITS_PER_SAMPLE, 16);
+                pcm->SetUINT32(MF_MT_AUDIO_SAMPLES_PER_SECOND, 48000);
+                pcm->SetUINT32(MF_MT_AUDIO_NUM_CHANNELS, 2);
+                sr->SetCurrentMediaType(si, nullptr, pcm);
+                pcm->Release();
+            }
+        };
+        cfgPcm(gameStream);
+        if (micStream != DWORD(-1)) cfgPcm(micStream);
+
+        constexpr int kBuckets = 96;
+        std::vector<float> gBuckets(kBuckets, 0.0f);
+        std::vector<float> mBuckets(micStream != DWORD(-1) ? kBuckets : 0, 0.0f);
+
+        for (int b = 0; b < kBuckets && !waveStop_.load(); ++b) {
+            double t = (static_cast<double>(b) + 0.5) * durSec / static_cast<double>(kBuckets);
+            PROPVARIANT pos{};
+            pos.vt = VT_I8;
+            pos.hVal.QuadPart = static_cast<LONGLONG>(t * 1e7);
+            sr->SetCurrentPosition(GUID_NULL, pos);
+            PropVariantClear(&pos);
+
+            bool gotG = false, gotM = (micStream == DWORD(-1));
+            for (int tries = 0; tries < 8 && !(gotG && gotM) && !waveStop_.load(); ++tries) {
+                DWORD si = 0, fl = 0; LONGLONG ts = 0; IMFSample* smp = nullptr;
+                if (FAILED(sr->ReadSample(MF_SOURCE_READER_ANY_STREAM, 0, &si, &fl, &ts, &smp))) break;
+                if (fl & MF_SOURCE_READERF_ENDOFSTREAM) { if (smp) smp->Release(); break; }
+                if (!smp) continue;
+                IMFMediaBuffer* buf = nullptr;
+                if (SUCCEEDED(smp->ConvertToContiguousBuffer(&buf)) && buf) {
+                    BYTE* p = nullptr; DWORD len = 0;
+                    if (SUCCEEDED(buf->Lock(&p, nullptr, &len)) && len >= 2) {
+                        const short* s = reinterpret_cast<const short*>(p);
+                        DWORD n = len / 2;
+                        double sumSq = 0.0;
+                        for (DWORD k = 0; k < n; ++k) {
+                            double v = static_cast<double>(s[k]) / 32768.0;
+                            sumSq += v * v;
+                        }
+                        float rms = (n > 0) ? static_cast<float>(std::sqrt(sumSq / n)) : 0.0f;
+                        float norm = std::min(1.0f, rms * 3.8f);
+                        if (si == gameStream && !gotG) { gBuckets[b] = norm; gotG = true; }
+                        if (si == micStream && !gotM)  { mBuckets[b] = norm; gotM = true; }
+                        buf->Unlock();
+                    }
+                    buf->Release();
+                }
+                smp->Release();
+            }
+        }
+        sr->Release();
+        if (waveStop_.load()) return;
+        auto* msg = new WaveReadyMsg{ gen, std::move(gBuckets), std::move(mBuckets) };
+        if (!PostMessageW(target, WM_MW_WAVE_READY, 0, reinterpret_cast<LPARAM>(msg))) {
+            delete msg;
+        }
+    });
+}
+
+void MainWindow::StopHoverScrubWorker() {
+    hoverScrubStop_.store(true);
+    hoverScrubCv_.notify_all();
+    if (hoverScrubThread_.joinable()) {
+        hoverScrubThread_.join();
+    }
+    hoverScrubStop_.store(false);
+    hoverSeekActive_ = false;
+    hoverSeekSec_ = -1.0;
+    hoverScrubBmpSec_ = -1.0;
+    hoverScrubTargetSec_ = -1.0;
+    if (hoverScrubBmp_) {
+        DeleteObject(hoverScrubBmp_);
+        hoverScrubBmp_ = nullptr;
+    }
+}
+
+void MainWindow::RequestHoverScrub(double sec) {
+    if (!playerOpen_ || !playerReady_ || playerClipPath_.empty() || !hwnd_) return;
+    {
+        std::lock_guard<std::mutex> lk(hoverScrubMtx_);
+        if (std::abs(sec - hoverScrubTargetSec_) < 0.35) return;
+        hoverScrubTargetSec_ = sec;
+        hoverScrubReqGen_ = playerGen_;
+    }
+    if (!hoverScrubThread_.joinable()) {
+        hoverScrubStop_.store(false);
+        const HWND target = hwnd_;
+        const std::wstring path = playerClipPath_;
+        hoverScrubThread_ = std::thread([this, target, path]() {
+            ComScope com(COINIT_MULTITHREADED);
+            IMFSourceReader* sr = nullptr;
+            if (FAILED(MFCreateSourceReaderFromURL(path.c_str(), nullptr, &sr)) || !sr) return;
+            DWORD vIdx = DWORD(-1);
+            UINT32 vw = 0, vh = 0;
+            sr->SetStreamSelection(MF_SOURCE_READER_ALL_STREAMS, FALSE);
+            for (DWORD i = 0; i < 8; ++i) {
+                IMFMediaType* mt = nullptr;
+                if (FAILED(sr->GetNativeMediaType(i, 0, &mt)) || !mt) break;
+                GUID maj{}; mt->GetGUID(MF_MT_MAJOR_TYPE, &maj);
+                if (maj == MFMediaType_Video && vIdx == DWORD(-1)) {
+                    vIdx = i;
+                    MFGetAttributeSize(mt, MF_MT_FRAME_SIZE, &vw, &vh);
+                }
+                mt->Release();
+            }
+            if (vIdx == DWORD(-1) || vw == 0 || vh == 0) { sr->Release(); return; }
+            sr->SetStreamSelection(vIdx, TRUE);
+            IMFMediaType* rgb = nullptr;
+            if (SUCCEEDED(MFCreateMediaType(&rgb)) && rgb) {
+                rgb->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Video);
+                rgb->SetGUID(MF_MT_SUBTYPE, MFVideoFormat_RGB32);
+                sr->SetCurrentMediaType(vIdx, nullptr, rgb);
+                rgb->Release();
+            }
+
+            while (!hoverScrubStop_.load()) {
+                double reqSec = -1.0;
+                uint64_t reqGen = 0;
+                {
+                    std::unique_lock<std::mutex> lk(hoverScrubMtx_);
+                    hoverScrubCv_.wait(lk, [&]() {
+                        return hoverScrubStop_.load() || hoverScrubTargetSec_ >= 0.0;
+                    });
+                    if (hoverScrubStop_.load()) break;
+                    reqSec = hoverScrubTargetSec_;
+                    reqGen = hoverScrubReqGen_;
+                    hoverScrubTargetSec_ = -1.0;
+                }
+
+                PROPVARIANT pos{};
+                pos.vt = VT_I8;
+                pos.hVal.QuadPart = static_cast<LONGLONG>(std::max(0.0, reqSec) * 1e7);
+                sr->SetCurrentPosition(GUID_NULL, pos);
+                PropVariantClear(&pos);
+
+                DWORD si = 0, fl = 0; LONGLONG ts = 0; IMFSample* smp = nullptr;
+                if (SUCCEEDED(sr->ReadSample(vIdx, 0, &si, &fl, &ts, &smp)) && smp) {
+                    IMFMediaBuffer* buf = nullptr;
+                    if (SUCCEEDED(smp->ConvertToContiguousBuffer(&buf)) && buf) {
+                        BYTE* p = nullptr; DWORD len = 0;
+                        if (SUCCEEDED(buf->Lock(&p, nullptr, &len)) && len >= vw * vh * 4) {
+                            const int tw = 160, th = 90;
+                            BITMAPINFO bmi{};
+                            bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+                            bmi.bmiHeader.biWidth = tw;
+                            bmi.bmiHeader.biHeight = -th;
+                            bmi.bmiHeader.biPlanes = 1;
+                            bmi.bmiHeader.biBitCount = 32;
+                            bmi.bmiHeader.biCompression = BI_RGB;
+                            void* bits = nullptr;
+                            HBITMAP hBmp = CreateDIBSection(nullptr, &bmi, DIB_RGB_COLORS, &bits, nullptr, 0);
+                            if (hBmp && bits) {
+                                uint32_t* dst = static_cast<uint32_t*>(bits);
+                                const uint32_t* src = reinterpret_cast<const uint32_t*>(p);
+                                for (int y = 0; y < th; ++y) {
+                                    UINT32 sy = (static_cast<UINT32>(y) * vh) / static_cast<UINT32>(th);
+                                    for (int x = 0; x < tw; ++x) {
+                                        UINT32 sx = (static_cast<UINT32>(x) * vw) / static_cast<UINT32>(tw);
+                                        dst[y * tw + x] = src[sy * vw + sx] | 0xFF000000u;
+                                    }
+                                }
+                                auto* msg = new ScrubReadyMsg{ reqGen, reqSec, hBmp };
+                                if (!PostMessageW(target, WM_MW_SCRUB_READY, 0, reinterpret_cast<LPARAM>(msg))) {
+                                    DeleteObject(hBmp);
+                                    delete msg;
+                                }
+                            }
+                            buf->Unlock();
+                        }
+                        buf->Release();
+                    }
+                    smp->Release();
+                }
+            }
+            sr->Release();
+        });
+    }
+    hoverScrubCv_.notify_one();
 }
 
 void MainWindow::StopUploadWorker() {
@@ -2559,26 +2806,41 @@ void MainWindow::PaintWindow(HDC targetDc) {
                 FillRoundRect(g, xs - S(4), trackY - S(7), (float)S(8), (float)S(20), (float)S(3), Gc(34, 197, 94));
                 FillRoundRect(g, xe - S(4), trackY - S(7), (float)S(8), (float)S(20), (float)S(3), Gc(245, 158, 11));
 
-                auto drawTrackStrip = [&](int ty, const wchar_t* lbl, Gdiplus::Color col, bool active) {
+                auto drawTrackStrip = [&](int ty, const wchar_t* lbl, Gdiplus::Color col, bool active, const std::vector<float>& wave) {
                     g.DrawString(lbl, -1, &fSmall, Gdiplus::RectF((float)S(254), (float)ty, (float)S(82), (float)S(16)), &sfLeft, &brMuted);
                     float tx = (float)S(340), tw = (float)std::max(S(200), cw - S(374));
-                    FillRoundRect(g, tx, (float)(ty + S(2)), tw, (float)S(12), (float)S(4), Gc(28, 34, 46));
+                    FillRoundRect(g, tx, (float)(ty + S(2)), tw, (float)S(14), (float)S(4), Gc(28, 34, 46));
                     float s0 = tx + tw * static_cast<float>(sr0);
                     float s1 = tx + tw * static_cast<float>(sr1);
                     if (s1 - s0 > 2.0f) {
-                        FillRoundRect(g, s0, (float)(ty + S(2)), s1 - s0, (float)S(12), (float)S(4),
-                            active ? col : Gc(70, 80, 96, 110));
+                        if (!wave.empty()) {
+                            const int nB = static_cast<int>(wave.size());
+                            const float barW = std::max(1.5f, (tw / static_cast<float>(nB)) - 1.0f);
+                            Gdiplus::SolidBrush wBr(active ? col : Gc(70, 80, 96, 100));
+                            Gdiplus::SolidBrush wDim(Gc(70, 80, 96, 70));
+                            for (int bi = 0; bi < nB; ++bi) {
+                                float bx = tx + (static_cast<float>(bi) / static_cast<float>(nB)) * tw;
+                                bool inRange = (bx >= s0 && bx <= s1);
+                                float amp = std::max(0.14f, wave[static_cast<size_t>(bi)]);
+                                float bh = amp * static_cast<float>(S(11));
+                                float by = static_cast<float>(ty + S(9)) - bh * 0.5f;
+                                g.FillRectangle(inRange ? &wBr : &wDim, bx, by, barW, bh);
+                            }
+                        } else {
+                            FillRoundRect(g, s0, (float)(ty + S(2)), s1 - s0, (float)S(12), (float)S(4),
+                                active ? col : Gc(70, 80, 96, 110));
+                        }
                     }
                     if (editCutActive_ && cutEndSec_ > cutStartSec_) {
                         float cs0 = tx + tw * static_cast<float>(std::max(sr0, std::min(sr1, cutStartSec_ / dur)));
                         float cs1 = tx + tw * static_cast<float>(std::max(sr0, std::min(sr1, cutEndSec_ / dur)));
                         if (cs1 - cs0 > 2.0f) {
-                            FillRoundRect(g, cs0, (float)(ty + S(2)), cs1 - cs0, (float)S(12), (float)S(2), Gc(185, 28, 28, 180));
+                            FillRoundRect(g, cs0, (float)(ty + S(2)), cs1 - cs0, (float)S(14), (float)S(2), Gc(185, 28, 28, 180));
                         }
                     }
                 };
-                drawTrackStrip(ch - S(232), L"Oyun / PC", Gc(16, 185, 129, 175), !editGameMuted_ && editGameVolPct_ > 0);
-                drawTrackStrip(ch - S(210), L"Mikrofon", Gc(59, 130, 246, 175), editHasMultiTrack_ && !editMicMuted_ && editMicVolPct_ > 0);
+                drawTrackStrip(ch - S(232), L"Oyun / PC", Gc(16, 185, 129, 200), !editGameMuted_ && editGameVolPct_ > 0, waveGame_);
+                drawTrackStrip(ch - S(210), L"Mikrofon", Gc(59, 130, 246, 200), editHasMultiTrack_ && !editMicMuted_ && editMicVolPct_ > 0, waveMic_);
             }
 
             float knobX = static_cast<float>(sk.left) + fillW;
@@ -2587,6 +2849,26 @@ void MainWindow::PaintWindow(HDC targetDc) {
             g.FillEllipse(&knobGlow, knobX - knobR - S(3), trackY + trackH * 0.5f - knobR - S(3), (knobR + S(3)) * 2.0f, (knobR + S(3)) * 2.0f);
             Gdiplus::SolidBrush knobBr(Gc(248, 250, 252));
             g.FillEllipse(&knobBr, knobX - knobR, trackY + trackH * 0.5f - knobR, knobR * 2.0f, knobR * 2.0f);
+
+            // Hover-scrub floating thumbnail preview above seek bar
+            if (hoverSeekActive_ && playerReady_ && playerDurSec_ > 0.0 && !playerFullscreen_) {
+                const int pw = S(164), ph = S(112);
+                int px = std::max(S(244), std::min(cw - pw - S(16), hoverSeekX_ - pw / 2));
+                int py = sk.top - ph - S(12);
+                FillRoundRect(g, (float)px, (float)py, (float)pw, (float)ph, (float)S(10), Gc(12, 16, 26, 245));
+                StrokeRoundRect(g, (float)px, (float)py, (float)pw, (float)ph, (float)S(10), Gc(96, 165, 250, 190));
+                if (hoverScrubBmp_) {
+                    Gdiplus::GraphicsState saved = g.Save();
+                    Gdiplus::GraphicsPath pClip;
+                    AddRoundedRect(pClip, (float)(px + S(4)), (float)(py + S(4)), (float)(pw - S(8)), (float)S(88), (float)S(6));
+                    g.SetClip(&pClip, Gdiplus::CombineModeIntersect);
+                    Gdiplus::Bitmap sbm(hoverScrubBmp_, nullptr);
+                    g.DrawImage(&sbm, px + S(4), py + S(4), pw - S(8), S(88));
+                    g.Restore(saved);
+                }
+                g.DrawString(FormatDurClock(hoverSeekSec_).c_str(), -1, &fBold,
+                    Gdiplus::RectF((float)px, (float)(py + S(93)), (float)pw, (float)S(18)), &sfCenter, &brText);
+            }
 
             const int timeY = trimMode_ ? (ch - S(184)) : (ch - S(152));
             const int btnY  = trimMode_ ? (ch - S(156)) : (ch - S(126));
@@ -3383,6 +3665,35 @@ LRESULT MainWindow::OnMessage(UINT msg, WPARAM wParam, LPARAM lParam) {
             return 0;
         }
 
+        case WM_MW_WAVE_READY: {
+            auto* wm = reinterpret_cast<WaveReadyMsg*>(lParam);
+            if (wm) {
+                if (wm->gen == playerGen_) {
+                    waveGame_ = std::move(wm->game);
+                    waveMic_ = std::move(wm->mic);
+                    if (hwnd_ && playerOpen_) InvalidateRect(hwnd_, nullptr, FALSE);
+                }
+                delete wm;
+            }
+            return 0;
+        }
+
+        case WM_MW_SCRUB_READY: {
+            auto* sm = reinterpret_cast<ScrubReadyMsg*>(lParam);
+            if (sm) {
+                if (sm->gen == playerGen_ && playerOpen_) {
+                    if (hoverScrubBmp_) DeleteObject(hoverScrubBmp_);
+                    hoverScrubBmp_ = sm->bmp;
+                    hoverScrubBmpSec_ = sm->sec;
+                    if (hwnd_ && hoverSeekActive_) InvalidateRect(hwnd_, nullptr, FALSE);
+                } else if (sm->bmp) {
+                    DeleteObject(sm->bmp);
+                }
+                delete sm;
+            }
+            return 0;
+        }
+
         case WM_MW_UPLOAD_PROGRESS: {
             wchar_t pbuf[64] = {};
             swprintf(pbuf, 64, L"Link oluşturuluyor... %%%d", static_cast<int>(wParam));
@@ -3710,6 +4021,24 @@ LRESULT MainWindow::OnMessage(UINT msg, WPARAM wParam, LPARAM lParam) {
                 SetPlayerVolume(ratio);
                 return 0;
             }
+            if (activeTab_ == 0 && playerOpen_ && playerReady_ && !playerFullscreen_ && !trimBusy_) {
+                RECT sk = GetSeekBarRect();
+                bool overSeek = (mx >= sk.left && mx <= sk.right && my >= sk.top - S(10) && my <= sk.bottom + S(10));
+                if (overSeek && playerDurSec_ > 0.0) {
+                    double ratio = std::max(0.0, std::min(1.0, static_cast<double>(mx - sk.left) / std::max(1L, sk.right - sk.left)));
+                    hoverSeekActive_ = true;
+                    hoverSeekX_ = mx;
+                    hoverSeekSec_ = ratio * playerDurSec_;
+                    RequestHoverScrub(hoverSeekSec_);
+                    InvalidateRect(hwnd_, nullptr, FALSE);
+                } else if (hoverSeekActive_) {
+                    hoverSeekActive_ = false;
+                    InvalidateRect(hwnd_, nullptr, FALSE);
+                }
+            } else if (hoverSeekActive_) {
+                hoverSeekActive_ = false;
+                InvalidateRect(hwnd_, nullptr, FALSE);
+            }
             UpdateHover(mx, my);
             return 0;
         }
@@ -3717,6 +4046,7 @@ LRESULT MainWindow::OnMessage(UINT msg, WPARAM wParam, LPARAM lParam) {
             trackingMouse_ = false;
             hoverBtnId_ = 0;
             hoverCardIdx_ = -1;
+            hoverSeekActive_ = false;
             if (!draggingSeek_ && !draggingVol_ && draggingTrim_ == 0) pressedBtnId_ = 0;
             InvalidateRect(hwnd_, nullptr, FALSE);
             return 0;
