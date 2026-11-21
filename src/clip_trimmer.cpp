@@ -729,6 +729,9 @@ bool EditMp4Clip(const ClipEditSpec& spec, std::string& outError,
         }
         if (!segFoundV) continue;
 
+        sr->SetStreamSelection(static_cast<DWORD>(MF_SOURCE_READER_ALL_STREAMS), FALSE);
+        sr->SetStreamSelection(vIn, TRUE);
+
         ComPtr<IMFMediaType> decV;
         MFCreateMediaType(decV.Put());
         decV->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Video);
@@ -744,6 +747,7 @@ bool EditMp4Clip(const ClipEditSpec& spec, std::string& outError,
         }
 
         auto cfgAudioIn = [&](DWORD idx) -> bool {
+            sr->SetStreamSelection(idx, TRUE);
             ComPtr<IMFMediaType> decA;
             MFCreateMediaType(decA.Put());
             decA->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Audio);
@@ -773,6 +777,8 @@ bool EditMp4Clip(const ClipEditSpec& spec, std::string& outError,
         bool vDone = false;
         bool aDone[3] = { !segHasAudio, !segHasGameMic, !segHasGameMic };
         std::vector<int16_t> segPcm[3];
+        const size_t targetOutPairs = static_cast<size_t>((outSpan100 * 48000LL) / 10000000LL);
+        size_t segOutFlushed = 0;
 
         while ((!vDone || !aDone[0] || !aDone[1] || !aDone[2]) && !aborted) {
             if (cancelFlag && cancelFlag->load()) { aborted = true; break; }
@@ -784,6 +790,7 @@ bool EditMp4Clip(const ClipEditSpec& spec, std::string& outError,
             if (FAILED(hr)) break;
 
             auto markStreamDone = [&](DWORD si) {
+                sr->SetStreamSelection(si, FALSE);
                 if (si == vIn) vDone = true;
                 else {
                     for (size_t k = 0; k < aIns.size() && k < 3; ++k) {
@@ -874,6 +881,7 @@ bool EditMp4Clip(const ClipEditSpec& spec, std::string& outError,
                             ctx->CopyResource(gpuOutPool[pIdx].Get(), vpOutTex.Get());
                             ComPtr<IMFMediaBuffer> dxBuf;
                             if (SUCCEEDED(MFCreateDXGISurfaceBuffer(__uuidof(ID3D11Texture2D), gpuOutPool[pIdx].Get(), 0, FALSE, dxBuf.Put())) && dxBuf) {
+                                dxBuf->SetCurrentLength((outW * outH * 3) / 2);
                                 outSmp->AddBuffer(dxBuf.Get());
                                 dxgiAttached = true;
                                 copied = true;
@@ -919,6 +927,7 @@ bool EditMp4Clip(const ClipEditSpec& spec, std::string& outError,
                             ctx->CopySubresourceRegion(gpuOutPool[pIdx].Get(), 0, 0, 0, 0, dtex.Get(), sub, &box);
                             ComPtr<IMFMediaBuffer> dxBuf;
                             if (SUCCEEDED(MFCreateDXGISurfaceBuffer(__uuidof(ID3D11Texture2D), gpuOutPool[pIdx].Get(), 0, FALSE, dxBuf.Put())) && dxBuf) {
+                                dxBuf->SetCurrentLength((outW * outH * 3) / 2);
                                 outSmp->AddBuffer(dxBuf.Get());
                                 copied = true;
                             }
@@ -963,28 +972,66 @@ bool EditMp4Clip(const ClipEditSpec& spec, std::string& outError,
                         }
                     }
                 }
+                // Live-flush audio chunks (~0.34s) so IMFSinkWriter interleaver never stalls video WriteSample
+                if (hasOutMix) {
+                    constexpr size_t kChunkOut = 16384;
+                    const size_t needIn = static_cast<size_t>(std::ceil(static_cast<double>(kChunkOut) * speed)) + 4;
+                    while (segOutFlushed + kChunkOut <= targetOutPairs) {
+                        bool ready = segHasGameMic
+                            ? (segPcm[1].size() / 2 >= needIn && segPcm[2].size() / 2 >= needIn)
+                            : (segPcm[0].size() / 2 >= needIn);
+                        if (!ready) break;
+                        const size_t consumeIn = static_cast<size_t>(std::lround(static_cast<double>(kChunkOut) * speed));
+                        if (segHasGameMic) {
+                            std::vector<int16_t> gIn(segPcm[1].begin(), segPcm[1].begin() + consumeIn * 2);
+                            std::vector<int16_t> mIn(segPcm[2].begin(), segPcm[2].begin() + consumeIn * 2);
+                            segPcm[1].erase(segPcm[1].begin(), segPcm[1].begin() + consumeIn * 2);
+                            segPcm[2].erase(segPcm[2].begin(), segPcm[2].begin() + consumeIn * 2);
+                            std::vector<int16_t> gRes, mRes;
+                            AppendResampledPcm(gIn, speed, gameGain, kChunkOut, gRes);
+                            AppendResampledPcm(mIn, speed, micGain, kChunkOut, mRes);
+                            outMixAccum.reserve(outMixAccum.size() + kChunkOut * 2);
+                            for (size_t i = 0; i < kChunkOut * 2; ++i) {
+                                float mix = static_cast<float>(gRes[i]) / 32767.0f + static_cast<float>(mRes[i]) / 32767.0f;
+                                outMixAccum.push_back(FloatToPcm16(mix));
+                            }
+                            if (hasOutGame) outGameAccum.insert(outGameAccum.end(), gRes.begin(), gRes.end());
+                            if (hasOutMic)  outMicAccum.insert(outMicAccum.end(), mRes.begin(), mRes.end());
+                        } else {
+                            std::vector<int16_t> sIn(segPcm[0].begin(), segPcm[0].begin() + consumeIn * 2);
+                            segPcm[0].erase(segPcm[0].begin(), segPcm[0].begin() + consumeIn * 2);
+                            AppendResampledPcm(sIn, speed, gameGain, kChunkOut, outMixAccum);
+                            if (hasOutGame) AppendResampledPcm(sIn, speed, gameGain, kChunkOut, outGameAccum);
+                            if (hasOutMic)  outMicAccum.insert(outMicAccum.end(), kChunkOut * 2, 0);
+                        }
+                        FlushPcmChunks(sw.Get(), aOutMix, outMixAccum, mixWrittenPairs, false);
+                        if (hasOutGame) FlushPcmChunks(sw.Get(), aOutGame, outGameAccum, gameWrittenPairs, false);
+                        if (hasOutMic)  FlushPcmChunks(sw.Get(), aOutMic, outMicAccum, micWrittenPairs, false);
+                        segOutFlushed += kChunkOut;
+                    }
+                }
             }
         }
 
         if (aborted) break;
 
-        if (hasOutMix) {
-            const size_t targetOutPairs = static_cast<size_t>((outSpan100 * 48000LL) / 10000000LL);
+        if (hasOutMix && segOutFlushed < targetOutPairs) {
+            const size_t remOutPairs = targetOutPairs - segOutFlushed;
             if (segHasGameMic) {
                 std::vector<int16_t> gRes, mRes;
-                AppendResampledPcm(segPcm[1], speed, gameGain, targetOutPairs, gRes);
-                AppendResampledPcm(segPcm[2], speed, micGain, targetOutPairs, mRes);
-                outMixAccum.reserve(outMixAccum.size() + targetOutPairs * 2);
-                for (size_t i = 0; i < targetOutPairs * 2; ++i) {
+                AppendResampledPcm(segPcm[1], speed, gameGain, remOutPairs, gRes);
+                AppendResampledPcm(segPcm[2], speed, micGain, remOutPairs, mRes);
+                outMixAccum.reserve(outMixAccum.size() + remOutPairs * 2);
+                for (size_t i = 0; i < remOutPairs * 2; ++i) {
                     float mix = static_cast<float>(gRes[i]) / 32767.0f + static_cast<float>(mRes[i]) / 32767.0f;
                     outMixAccum.push_back(FloatToPcm16(mix));
                 }
                 if (hasOutGame) outGameAccum.insert(outGameAccum.end(), gRes.begin(), gRes.end());
                 if (hasOutMic)  outMicAccum.insert(outMicAccum.end(), mRes.begin(), mRes.end());
             } else {
-                AppendResampledPcm(segPcm[0], speed, gameGain, targetOutPairs, outMixAccum);
-                if (hasOutGame) AppendResampledPcm(segPcm[0], speed, gameGain, targetOutPairs, outGameAccum);
-                if (hasOutMic)  outMicAccum.insert(outMicAccum.end(), targetOutPairs * 2, 0);
+                AppendResampledPcm(segPcm[0], speed, gameGain, remOutPairs, outMixAccum);
+                if (hasOutGame) AppendResampledPcm(segPcm[0], speed, gameGain, remOutPairs, outGameAccum);
+                if (hasOutMic)  outMicAccum.insert(outMicAccum.end(), remOutPairs * 2, 0);
             }
             FlushPcmChunks(sw.Get(), aOutMix, outMixAccum, mixWrittenPairs, false);
             if (hasOutGame) FlushPcmChunks(sw.Get(), aOutGame, outGameAccum, gameWrittenPairs, false);
