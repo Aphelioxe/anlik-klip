@@ -98,6 +98,7 @@ void StrokeRoundRect(Gdiplus::Graphics& g, float x, float y, float w, float h, f
 
 enum CustomBtnId {
     BTN_TAB_CLIPS = 1,
+    BTN_TAB_MONTAGE,
     BTN_TAB_SETTINGS,
     BTN_SIDE_SAVE,
     BTN_SIDE_TOGGLE,
@@ -149,7 +150,24 @@ enum CustomBtnId {
     BTN_CMB_DURATION,
     BTN_CMB_RESFPS,
     BTN_CMB_BITRATE,
-    BTN_CMB_MIC_DEV
+    BTN_CMB_MIC_DEV,
+
+    // Montage tab controls
+    BTN_MNT_CLEAR = 100,
+    BTN_MNT_FADE,
+    BTN_MNT_V916,
+    BTN_MNT_SPEED,
+    BTN_MNT_GAME_MUTE,
+    BTN_MNT_MIC_MUTE,
+    BTN_MNT_EXPORT_NORMAL,
+    BTN_MNT_EXPORT_DISC10,
+    BTN_MNT_EXPORT_DISC25,
+    BTN_MNT_CANCEL,
+
+    BTN_MNT_ADD_BASE  = 2000,
+    BTN_MNT_UP_BASE   = 3000,
+    BTN_MNT_DOWN_BASE = 4000,
+    BTN_MNT_DEL_BASE  = 5000
 };
 
 enum NativeCtrlId {
@@ -561,7 +579,7 @@ bool MainWindow::Create(int initialTab) {
     RefreshClips();
     SwitchTab(initialTab);
     tabAnimT_ = 1.0f;
-    tabIndicatorY_ = (activeTab_ == 1) ? 160.0f : 118.0f;
+    tabIndicatorY_ = 118.0f + static_cast<float>(activeTab_) * 42.0f;
 
     openAnimStartMs_ = GetTickCount64();
     ShowWindow(hwnd_, SW_SHOWNORMAL);
@@ -860,8 +878,8 @@ void MainWindow::UpdateGalleryControlVisibility() {
 }
 
 void MainWindow::SwitchTab(int tabIndex) {
-    int nextTab = (tabIndex == 1) ? 1 : 0;
-    if (nextTab == 1 && playerOpen_) {
+    int nextTab = std::max(0, std::min(2, tabIndex));
+    if (nextTab != 0 && playerOpen_) {
         CloseEmbeddedPlayer();
     }
     const bool changed = (nextTab != activeTab_);
@@ -873,12 +891,12 @@ void MainWindow::SwitchTab(int tabIndex) {
     activeTab_ = nextTab;
     if (hwnd_) SendMessageW(hwnd_, WM_SETREDRAW, FALSE, 0);
     for (HWND h : settingsCtrls_) {
-        ShowWindow(h, activeTab_ == 1 ? SW_SHOW : SW_HIDE);
+        ShowWindow(h, activeTab_ == 2 ? SW_SHOW : SW_HIDE);
     }
     UpdateGalleryControlVisibility();
     if (hwnd_) {
         SendMessageW(hwnd_, WM_SETREDRAW, TRUE, 0);
-        if (activeTab_ == 1) SetTimer(hwnd_, TIMER_MIC_METER_ID, 120, nullptr);
+        if (activeTab_ == 2) SetTimer(hwnd_, TIMER_MIC_METER_ID, 120, nullptr);
         else KillTimer(hwnd_, TIMER_MIC_METER_ID);
         if (changed) SetTimer(hwnd_, TIMER_UI_ANIM_ID, 10, nullptr);
         RedrawWindow(hwnd_, nullptr, nullptr, RDW_INVALIDATE | RDW_UPDATENOW | RDW_ALLCHILDREN);
@@ -1583,6 +1601,60 @@ void MainWindow::StartTrimAsync(bool replaceOriginal, int targetSizeMb) {
     if (hwnd_) InvalidateRect(hwnd_, nullptr, FALSE);
 }
 
+void MainWindow::StartMontageExport(int targetSizeMb) {
+    if (trimBusy_ || montagePaths_.empty()) return;
+    if (trimThread_.joinable()) trimThread_.join();
+
+    trimCancel_.store(false);
+    trimBusy_ = true;
+
+    std::wstring outDir = app_.Config().outputDir;
+    if (outDir.empty()) {
+        size_t sl = montagePaths_[0].find_last_of(L"\\/");
+        if (sl != std::wstring::npos) outDir = montagePaths_[0].substr(0, sl);
+    }
+    const std::wstring outPath = BuildMontageOutputPath(outDir);
+
+    ClipEditSpec editSpec;
+    editSpec.dstPath = outPath;
+    for (const auto& p : montagePaths_) {
+        editSpec.montageSegments.push_back({ p, 0.0, 0.0 });
+    }
+    editSpec.fadeTransitions = montageFade_;
+    editSpec.vertical916 = montageVertical916_;
+    editSpec.speed = montageSpeed_;
+    editSpec.gameVolPct = montageGameMuted_ ? 0 : 100;
+    editSpec.micVolPct = montageMicMuted_ ? 0 : 100;
+    editSpec.targetSizeMb = targetSizeMb;
+
+    SetFooterMessage(L"Montaj oluşturuluyor, lütfen bekleyin...");
+    HWND target = hwnd_;
+    trimThread_ = std::thread([this, target, outPath, editSpec]() {
+        ComScope com(COINIT_MULTITHREADED);
+        std::string errUtf8;
+        bool ok = EditMp4Clip(editSpec, errUtf8, &trimCancel_);
+        if (trimCancel_.load()) {
+            DeleteFileW(outPath.c_str());
+            return;
+        }
+        auto* m = new TrimDoneMsg{};
+        m->ok = ok;
+        m->replaceOriginal = false;
+        m->origPath = editSpec.montageSegments.empty() ? L"" : editSpec.montageSegments[0].path;
+        m->outPath = outPath;
+        if (!ok) {
+            int wlen = MultiByteToWideChar(CP_UTF8, 0, errUtf8.c_str(), -1, nullptr, 0);
+            std::wstring werr(wlen > 0 ? wlen - 1 : 0, L'\0');
+            if (wlen > 1) MultiByteToWideChar(CP_UTF8, 0, errUtf8.c_str(), -1, &werr[0], wlen);
+            m->message = L"Montaj başarısız: " + werr;
+        }
+        if (!PostMessageW(target, WM_MW_TRIM_DONE, 0, reinterpret_cast<LPARAM>(m))) {
+            delete m;
+        }
+    });
+    if (hwnd_) InvalidateRect(hwnd_, nullptr, FALSE);
+}
+
 void MainWindow::TogglePlayerPlayPause() {
     if (!player_ || !playerReady_) return;
     if (playerEnded_) {
@@ -2190,7 +2262,7 @@ void MainWindow::PaintWindow(HDC targetDc) {
                 g.DrawString(badge.c_str(), -1, &fSmall,
                     Gdiplus::RectF((float)(rc.right - S(40)), (float)(rc.top + S(8)), (float)S(30), (float)S(20)),
                     &sfCenter, &tb);
-            } else if (id == BTN_TAB_CLIPS || id == BTN_TAB_SETTINGS) {
+            } else if (id == BTN_TAB_CLIPS || id == BTN_TAB_MONTAGE || id == BTN_TAB_SETTINGS) {
                 g.DrawString(label.c_str(), -1, &fBold,
                     Gdiplus::RectF((float)rc.left + S(14), (float)rc.top, (float)(rc.right - rc.left - S(20)), (float)(rc.bottom - rc.top)),
                     &sfLeft, &tb);
@@ -2203,7 +2275,7 @@ void MainWindow::PaintWindow(HDC targetDc) {
 
         // Animated sliding active tab pill in sidebar
         {
-            float targetY = (activeTab_ == 1) ? 160.0f : 118.0f;
+            float targetY = 118.0f + static_cast<float>(activeTab_) * 42.0f;
             float pillY = tabIndicatorY_ + (targetY - tabIndicatorY_) * tabAnimT_;
             FillRoundRectGrad(g, (float)S(16), (float)S(static_cast<int>(pillY)), (float)S(188), (float)S(36), (float)S(9),
                 Gc(37, 99, 235, 70), Gc(99, 102, 241, 40));
@@ -2218,7 +2290,12 @@ void MainWindow::PaintWindow(HDC targetDc) {
         addBtn(BTN_TAB_CLIPS, 16, 118, 188, 36, L"Kliplerim",
             Gc(0, 0, 0, 0), Gc(34, 45, 70, 140),
             Gc(0, 0, 0, 0), true, false, cntStr);
-        addBtn(BTN_TAB_SETTINGS, 16, 160, 188, 36, L"Ayarlar",
+        wchar_t mntCntStr[16] = {};
+        if (!montagePaths_.empty()) swprintf(mntCntStr, 16, L"%zu", montagePaths_.size());
+        addBtn(BTN_TAB_MONTAGE, 16, 160, 188, 36, L"Montaj",
+            Gc(0, 0, 0, 0), Gc(34, 45, 70, 140),
+            Gc(0, 0, 0, 0), true, false, mntCntStr);
+        addBtn(BTN_TAB_SETTINGS, 16, 202, 188, 36, L"Ayarlar",
             Gc(0, 0, 0, 0), Gc(34, 45, 70, 140),
             Gc(0, 0, 0, 0), true, false);
 
@@ -2864,8 +2941,154 @@ void MainWindow::PaintWindow(HDC targetDc) {
             }
             g.ResetTransform();
             g.ResetClip();
+        } else if (activeTab_ == 1) {
+            // ================= TAB 1: MONTAJ =================
+            g.DrawString(L"Klip Montajı", -1, &fTitle,
+                Gdiplus::RectF((float)S(242), (float)S(14), (float)S(260), (float)S(28)), &sfLeft, &brText);
+            g.DrawString(L"Klipleri sırayla birleştirin, karartma geçişi, hız, 9:16 dikey ve Discord boyut seçeneklerini uygulayın.", -1, &fSmall,
+                Gdiplus::RectF((float)S(242), (float)S(42), (float)std::max(S(300), cw - S(266)), (float)S(18)), &sfLeft, &brMuted);
+
+            const int colGap = S(16);
+            const int bodyW = std::max(S(640), cw - S(264));
+            const int leftW = (bodyW - colGap) / 2;
+            const int rightX = S(242) + leftW + colGap;
+            const int rightW = bodyW - leftW - colGap;
+            const int listTop = S(70);
+            const int listH = std::max(S(240), ch - S(300));
+
+            // Left Card: Clip Library
+            FillRoundRect(g, (float)S(242), (float)listTop, (float)leftW, (float)listH, (float)S(12), Gc(16, 21, 33));
+            StrokeRoundRect(g, (float)S(242), (float)listTop, (float)leftW, (float)listH, (float)S(12), Gc(44, 56, 80));
+            g.DrawString(L"Kliplerim (Sıraya Ekle)", -1, &fBold,
+                Gdiplus::RectF((float)S(256), (float)(listTop + S(10)), (float)(leftW - S(28)), (float)S(22)), &sfLeft, &brBlueTxt);
+
+            const int rowH = S(40);
+            const int rowStartY = listTop + S(38);
+            const int maxVisLib = std::max(1, (listH - S(46)) / rowH);
+            const int maxLibSc = std::max(0, static_cast<int>(clips_.size()) - maxVisLib);
+            montageLibScroll_ = std::max(0, std::min(montageLibScroll_, maxLibSc));
+
+            for (int vi = 0; vi < maxVisLib; ++vi) {
+                int ci = montageLibScroll_ + vi;
+                if (ci >= static_cast<int>(clips_.size())) break;
+                const auto& c = clips_[static_cast<size_t>(ci)];
+                int ry = rowStartY + vi * rowH;
+                FillRoundRect(g, (float)S(252), (float)ry, (float)(leftW - S(20)), (float)(rowH - S(5)), (float)S(8), Gc(22, 29, 45));
+                wchar_t meta[64] = {};
+                swprintf(meta, 64, L"%.1f sn • %.1f MB", c.durationSeconds, static_cast<double>(c.fileSizeBytes) / (1024.0 * 1024.0));
+                g.DrawString(c.fileName.c_str(), -1, &fSmall,
+                    Gdiplus::RectF((float)S(260), (float)(ry + S(3)), (float)(leftW - S(94)), (float)S(16)), &sfLeft, &brText);
+                g.DrawString(meta, -1, &fSmall,
+                    Gdiplus::RectF((float)S(260), (float)(ry + S(18)), (float)(leftW - S(94)), (float)S(14)), &sfLeft, &brMuted);
+                addBtnPx(BTN_MNT_ADD_BASE + ci, S(242) + leftW - S(72), ry + S(5), S(54), S(25), L"+ Ekle",
+                    Gc(37, 99, 235), Gc(59, 130, 246), Gc(96, 165, 250), !trimBusy_ && ci < 900);
+            }
+
+            // Right Card: Montage Queue
+            FillRoundRect(g, (float)rightX, (float)listTop, (float)rightW, (float)listH, (float)S(12), Gc(16, 21, 33));
+            StrokeRoundRect(g, (float)rightX, (float)listTop, (float)rightW, (float)listH, (float)S(12), Gc(59, 130, 246, 110));
+
+            double totalMntSec = 0.0;
+            for (const auto& mp : montagePaths_) {
+                for (const auto& c : clips_) {
+                    if (_wcsicmp(c.filePath.c_str(), mp.c_str()) == 0) {
+                        totalMntSec += c.durationSeconds;
+                        break;
+                    }
+                }
+            }
+            wchar_t qHdr[96] = {};
+            swprintf(qHdr, 96, L"Montaj Sırası (%zu klip • %.1f sn)", montagePaths_.size(), totalMntSec / montageSpeed_);
+            g.DrawString(qHdr, -1, &fBold,
+                Gdiplus::RectF((float)(rightX + S(14)), (float)(listTop + S(10)), (float)(rightW - S(100)), (float)S(22)), &sfLeft, &brBlueTxt);
+            addBtnPx(BTN_MNT_CLEAR, rightX + rightW - S(78), listTop + S(8), S(64), S(24), L"Temizle",
+                Gc(45, 55, 75), Gc(65, 80, 108), Gc(90, 110, 140), !trimBusy_ && !montagePaths_.empty());
+
+            if (montagePaths_.empty()) {
+                g.DrawString(L"Soldan '+ Ekle' ile en az 2 klip ekleyin.", -1, &fSmall,
+                    Gdiplus::RectF((float)(rightX + S(16)), (float)(listTop + S(52)), (float)(rightW - S(32)), (float)S(24)), &sfLeft, &brMuted);
+            } else {
+                const int maxVisQ = std::max(1, (listH - S(46)) / rowH);
+                const int maxQSc = std::max(0, static_cast<int>(montagePaths_.size()) - maxVisQ);
+                montageQueueScroll_ = std::max(0, std::min(montageQueueScroll_, maxQSc));
+                for (int vi = 0; vi < maxVisQ; ++vi) {
+                    int qi = montageQueueScroll_ + vi;
+                    if (qi >= static_cast<int>(montagePaths_.size())) break;
+                    const std::wstring& qp = montagePaths_[static_cast<size_t>(qi)];
+                    size_t sl = qp.find_last_of(L"\\/");
+                    std::wstring qName = (sl != std::wstring::npos) ? qp.substr(sl + 1) : qp;
+                    double qDur = 0.0;
+                    for (const auto& c : clips_) {
+                        if (_wcsicmp(c.filePath.c_str(), qp.c_str()) == 0) { qDur = c.durationSeconds; break; }
+                    }
+                    int ry = rowStartY + vi * rowH;
+                    FillRoundRect(g, (float)(rightX + S(10)), (float)ry, (float)(rightW - S(20)), (float)(rowH - S(5)), (float)S(8), Gc(22, 29, 45));
+                    wchar_t qLine[256] = {};
+                    swprintf(qLine, 256, L"#%d  %s", qi + 1, qName.c_str());
+                    g.DrawString(qLine, -1, &fSmall,
+                        Gdiplus::RectF((float)(rightX + S(18)), (float)(ry + S(3)), (float)(rightW - S(124)), (float)S(16)), &sfLeft, &brText);
+                    wchar_t qMeta[48] = {};
+                    swprintf(qMeta, 48, L"%.1f sn", qDur);
+                    g.DrawString(qMeta, -1, &fSmall,
+                        Gdiplus::RectF((float)(rightX + S(18)), (float)(ry + S(18)), (float)(rightW - S(124)), (float)S(14)), &sfLeft, &brMuted);
+
+                    int bx = rightX + rightW - S(104);
+                    addBtnPx(BTN_MNT_UP_BASE + qi, bx, ry + S(5), S(26), S(25), L"↑",
+                        Gc(34, 42, 58), Gc(50, 62, 86), Gc(70, 86, 116), !trimBusy_ && qi > 0);
+                    addBtnPx(BTN_MNT_DOWN_BASE + qi, bx + S(30), ry + S(5), S(26), S(25), L"↓",
+                        Gc(34, 42, 58), Gc(50, 62, 86), Gc(70, 86, 116), !trimBusy_ && (qi + 1 < static_cast<int>(montagePaths_.size())));
+                    addBtnPx(BTN_MNT_DEL_BASE + qi, bx + S(60), ry + S(5), S(26), S(25), L"×",
+                        Gc(127, 29, 29), Gc(185, 28, 28), Gc(220, 38, 38), !trimBusy_);
+                }
+            }
+
+            // Bottom Card: Options & Export
+            const int optY = listTop + listH + S(12);
+            const int optH = S(142);
+            FillRoundRect(g, (float)S(242), (float)optY, (float)bodyW, (float)optH, (float)S(12), Gc(16, 21, 33));
+            StrokeRoundRect(g, (float)S(242), (float)optY, (float)bodyW, (float)optH, (float)S(12), Gc(44, 56, 80));
+
+            g.DrawString(L"Montaj Ayarları ve Dışa Aktarma", -1, &fBold,
+                Gdiplus::RectF((float)S(256), (float)(optY + S(10)), (float)S(260), (float)S(20)), &sfLeft, &brBlueTxt);
+
+            const int r1Y = optY + S(38);
+            addBtnPx(BTN_MNT_FADE, S(256), r1Y, S(162), S(28),
+                montageFade_ ? L"Geçiş: Karartma (0.35s)" : L"Geçiş: Keskin",
+                montageFade_ ? Gc(37, 99, 235) : Gc(34, 42, 58),
+                montageFade_ ? Gc(59, 130, 246) : Gc(50, 62, 86), Gc(96, 165, 250), !trimBusy_);
+            addBtnPx(BTN_MNT_V916, S(426), r1Y, S(124), S(28),
+                montageVertical916_ ? L"9:16 Dikey: Açık" : L"9:16 Dikey: Kapalı",
+                montageVertical916_ ? Gc(124, 58, 237) : Gc(34, 42, 58),
+                montageVertical916_ ? Gc(139, 92, 246) : Gc(50, 62, 86), Gc(167, 139, 250), !trimBusy_);
+            wchar_t spdBuf[32] = {};
+            swprintf(spdBuf, 32, L"Hız: %.1fx", montageSpeed_);
+            addBtnPx(BTN_MNT_SPEED, S(558), r1Y, S(94), S(28), spdBuf,
+                Gc(34, 42, 58), Gc(50, 62, 86), Gc(70, 86, 116), !trimBusy_);
+            addBtnPx(BTN_MNT_GAME_MUTE, S(660), r1Y, S(110), S(28),
+                montageGameMuted_ ? L"Oyun: Sustu" : L"Oyun: Açık",
+                montageGameMuted_ ? Gc(153, 27, 27) : Gc(34, 42, 58),
+                montageGameMuted_ ? Gc(185, 28, 28) : Gc(50, 62, 86), Gc(248, 113, 113), !trimBusy_);
+            addBtnPx(BTN_MNT_MIC_MUTE, S(778), r1Y, S(104), S(28),
+                montageMicMuted_ ? L"Mic: Sustu" : L"Mic: Açık",
+                montageMicMuted_ ? Gc(153, 27, 27) : Gc(34, 42, 58),
+                montageMicMuted_ ? Gc(185, 28, 28) : Gc(50, 62, 86), Gc(248, 113, 113), !trimBusy_);
+
+            const int r2Y = optY + S(78);
+            const bool canExportMnt = !trimBusy_ && !montagePaths_.empty();
+            addBtnPx(BTN_MNT_EXPORT_NORMAL, S(256), r2Y, S(156), S(32), L"Montajı Oluştur",
+                Gc(16, 185, 129), Gc(5, 150, 105), Gc(52, 211, 153), canExportMnt);
+            addBtnPx(BTN_MNT_EXPORT_DISC10, S(420), r2Y, S(132), S(32), L"Discord ≤10 MB",
+                Gc(88, 101, 242), Gc(104, 117, 248), Gc(165, 180, 252), canExportMnt);
+            addBtnPx(BTN_MNT_EXPORT_DISC25, S(560), r2Y, S(132), S(32), L"Discord ≤25 MB",
+                Gc(67, 56, 202), Gc(79, 70, 229), Gc(165, 180, 252), canExportMnt);
+            if (trimBusy_) {
+                addBtnPx(BTN_MNT_CANCEL, S(700), r2Y, S(96), S(32), L"İptal",
+                    Gc(153, 27, 27), Gc(185, 28, 28), Gc(248, 113, 113), true);
+            }
+            g.DrawString(footerMsg_.c_str(), -1, &fSmall,
+                Gdiplus::RectF((float)S(256), (float)(optY + S(116)), (float)(bodyW - S(28)), (float)S(18)), &sfLeft, &brMuted);
         } else {
-            // ================= TAB 1: AYARLAR =================
+            // ================= TAB 2: AYARLAR =================
             const int sox = settingsOffsetX_;
 
             g.DrawString(L"Ayarlar", -1, &fTitle,
@@ -3051,7 +3274,7 @@ LRESULT MainWindow::OnMessage(UINT msg, WPARAM wParam, LPARAM lParam) {
         case WM_TIMER:
             if (wParam == TIMER_PLAYER_ID) {
                 UpdatePlayerMetrics();
-            } else if (wParam == TIMER_MIC_METER_ID && activeTab_ == 1) {
+            } else if (wParam == TIMER_MIC_METER_ID && activeTab_ == 2) {
                 RECT mrc{ S(590) + settingsOffsetX_, S(220), S(892) + settingsOffsetX_, S(245) };
                 InvalidateRect(hwnd_, &mrc, FALSE);
             } else if (wParam == TIMER_UI_ANIM_ID) {
@@ -3080,10 +3303,10 @@ LRESULT MainWindow::OnMessage(UINT msg, WPARAM wParam, LPARAM lParam) {
                     float rawTab = std::min(1.0f, static_cast<float>(now - tabAnimStartMs_) / 140.0f);
                     tabAnimT_ = rawTab;
                     if (rawTab >= 1.0f) {
-                        tabIndicatorY_ = (activeTab_ == 1) ? 160.0f : 118.0f;
+                        tabIndicatorY_ = 118.0f + static_cast<float>(activeTab_) * 42.0f;
                     }
                     if (hwnd_) {
-                        RECT sideTabsRc{ S(14), S(114), S(208), S(200) };
+                        RECT sideTabsRc{ S(14), S(114), S(208), S(246) };
                         InvalidateRect(hwnd_, &sideTabsRc, FALSE);
                     }
                     fastTick = true;
@@ -3132,6 +3355,7 @@ LRESULT MainWindow::OnMessage(UINT msg, WPARAM wParam, LPARAM lParam) {
                         if (selectedIdx_ >= 0) OpenEmbeddedPlayer(selectedIdx_);
                         SetFooterMessage(L"Klip kırpıldı ve ana klip güncellendi (eski kopya çöp kutusunda).");
                     } else {
+                        if (activeTab_ == 1) SwitchTab(0);
                         trimMode_ = false;
                         favOnly_ = false;
                         if (edtSearch_ && !searchQuery_.empty()) {
@@ -3140,7 +3364,7 @@ LRESULT MainWindow::OnMessage(UINT msg, WPARAM wParam, LPARAM lParam) {
                         }
                         RefreshClips(tm->outPath);
                         if (selectedIdx_ >= 0) OpenEmbeddedPlayer(selectedIdx_);
-                        SetFooterMessage(L"Kırpılan kesit yeni klip olarak kaydedildi.");
+                        SetFooterMessage(L"Kırpılan kesit / montaj yeni klip olarak kaydedildi.");
                     }
                 } else {
                     if (tm->replaceOriginal) DeleteFileW(tm->outPath.c_str());
@@ -3503,6 +3727,20 @@ LRESULT MainWindow::OnMessage(UINT msg, WPARAM wParam, LPARAM lParam) {
                 scrollY_ -= (delta / WHEEL_DELTA) * S(68);
                 ClampScroll();
                 InvalidateRect(hwnd_, nullptr, FALSE);
+            } else if (activeTab_ == 1) {
+                POINT pt{ static_cast<short>(LOWORD(lParam)), static_cast<short>(HIWORD(lParam)) };
+                ScreenToClient(hwnd_, &pt);
+                int delta = GET_WHEEL_DELTA_WPARAM(wParam);
+                int step = (delta > 0) ? -1 : 1;
+                RECT cli{}; GetClientRect(hwnd_, &cli);
+                int bodyW = std::max<int>(S(640), static_cast<int>(cli.right - cli.left) - S(264));
+                int splitX = S(242) + (bodyW - S(16)) / 2;
+                if (pt.x < splitX) {
+                    montageLibScroll_ = std::max(0, montageLibScroll_ + step);
+                } else {
+                    montageQueueScroll_ = std::max(0, montageQueueScroll_ + step);
+                }
+                InvalidateRect(hwnd_, nullptr, FALSE);
             }
             return 0;
 
@@ -3617,13 +3855,68 @@ LRESULT MainWindow::OnMessage(UINT msg, WPARAM wParam, LPARAM lParam) {
                 ReleaseCapture();
                 InvalidateRect(hwnd_, nullptr, FALSE);
                 if (HitTestCustomButton(mx, my) == target) {
+                    if (target >= BTN_MNT_ADD_BASE && target < BTN_MNT_UP_BASE) {
+                        int ci = target - BTN_MNT_ADD_BASE;
+                        if (!trimBusy_ && ci >= 0 && ci < static_cast<int>(clips_.size())) {
+                            montagePaths_.push_back(clips_[static_cast<size_t>(ci)].filePath);
+                        }
+                    } else if (target >= BTN_MNT_UP_BASE && target < BTN_MNT_DOWN_BASE) {
+                        int qi = target - BTN_MNT_UP_BASE;
+                        if (!trimBusy_ && qi > 0 && qi < static_cast<int>(montagePaths_.size())) {
+                            std::swap(montagePaths_[static_cast<size_t>(qi)], montagePaths_[static_cast<size_t>(qi - 1)]);
+                        }
+                    } else if (target >= BTN_MNT_DOWN_BASE && target < BTN_MNT_DEL_BASE) {
+                        int qi = target - BTN_MNT_DOWN_BASE;
+                        if (!trimBusy_ && qi >= 0 && qi + 1 < static_cast<int>(montagePaths_.size())) {
+                            std::swap(montagePaths_[static_cast<size_t>(qi)], montagePaths_[static_cast<size_t>(qi + 1)]);
+                        }
+                    } else if (target >= BTN_MNT_DEL_BASE && target < BTN_MNT_DEL_BASE + 1000) {
+                        int qi = target - BTN_MNT_DEL_BASE;
+                        if (!trimBusy_ && qi >= 0 && qi < static_cast<int>(montagePaths_.size())) {
+                            montagePaths_.erase(montagePaths_.begin() + qi);
+                        }
+                    }
                     switch (target) {
                         case BTN_TAB_CLIPS:
                             if (activeTab_ == 0 && playerOpen_) CloseEmbeddedPlayer();
                             SwitchTab(0);
                             RefreshClips();
                             break;
-                        case BTN_TAB_SETTINGS: SwitchTab(1); break;
+                        case BTN_TAB_MONTAGE:
+                            SwitchTab(1);
+                            RefreshClips();
+                            break;
+                        case BTN_TAB_SETTINGS: SwitchTab(2); break;
+                        case BTN_MNT_CLEAR:
+                            if (!trimBusy_) montagePaths_.clear();
+                            break;
+                        case BTN_MNT_FADE:
+                            if (!trimBusy_) montageFade_ = !montageFade_;
+                            break;
+                        case BTN_MNT_V916:
+                            if (!trimBusy_) montageVertical916_ = !montageVertical916_;
+                            break;
+                        case BTN_MNT_SPEED:
+                            if (!trimBusy_) {
+                                if (montageSpeed_ < 0.75) montageSpeed_ = 1.0;
+                                else if (montageSpeed_ < 1.25) montageSpeed_ = 1.5;
+                                else if (montageSpeed_ < 1.75) montageSpeed_ = 2.0;
+                                else montageSpeed_ = 0.5;
+                            }
+                            break;
+                        case BTN_MNT_GAME_MUTE:
+                            if (!trimBusy_) montageGameMuted_ = !montageGameMuted_;
+                            break;
+                        case BTN_MNT_MIC_MUTE:
+                            if (!trimBusy_) montageMicMuted_ = !montageMicMuted_;
+                            break;
+                        case BTN_MNT_EXPORT_NORMAL: StartMontageExport(0); break;
+                        case BTN_MNT_EXPORT_DISC10: StartMontageExport(10); break;
+                        case BTN_MNT_EXPORT_DISC25: StartMontageExport(25); break;
+                        case BTN_MNT_CANCEL:
+                            trimCancel_.store(true);
+                            SetFooterMessage(L"Montaj iptal ediliyor...");
+                            break;
                         case BTN_SIDE_SAVE: if (cb_.onSaveClipRequested) cb_.onSaveClipRequested(); break;
                         case BTN_SIDE_TOGGLE: if (cb_.onToggleBufferingRequested) cb_.onToggleBufferingRequested(); break;
                         case BTN_SIDE_MIC:

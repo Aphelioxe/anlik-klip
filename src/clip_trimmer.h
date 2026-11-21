@@ -5,6 +5,13 @@
 #include <windows.h>
 #include <atomic>
 #include <string>
+#include <vector>
+
+struct MontageSegmentSpec {
+    std::wstring path;
+    double startSec = 0.0;
+    double endSec = 0.0; // <= 0.0 means full clip duration
+};
 
 struct ClipEditSpec {
     std::wstring srcPath;
@@ -29,10 +36,19 @@ struct ClipEditSpec {
 
     // Optional 9:16 vertical Shorts/Reels export (centered 16:9 gameplay + dimmed vertical background)
     bool vertical916 = false;
+
+    // Optional multi-clip montage (overrides srcPath/startSec/endSec/cut/insert when non-empty)
+    std::vector<MontageSegmentSpec> montageSegments;
+
+    // Optional 0.35s fade-to-black & audio smooth transitions between montage clips
+    bool fadeTransitions = false;
 };
 
 /** Returns a non-colliding copy path alongside srcPath (e.g. "Clip_kesit.mp4"). */
 std::wstring BuildTrimmedCopyPath(const std::wstring& srcPath);
+
+/** Returns a non-colliding montage output path in dir (e.g. "Montaj_2026-11-21_22-00-00.mp4"). */
+std::wstring BuildMontageOutputPath(const std::wstring& dir);
 
 /** Probes whether an MP4 clip contains separate Game (Track 2) and Mic (Track 3) audio streams. */
 bool ProbeClipAudioTracks(const std::wstring& path, bool& outHasSeparateGameMic, double* outDurationSec = nullptr);

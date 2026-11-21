@@ -362,6 +362,25 @@ std::wstring BuildTrimmedCopyPath(const std::wstring& srcPath) {
     return dir + stem + L"_kesit_x.mp4";
 }
 
+std::wstring BuildMontageOutputPath(const std::wstring& dir) {
+    std::wstring base = dir;
+    if (!base.empty() && base.back() != L'\\' && base.back() != L'/') base.push_back(L'\\');
+    SYSTEMTIME st{};
+    GetLocalTime(&st);
+    wchar_t stem[64] = {};
+    swprintf(stem, 64, L"Montaj_%04d-%02d-%02d_%02d-%02d-%02d",
+             st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond);
+    std::wstring cand = base + stem + L".mp4";
+    if (GetFileAttributesW(cand.c_str()) == INVALID_FILE_ATTRIBUTES) return cand;
+    for (int i = 2; i < 1000; ++i) {
+        wchar_t suf[32] = {};
+        swprintf(suf, 32, L"_%d.mp4", i);
+        cand = base + stem + suf;
+        if (GetFileAttributesW(cand.c_str()) == INVALID_FILE_ATTRIBUTES) return cand;
+    }
+    return base + stem + L"_x.mp4";
+}
+
 bool ProbeClipAudioTracks(const std::wstring& path, bool& outHasSeparateGameMic, double* outDurationSec) {
     outHasSeparateGameMic = false;
     if (outDurationSec) *outDurationSec = 0.0;
@@ -394,9 +413,10 @@ bool ProbeClipAudioTracks(const std::wstring& path, bool& outHasSeparateGameMic,
 
 bool EditMp4Clip(const ClipEditSpec& spec, std::string& outError,
                  std::atomic<bool>* cancelFlag) {
+    const bool isMontage = !spec.montageSegments.empty();
     double startSec = std::max(0.0, spec.startSec);
     double endSec = spec.endSec;
-    if (endSec <= startSec + 0.2) {
+    if (!isMontage && endSec <= startSec + 0.2) {
         outError = "Kırpma aralığı en az 0.2 saniye olmalı.";
         return false;
     }
@@ -406,26 +426,53 @@ bool EditMp4Clip(const ClipEditSpec& spec, std::string& outError,
     const float micGain = std::max(0.0f, std::min(2.0f, static_cast<float>(spec.micVolPct) / 100.0f));
 
     std::vector<SourceSegment> segments;
-    const bool hasCut = (spec.cutEndSec > spec.cutStartSec + 0.1) &&
-                        (spec.cutStartSec > startSec + 0.1) &&
-                        (spec.cutEndSec < endSec - 0.1);
-    double insertDur = 0.0;
-    bool insertHasMulti = false;
-    bool hasInsert = !spec.insertClipPath.empty() &&
-                     ProbeClipAudioTracks(spec.insertClipPath, insertHasMulti, &insertDur) &&
-                     insertDur > 0.2;
+    bool hasCut = false;
+    bool hasInsert = false;
+    std::wstring primaryPath = spec.srcPath;
 
-    if (hasCut) {
-        segments.push_back({ spec.srcPath, startSec, spec.cutStartSec });
-        if (hasInsert) segments.push_back({ spec.insertClipPath, 0.0, insertDur });
-        segments.push_back({ spec.srcPath, spec.cutEndSec, endSec });
+    if (isMontage) {
+        for (const auto& ms : spec.montageSegments) {
+            if (ms.path.empty()) continue;
+            double s0 = std::max(0.0, ms.startSec);
+            double s1 = ms.endSec;
+            if (s1 <= s0 + 0.2) {
+                bool dummyMulti = false;
+                double probedDur = 0.0;
+                if (!ProbeClipAudioTracks(ms.path, dummyMulti, &probedDur) || probedDur <= 0.2) continue;
+                s1 = probedDur;
+            }
+            if (s1 > s0 + 0.2) {
+                segments.push_back({ ms.path, s0, s1 });
+            }
+        }
+        if (segments.empty()) {
+            outError = "Montaj için geçerli klip bulunamadı.";
+            return false;
+        }
+        primaryPath = segments[0].path;
     } else {
-        segments.push_back({ spec.srcPath, startSec, endSec });
-        if (hasInsert) segments.push_back({ spec.insertClipPath, 0.0, insertDur });
+        hasCut = (spec.cutEndSec > spec.cutStartSec + 0.1) &&
+                 (spec.cutStartSec > startSec + 0.1) &&
+                 (spec.cutEndSec < endSec - 0.1);
+        double insertDur = 0.0;
+        bool insertHasMulti = false;
+        hasInsert = !spec.insertClipPath.empty() &&
+                    ProbeClipAudioTracks(spec.insertClipPath, insertHasMulti, &insertDur) &&
+                    insertDur > 0.2;
+
+        if (hasCut) {
+            segments.push_back({ spec.srcPath, startSec, spec.cutStartSec });
+            if (hasInsert) segments.push_back({ spec.insertClipPath, 0.0, insertDur });
+            segments.push_back({ spec.srcPath, spec.cutEndSec, endSec });
+        } else {
+            segments.push_back({ spec.srcPath, startSec, endSec });
+            if (hasInsert) segments.push_back({ spec.insertClipPath, 0.0, insertDur });
+        }
     }
 
     // Fast lossless passthrough trim (<0.3s, minimal RAM) when only start/end changed
-    if (!hasCut && !hasInsert && spec.targetSizeMb == 0 && !spec.vertical916 &&
+    if (!isMontage && !hasCut && !hasInsert && !spec.fadeTransitions &&
+        spec.targetSizeMb == 0 && !spec.vertical916 &&
         std::abs(speed - 1.0) < 0.01 &&
         spec.gameVolPct == 100 && spec.micVolPct == 100) {
         if (FastPassthroughTrimMp4(spec.srcPath, spec.dstPath, startSec, endSec, cancelFlag)) {
@@ -458,10 +505,10 @@ bool EditMp4Clip(const ClipEditSpec& spec, std::string& outError,
 
     // Probe primary video format & audio track layout
     bool srcMultiTrack = false;
-    ProbeClipAudioTracks(spec.srcPath, srcMultiTrack, nullptr);
+    ProbeClipAudioTracks(primaryPath, srcMultiTrack, nullptr);
 
     ComPtr<IMFSourceReader> probeSr;
-    if (FAILED(MFCreateSourceReaderFromURL(spec.srcPath.c_str(), nullptr, probeSr.Put())) || !probeSr) {
+    if (FAILED(MFCreateSourceReaderFromURL(primaryPath.c_str(), nullptr, probeSr.Put())) || !probeSr) {
         outError = "Kaynak klip okunamadı.";
         return false;
     }
@@ -514,13 +561,11 @@ bool EditMp4Clip(const ClipEditSpec& spec, std::string& outError,
         outW = (srcH >= 1080) ? 1080u : 720u;
         outH = (srcH >= 1080) ? 1920u : 1280u;
     }
-    if (!isDiscordExport) {
-        if (speed < 0.99) {
-            outFpsN = std::max<uint32_t>(15u, static_cast<uint32_t>(std::lround((static_cast<double>(fpsN) / fpsD) * speed)));
-            outFpsD = 1;
-        } else if (speed > 1.01) {
-            outBr = std::min<uint32_t>(24000000u, static_cast<uint32_t>(outBr * 1.25));
-        }
+    if (speed < 0.99) {
+        outFpsN = std::max<uint32_t>(15u, static_cast<uint32_t>(std::lround((static_cast<double>(fpsN) / fpsD) * speed)));
+        outFpsD = 1;
+    } else if (!isDiscordExport && speed > 1.01) {
+        outBr = std::min<uint32_t>(24000000u, static_cast<uint32_t>(outBr * 1.25));
     }
     if (isDiscordExport) {
         const double targetBits = static_cast<double>(spec.targetSizeMb) * 8.0 * 1024.0 * 1024.0 * 0.88;
@@ -543,12 +588,13 @@ bool EditMp4Clip(const ClipEditSpec& spec, std::string& outError,
         outBr = vBps;
     }
     UINT32 vpInW = srcW, vpInH = srcH;
-    if (hasInsert) {
-        ComPtr<IMFSourceReader> insProbe;
-        if (SUCCEEDED(MFCreateSourceReaderFromURL(spec.insertClipPath.c_str(), nullptr, insProbe.Put())) && insProbe) {
+    for (const auto& sg : segments) {
+        if (_wcsicmp(sg.path.c_str(), primaryPath.c_str()) == 0) continue;
+        ComPtr<IMFSourceReader> segProbe;
+        if (SUCCEEDED(MFCreateSourceReaderFromURL(sg.path.c_str(), nullptr, segProbe.Put())) && segProbe) {
             for (DWORD si = 0; si < 8; ++si) {
                 ComPtr<IMFMediaType> mt;
-                if (FAILED(insProbe->GetNativeMediaType(si, 0, mt.Put())) || !mt) break;
+                if (FAILED(segProbe->GetNativeMediaType(si, 0, mt.Put())) || !mt) break;
                 GUID maj{};
                 mt->GetGUID(MF_MT_MAJOR_TYPE, &maj);
                 if (maj == MFMediaType_Video) {
@@ -562,7 +608,7 @@ bool EditMp4Clip(const ClipEditSpec& spec, std::string& outError,
             }
         }
     }
-    const bool needVp = (outW != srcW || outH != srcH || spec.vertical916 || hasInsert);
+    const bool needVp = (outW != srcW || outH != srcH || spec.vertical916 || hasInsert || segments.size() > 1 || spec.fadeTransitions);
     const LONGLONG outFrameDur100 = (10000000LL * outFpsD) / std::max<uint32_t>(1u, outFpsN);
 
     std::wstring tmpPath = spec.dstPath + L".tmp.mp4";
@@ -727,7 +773,8 @@ bool EditMp4Clip(const ClipEditSpec& spec, std::string& outError,
     std::vector<int16_t> outMixAccum, outGameAccum, outMicAccum;
     int64_t mixWrittenPairs = 0, gameWrittenPairs = 0, micWrittenPairs = 0;
 
-    for (const auto& seg : segments) {
+    for (size_t segIdx = 0; segIdx < segments.size(); ++segIdx) {
+        const auto& seg = segments[segIdx];
         if (cancelFlag && cancelFlag->load()) { aborted = true; break; }
 
         ComPtr<IMFAttributes> rAttr;
@@ -880,6 +927,22 @@ bool EditMp4Clip(const ClipEditSpec& spec, std::string& outError,
                         D3D11_BOX box{ 0, 0, 0, copyW, copyH, 1 };
                         ctx->CopySubresourceRegion(vpInTex.Get(), 0, 0, 0, 0, dtex.Get(), sub, &box);
 
+                        float segAlpha = 1.0f;
+                        if (spec.fadeTransitions && segments.size() > 1) {
+                            const double segOutDurSec = static_cast<double>(outSpan100) / 1e7;
+                            const double fadeSec = std::min(0.35, segOutDurSec * 0.25);
+                            const double relOutSec = static_cast<double>(std::max<LONGLONG>(0, gridTs - outVBase100)) / 1e7;
+                            if (segIdx > 0 && relOutSec < fadeSec && fadeSec > 0.01) {
+                                segAlpha = std::min(segAlpha, std::max(0.05f, static_cast<float>(relOutSec / fadeSec)));
+                            }
+                            if (segIdx + 1 < segments.size() && relOutSec > (segOutDurSec - fadeSec) && fadeSec > 0.01) {
+                                segAlpha = std::min(segAlpha, std::max(0.05f, static_cast<float>((segOutDurSec - relOutSec) / fadeSec)));
+                            }
+                            D3D11_VIDEO_COLOR bgCol{};
+                            bgCol.RGBA = { 0.0f, 0.0f, 0.0f, 1.0f };
+                            vctx->VideoProcessorSetOutputBackgroundColor(vp.Get(), FALSE, &bgCol);
+                        }
+
                         if (spec.vertical916) {
                             LONG cropW = std::min<LONG>(static_cast<LONG>(copyW),
                                 std::max<LONG>(16, (static_cast<LONG>(copyH) * static_cast<LONG>(outW)) / static_cast<LONG>(outH))) & ~1L;
@@ -894,8 +957,10 @@ bool EditMp4Clip(const ClipEditSpec& spec, std::string& outError,
 
                             vctx->VideoProcessorSetStreamSourceRect(vp.Get(), 0, TRUE, &bgSrc);
                             vctx->VideoProcessorSetStreamDestRect(vp.Get(), 0, TRUE, &dstFull);
+                            vctx->VideoProcessorSetStreamAlpha(vp.Get(), 0, TRUE, segAlpha);
                             vctx->VideoProcessorSetStreamSourceRect(vp.Get(), 1, TRUE, &fgSrc);
                             vctx->VideoProcessorSetStreamDestRect(vp.Get(), 1, TRUE, &fgDst);
+                            vctx->VideoProcessorSetStreamAlpha(vp.Get(), 1, TRUE, segAlpha);
 
                             D3D11_VIDEO_PROCESSOR_STREAM streams[2]{};
                             streams[0].Enable = TRUE; streams[0].pInputSurface = vpInView.Get();
@@ -922,6 +987,7 @@ bool EditMp4Clip(const ClipEditSpec& spec, std::string& outError,
                             }
                             vctx->VideoProcessorSetStreamSourceRect(vp.Get(), 0, TRUE, &srcFull);
                             vctx->VideoProcessorSetStreamDestRect(vp.Get(), 0, TRUE, &dstRect);
+                            vctx->VideoProcessorSetStreamAlpha(vp.Get(), 0, TRUE, segAlpha);
                             D3D11_VIDEO_PROCESSOR_STREAM st{};
                             st.Enable = TRUE; st.pInputSurface = vpInView.Get();
                             vctx->VideoProcessorBlt(vp.Get(), vpOutView.Get(), 0, 1, &st);
@@ -996,6 +1062,59 @@ bool EditMp4Clip(const ClipEditSpec& spec, std::string& outError,
                     ++outFrameIdx;
                     ++segOutFrames;
                     ++vWritten;
+
+                    // Hold/duplicate frame on grid if input FPS is lower than output FPS (e.g. 30fps clip in 60fps montage, or 0.5x)
+                    int dupCap = 0;
+                    while (dupCap < 6) {
+                        LONGLONG gTs = (outFrameIdx * 10000000LL * outFpsD) / outFpsN;
+                        if (gTs >= outVBase100 + outSpan100) break;
+                        if (gTs + (outFrameDur100 / 2) > mappedTs) break;
+                        LONGLONG nGTs = ((outFrameIdx + 1) * 10000000LL * outFpsD) / outFpsN;
+                        LONGLONG nDur = std::max<LONGLONG>(1, nGTs - gTs);
+                        ComPtr<IMFSample> dupSmp;
+                        MFCreateSample(dupSmp.Put());
+                        if (!dupSmp) break;
+                        dupSmp->SetSampleTime(gTs);
+                        dupSmp->SetSampleDuration(nDur);
+                        bool dupOk = false;
+                        if (hasGpuPool && ctx) {
+                            const int pIdx = static_cast<int>(outFrameIdx % 16);
+                            if (needVp && vpOutTex) {
+                                ctx->CopyResource(gpuOutPool[pIdx].Get(), vpOutTex.Get());
+                                ComPtr<IMFMediaBuffer> dxBuf;
+                                if (SUCCEEDED(MFCreateDXGISurfaceBuffer(__uuidof(ID3D11Texture2D), gpuOutPool[pIdx].Get(), 0, FALSE, dxBuf.Put())) && dxBuf) {
+                                    dxBuf->SetCurrentLength((outW * outH * 3) / 2);
+                                    dupSmp->AddBuffer(dxBuf.Get());
+                                    dupOk = true;
+                                }
+                            }
+                        }
+                        if (!dupOk) {
+                            ComPtr<IMFMediaBuffer> srcBuf;
+                            if (SUCCEEDED(outSmp->ConvertToContiguousBuffer(srcBuf.Put())) && srcBuf) {
+                                BYTE* sp = nullptr; DWORD sl = 0;
+                                if (SUCCEEDED(srcBuf->Lock(&sp, nullptr, &sl)) && sl > 0) {
+                                    ComPtr<IMFMediaBuffer> cb;
+                                    if (SUCCEEDED(MFCreateMemoryBuffer(sl, cb.Put())) && cb) {
+                                        BYTE* dp = nullptr;
+                                        if (SUCCEEDED(cb->Lock(&dp, nullptr, nullptr))) {
+                                            memcpy(dp, sp, sl);
+                                            cb->Unlock();
+                                            cb->SetCurrentLength(sl);
+                                            dupSmp->AddBuffer(cb.Get());
+                                            dupOk = true;
+                                        }
+                                    }
+                                    srcBuf->Unlock();
+                                }
+                            }
+                        }
+                        if (!dupOk || FAILED(sw->WriteSample(vOutIdx, dupSmp.Get()))) break;
+                        ++outFrameIdx;
+                        ++segOutFrames;
+                        ++vWritten;
+                        ++dupCap;
+                    }
                 }
             } else {
                 int trackIdx = -1;

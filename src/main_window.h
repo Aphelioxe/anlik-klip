@@ -130,7 +130,7 @@ private:
     HBRUSH brCard_ = nullptr;
     HBRUSH brInput_ = nullptr;
 
-    int activeTab_ = 0; // 0 = Kliplerim, 1 = Ayarlar
+    int activeTab_ = 0; // 0 = Kliplerim, 1 = Montaj, 2 = Ayarlar
     int hoverBtnId_ = 0;
     int pressedBtnId_ = 0;
     int hoverCardIdx_ = -1;
@@ -201,6 +201,17 @@ private:
     bool trimBusy_ = false;
     std::atomic<bool> trimCancel_{false};
     std::thread trimThread_;
+
+    // Montage tab state
+    std::vector<std::wstring> montagePaths_;
+    int montageLibScroll_ = 0;
+    int montageQueueScroll_ = 0;
+    bool montageFade_ = true;
+    bool montageVertical916_ = false;
+    double montageSpeed_ = 1.0;
+    bool montageGameMuted_ = false;
+    bool montageMicMuted_ = false;
+    void StartMontageExport(int targetSizeMb);
 
     bool uploadBusy_ = false;
     std::atomic<bool> uploadCancel_{false};
