@@ -1,4 +1,5 @@
 #include "mp4_writer.h"
+#include "clip_trimmer.h"
 #include "com_ptr.h"
 #include "config.h"
 
@@ -253,6 +254,7 @@ bool WriteClipToMp4(const ClipSnapshot& snap, const std::wstring& finalPath, std
         return false;
     }
 
+    FixMp4AudioTrackFlags(tmpPath);
     if (!MoveFileExW(tmpPath.c_str(), finalPath.c_str(), MOVEFILE_REPLACE_EXISTING)) {
         char msg[96];
         snprintf(msg, sizeof(msg), "MoveFileExW err=%lu", GetLastError());

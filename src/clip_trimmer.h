@@ -50,6 +50,13 @@ std::wstring BuildTrimmedCopyPath(const std::wstring& srcPath);
 /** Returns a non-colliding montage output path in dir (e.g. "Montaj_2026-11-21_22-00-00.mp4"). */
 std::wstring BuildMontageOutputPath(const std::wstring& dir);
 
+/**
+ * Marks the first audio track (Mix) as enabled (tkhd flags=1, altGrp=1) and secondary
+ * audio tracks (Game/Mic) as disabled-by-default (tkhd flags=0, altGrp=1) so external
+ * players (Windows Media Player, Chrome, Discord, share links) always play Mix audio.
+ */
+bool FixMp4AudioTrackFlags(const std::wstring& mp4Path);
+
 /** Probes whether an MP4 clip contains separate Game (Track 2) and Mic (Track 3) audio streams. */
 bool ProbeClipAudioTracks(const std::wstring& path, bool& outHasSeparateGameMic, double* outDurationSec = nullptr);
 

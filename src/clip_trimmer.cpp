@@ -233,6 +233,7 @@ bool FastPassthroughTrimMp4(const std::wstring& srcPath, const std::wstring& dst
         return false;
     }
     sw.Reset();
+    FixMp4AudioTrackFlags(tmpPath);
     if (!MoveFileExW(tmpPath.c_str(), dstPath.c_str(), MOVEFILE_REPLACE_EXISTING)) {
         DeleteFileW(tmpPath.c_str());
         return false;
@@ -379,6 +380,125 @@ std::wstring BuildMontageOutputPath(const std::wstring& dir) {
         if (GetFileAttributesW(cand.c_str()) == INVALID_FILE_ATTRIBUTES) return cand;
     }
     return base + stem + L"_x.mp4";
+}
+
+bool FixMp4AudioTrackFlags(const std::wstring& mp4Path) {
+    HANDLE hF = CreateFileW(mp4Path.c_str(), GENERIC_READ | GENERIC_WRITE,
+                            FILE_SHARE_READ, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (hF == INVALID_HANDLE_VALUE) return false;
+
+    LARGE_INTEGER fileSize{};
+    if (!GetFileSizeEx(hF, &fileSize) || fileSize.QuadPart < 16) {
+        CloseHandle(hF);
+        return false;
+    }
+
+    auto be32 = [](const uint8_t* p) -> uint32_t {
+        return (uint32_t(p[0]) << 24) | (uint32_t(p[1]) << 16) | (uint32_t(p[2]) << 8) | uint32_t(p[3]);
+    };
+    auto be64 = [](const uint8_t* p) -> uint64_t {
+        return (uint64_t(p[0]) << 56) | (uint64_t(p[1]) << 48) | (uint64_t(p[2]) << 40) | (uint64_t(p[3]) << 32) |
+               (uint64_t(p[4]) << 24) | (uint64_t(p[5]) << 16) | (uint64_t(p[6]) << 8) | uint64_t(p[7]);
+    };
+
+    int64_t pos = 0;
+    int64_t moovOffset = -1;
+    uint32_t moovSize = 0;
+    while (pos + 8 <= fileSize.QuadPart) {
+        LARGE_INTEGER li{}; li.QuadPart = pos;
+        if (!SetFilePointerEx(hF, li, nullptr, FILE_BEGIN)) break;
+        uint8_t hdr[16]{};
+        DWORD rd = 0;
+        if (!ReadFile(hF, hdr, 8, &rd, nullptr) || rd < 8) break;
+        uint64_t sz = be32(hdr);
+        if (sz == 1) {
+            if (!ReadFile(hF, hdr + 8, 8, &rd, nullptr) || rd < 8) break;
+            sz = be64(hdr + 8);
+        } else if (sz == 0) {
+            sz = static_cast<uint64_t>(fileSize.QuadPart - pos);
+        }
+        if (sz < 8 || pos + static_cast<int64_t>(sz) > fileSize.QuadPart) break;
+        if (memcmp(hdr + 4, "moov", 4) == 0 && sz <= 16ULL * 1024ULL * 1024ULL) {
+            moovOffset = pos;
+            moovSize = static_cast<uint32_t>(sz);
+            break;
+        }
+        pos += static_cast<int64_t>(sz);
+    }
+
+    if (moovOffset < 0 || moovSize < 16) {
+        CloseHandle(hF);
+        return false;
+    }
+
+    std::vector<uint8_t> moov(moovSize);
+    LARGE_INTEGER li{}; li.QuadPart = moovOffset;
+    DWORD rd = 0;
+    if (!SetFilePointerEx(hF, li, nullptr, FILE_BEGIN) ||
+        !ReadFile(hF, moov.data(), moovSize, &rd, nullptr) || rd != moovSize) {
+        CloseHandle(hF);
+        return false;
+    }
+
+    int audioTrackCount = 0;
+    bool modified = false;
+    size_t mp = 8;
+    while (mp + 8 <= moov.size()) {
+        uint32_t bsz = be32(&moov[mp]);
+        if (bsz < 8 || mp + bsz > moov.size()) break;
+        if (memcmp(&moov[mp + 4], "trak", 4) == 0) {
+            size_t tkhdPos = 0, tkhdEnd = 0;
+            bool isSound = false;
+            size_t tp = mp + 8;
+            while (tp + 8 <= mp + bsz) {
+                uint32_t tsz = be32(&moov[tp]);
+                if (tsz < 8 || tp + tsz > mp + bsz) break;
+                if (memcmp(&moov[tp + 4], "tkhd", 4) == 0) {
+                    tkhdPos = tp;
+                    tkhdEnd = tp + tsz;
+                } else if (memcmp(&moov[tp + 4], "mdia", 4) == 0) {
+                    size_t mdp = tp + 8;
+                    while (mdp + 8 <= tp + tsz) {
+                        uint32_t msz = be32(&moov[mdp]);
+                        if (msz < 8 || mdp + msz > tp + tsz) break;
+                        if (memcmp(&moov[mdp + 4], "hdlr", 4) == 0 && mdp + 20 <= tp + tsz) {
+                            if (memcmp(&moov[mdp + 16], "soun", 4) == 0) isSound = true;
+                        }
+                        mdp += msz;
+                    }
+                }
+                tp += tsz;
+            }
+            if (isSound && tkhdPos > 0) {
+                uint8_t ver = moov[tkhdPos + 8];
+                size_t altOff = (ver == 0) ? (tkhdPos + 40) : (tkhdPos + 52);
+                if (altOff + 2 <= tkhdEnd) {
+                    uint8_t wantFlag = (audioTrackCount == 0) ? 0x01 : 0x00;
+                    if (moov[tkhdPos + 9] != 0 || moov[tkhdPos + 10] != 0 || moov[tkhdPos + 11] != wantFlag) {
+                        moov[tkhdPos + 9] = 0;
+                        moov[tkhdPos + 10] = 0;
+                        moov[tkhdPos + 11] = wantFlag;
+                        modified = true;
+                    }
+                    if (moov[altOff] != 0 || moov[altOff + 1] != 1) {
+                        moov[altOff] = 0;
+                        moov[altOff + 1] = 1;
+                        modified = true;
+                    }
+                }
+                ++audioTrackCount;
+            }
+        }
+        mp += bsz;
+    }
+
+    if (modified && audioTrackCount > 1) {
+        DWORD wr = 0;
+        SetFilePointerEx(hF, li, nullptr, FILE_BEGIN);
+        WriteFile(hF, moov.data(), moovSize, &wr, nullptr);
+    }
+    CloseHandle(hF);
+    return true;
 }
 
 bool ProbeClipAudioTracks(const std::wstring& path, bool& outHasSeparateGameMic, double* outDurationSec) {
@@ -1240,6 +1360,7 @@ bool EditMp4Clip(const ClipEditSpec& spec, std::string& outError,
         return false;
     }
 
+    FixMp4AudioTrackFlags(tmpPath);
     if (!MoveFileExW(tmpPath.c_str(), spec.dstPath.c_str(), MOVEFILE_REPLACE_EXISTING)) {
         DeleteFileW(tmpPath.c_str());
         outError = "Düzenlenen dosya hedef konuma kaydedilemedi.";

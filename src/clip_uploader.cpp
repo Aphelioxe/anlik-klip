@@ -1,4 +1,5 @@
 #include "clip_uploader.h"
+#include "clip_trimmer.h"
 
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
@@ -240,6 +241,25 @@ ClipUploadResult UploadClipToShareLink(
         return res;
     }
 
+    std::wstring uploadPath = filePath;
+    std::wstring tempFixed;
+    {
+        bool hasMulti = false;
+        if (ProbeClipAudioTracks(filePath, hasMulti, nullptr) && hasMulti) {
+            tempFixed = filePath + L".upload.tmp.mp4";
+            if (CopyFileW(filePath.c_str(), tempFixed.c_str(), FALSE)) {
+                FixMp4AudioTrackFlags(tempFixed);
+                uploadPath = tempFixed;
+            } else {
+                tempFixed.clear();
+            }
+        }
+    }
+    struct TempGuard {
+        std::wstring& p;
+        ~TempGuard() { if (!p.empty()) DeleteFileW(p.c_str()); }
+    } tempGuard{ tempFixed };
+
     // 1) Primary for <= 195 MB: Catbox.moe (gives direct .mp4 URL that plays in browser & embeds in Discord)
     if (fileSize <= 195ULL * 1024ULL * 1024ULL) {
         std::string catPrefix = "------AnlikKlipBoundary7F9A2C\r\n"
@@ -249,7 +269,7 @@ ClipUploadResult UploadClipToShareLink(
         std::string body;
         std::wstring err;
         if (MultipartUploadFile(L"catbox.moe", L"/user/api.php", catPrefix, "fileToUpload",
-                filePath, fileSize, onProgress, cancelFlag, status, body, err)) {
+                uploadPath, fileSize, onProgress, cancelFlag, status, body, err)) {
             std::string url = TrimAscii(body);
             if (status == 200 && url.rfind("https://", 0) == 0) {
                 res.ok = true;
@@ -268,7 +288,7 @@ ClipUploadResult UploadClipToShareLink(
     std::string body;
     std::wstring err;
     if (MultipartUploadFile(L"upload.gofile.io", L"/uploadfile", "", "file",
-            filePath, fileSize, onProgress, cancelFlag, status, body, err)) {
+            uploadPath, fileSize, onProgress, cancelFlag, status, body, err)) {
         std::string dlPage = ExtractJsonStringField(body, "downloadPage");
         if (status == 200 && !dlPage.empty()) {
             res.ok = true;
