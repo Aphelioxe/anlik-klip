@@ -388,7 +388,6 @@ bool EditMp4Clip(const ClipEditSpec& spec, std::string& outError,
         wAttr->SetUINT32(MF_READWRITE_ENABLE_HARDWARE_TRANSFORMS, TRUE);
         wAttr->SetUnknown(MF_SINK_WRITER_D3D_MANAGER, dm.Get());
     }
-    if (wAttr) wAttr->SetUINT32(MF_SINK_WRITER_DISABLE_THROTTLING, TRUE);
 
     ComPtr<IMFSinkWriter> sw;
     HRESULT hr = MFCreateSinkWriterFromURL(tmpPath.c_str(), nullptr, wAttr.Get(), sw.Put());
