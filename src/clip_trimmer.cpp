@@ -602,6 +602,8 @@ bool EditMp4Clip(const ClipEditSpec& spec, std::string& outError,
     }
 
     ComPtr<ID3D11Texture2D> stgTex;
+    ComPtr<ID3D11Texture2D> gpuOutPool[4];
+    bool hasGpuPool = false;
     ComPtr<ID3D11VideoDevice> vdev;
     ComPtr<ID3D11VideoContext> vctx;
     ComPtr<ID3D11VideoProcessorEnumerator> vpEnum;
@@ -621,6 +623,25 @@ bool EditMp4Clip(const ClipEditSpec& spec, std::string& outError,
         sd.Usage = D3D11_USAGE_STAGING;
         sd.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
         dev->CreateTexture2D(&sd, nullptr, stgTex.Put());
+
+        if (dm && ctx) {
+            D3D11_TEXTURE2D_DESC gd{};
+            gd.Width = outW;
+            gd.Height = outH;
+            gd.MipLevels = 1;
+            gd.ArraySize = 1;
+            gd.Format = DXGI_FORMAT_NV12;
+            gd.SampleDesc.Count = 1;
+            gd.Usage = D3D11_USAGE_DEFAULT;
+            gd.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
+            hasGpuPool = true;
+            for (int pi = 0; pi < 4; ++pi) {
+                if (FAILED(dev->CreateTexture2D(&gd, nullptr, gpuOutPool[pi].Put()))) {
+                    hasGpuPool = false;
+                    break;
+                }
+            }
+        }
 
         if (needVp && SUCCEEDED(dev->QueryInterface(__uuidof(ID3D11VideoDevice), vdev.PutVoid())) &&
             ctx && SUCCEEDED(ctx->QueryInterface(__uuidof(ID3D11VideoContext), vctx.PutVoid()))) {
@@ -829,31 +850,65 @@ bool EditMp4Clip(const ClipEditSpec& spec, std::string& outError,
                             vctx->VideoProcessorBlt(vp.Get(), vpOutView.Get(), 0, 1, &st);
                         }
 
-                        ctx->CopyResource(stgTex.Get(), vpOutTex.Get());
-                        D3D11_MAPPED_SUBRESOURCE mapped{};
-                        if (SUCCEEDED(ctx->Map(stgTex.Get(), 0, D3D11_MAP_READ, 0, &mapped))) {
-                            const DWORD nvLen = (outW * outH * 3) / 2;
-                            ComPtr<IMFMediaBuffer> ob;
-                            if (SUCCEEDED(MFCreateMemoryBuffer(nvLen, ob.Put())) && ob) {
-                                BYTE* dst = nullptr;
-                                if (SUCCEEDED(ob->Lock(&dst, nullptr, nullptr))) {
-                                    const BYTE* srcY = reinterpret_cast<const BYTE*>(mapped.pData);
-                                    for (uint32_t y = 0; y < outH; ++y) memcpy(dst + y * outW, srcY + y * mapped.RowPitch, outW);
-                                    const BYTE* srcUV = srcY + outH * mapped.RowPitch;
-                                    BYTE* dstUV = dst + outW * outH;
-                                    for (uint32_t y = 0; y < outH / 2; ++y) memcpy(dstUV + y * outW, srcUV + y * mapped.RowPitch, outW);
-                                    ob->Unlock();
-                                    ob->SetCurrentLength(nvLen);
-                                    outSmp->AddBuffer(ob.Get());
-                                    copied = true;
-                                }
+                        bool dxgiAttached = false;
+                        if (hasGpuPool) {
+                            const int pIdx = static_cast<int>(outFrameIdx % 4);
+                            ctx->CopyResource(gpuOutPool[pIdx].Get(), vpOutTex.Get());
+                            ComPtr<IMFMediaBuffer> dxBuf;
+                            if (SUCCEEDED(MFCreateDXGISurfaceBuffer(__uuidof(ID3D11Texture2D), gpuOutPool[pIdx].Get(), 0, FALSE, dxBuf.Put())) && dxBuf) {
+                                outSmp->AddBuffer(dxBuf.Get());
+                                dxgiAttached = true;
+                                copied = true;
                             }
-                            ctx->Unmap(stgTex.Get(), 0);
+                        }
+                        if (!dxgiAttached) {
+                            ctx->CopyResource(stgTex.Get(), vpOutTex.Get());
+                            D3D11_MAPPED_SUBRESOURCE mapped{};
+                            if (SUCCEEDED(ctx->Map(stgTex.Get(), 0, D3D11_MAP_READ, 0, &mapped))) {
+                                const DWORD nvLen = (outW * outH * 3) / 2;
+                                ComPtr<IMFMediaBuffer> ob;
+                                if (SUCCEEDED(MFCreateMemoryBuffer(nvLen, ob.Put())) && ob) {
+                                    BYTE* dst = nullptr;
+                                    if (SUCCEEDED(ob->Lock(&dst, nullptr, nullptr))) {
+                                        const BYTE* srcY = reinterpret_cast<const BYTE*>(mapped.pData);
+                                        for (uint32_t y = 0; y < outH; ++y) memcpy(dst + y * outW, srcY + y * mapped.RowPitch, outW);
+                                        const BYTE* srcUV = srcY + outH * mapped.RowPitch;
+                                        BYTE* dstUV = dst + outW * outH;
+                                        for (uint32_t y = 0; y < outH / 2; ++y) memcpy(dstUV + y * outW, srcUV + y * mapped.RowPitch, outW);
+                                        ob->Unlock();
+                                        ob->SetCurrentLength(nvLen);
+                                        outSmp->AddBuffer(ob.Get());
+                                        copied = true;
+                                    }
+                                }
+                                ctx->Unmap(stgTex.Get(), 0);
+                            }
                         }
                     }
                 }
                 if (!copied && !needVp) {
-                    copied = CopyVideoSampleBuffer(ctx.Get(), stgTex.Get(), smp.Get(), outW, outH, outSmp.Get());
+                    if (hasGpuPool && ctx) {
+                        ComPtr<IMFMediaBuffer> buf;
+                        ComPtr<IMFDXGIBuffer> db;
+                        ComPtr<ID3D11Texture2D> dtex;
+                        UINT sub = 0;
+                        if (SUCCEEDED(smp->GetBufferByIndex(0, buf.Put())) && buf &&
+                            SUCCEEDED(buf->QueryInterface(__uuidof(IMFDXGIBuffer), db.PutVoid())) &&
+                            SUCCEEDED(db->GetResource(__uuidof(ID3D11Texture2D), dtex.PutVoid()))) {
+                            db->GetSubresourceIndex(&sub);
+                            const int pIdx = static_cast<int>(outFrameIdx % 4);
+                            D3D11_BOX box{ 0, 0, 0, outW, outH, 1 };
+                            ctx->CopySubresourceRegion(gpuOutPool[pIdx].Get(), 0, 0, 0, 0, dtex.Get(), sub, &box);
+                            ComPtr<IMFMediaBuffer> dxBuf;
+                            if (SUCCEEDED(MFCreateDXGISurfaceBuffer(__uuidof(ID3D11Texture2D), gpuOutPool[pIdx].Get(), 0, FALSE, dxBuf.Put())) && dxBuf) {
+                                outSmp->AddBuffer(dxBuf.Get());
+                                copied = true;
+                            }
+                        }
+                    }
+                    if (!copied) {
+                        copied = CopyVideoSampleBuffer(ctx.Get(), stgTex.Get(), smp.Get(), outW, outH, outSmp.Get());
+                    }
                 }
                 if (!copied) continue;
                 if (SUCCEEDED(sw->WriteSample(vOutIdx, outSmp.Get()))) {
