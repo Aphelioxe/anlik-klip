@@ -131,6 +131,7 @@ bool FastPassthroughTrimMp4(const std::wstring& srcPath, const std::wstring& dst
                 DeleteFileW(tmpPath.c_str());
                 return false;
             }
+            sr->SetStreamSelection(si, TRUE);
             outMap[si] = outIdx;
             isStreamDone[si] = false;
             if (maj == MFMediaType_Video && vIn == DWORD(-1)) vIn = si;
@@ -182,7 +183,10 @@ bool FastPassthroughTrimMp4(const std::wstring& srcPath, const std::wstring& dst
             break;
         }
         if (flags & MF_SOURCE_READERF_ENDOFSTREAM) {
-            if (si < streamCount) isStreamDone[si] = true;
+            if (si < streamCount) {
+                isStreamDone[si] = true;
+                sr->SetStreamSelection(si, FALSE);
+            }
             continue;
         }
         if (!smp || si >= streamCount || outMap[si] == DWORD(-1)) continue;
@@ -191,6 +195,19 @@ bool FastPassthroughTrimMp4(const std::wstring& srcPath, const std::wstring& dst
             if (si != vIn) continue;
             UINT32 cp = 0;
             smp->GetUINT32(MFSampleExtension_CleanPoint, &cp);
+            if (!cp) {
+                ComPtr<IMFMediaBuffer> kb;
+                if (SUCCEEDED(smp->ConvertToContiguousBuffer(kb.Put())) && kb) {
+                    BYTE* p = nullptr; DWORD bl = 0;
+                    if (SUCCEEDED(kb->Lock(&p, nullptr, &bl))) {
+                        for (DWORD k = 0; k + 4 < bl && k < 256; ++k) {
+                            if (p[k] == 0 && p[k + 1] == 0 && p[k + 2] == 1 && ((p[k + 3] & 0x1F) == 5)) { cp = 1; break; }
+                            if (k + 5 < bl && p[k] == 0 && p[k + 1] == 0 && p[k + 2] == 0 && p[k + 3] == 1 && ((p[k + 4] & 0x1F) == 5)) { cp = 1; break; }
+                        }
+                        kb->Unlock();
+                    }
+                }
+            }
             if (!cp || ts < keyThresh100) continue;
             gotFirstKey = true;
             basePts = ts;
@@ -198,6 +215,7 @@ bool FastPassthroughTrimMp4(const std::wstring& srcPath, const std::wstring& dst
 
         if (ts > end100) {
             isStreamDone[si] = true;
+            sr->SetStreamSelection(si, FALSE);
             continue;
         }
         if (ts < basePts) continue;
