@@ -221,6 +221,7 @@ bool FastPassthroughTrimMp4(const std::wstring& srcPath, const std::wstring& dst
         if (ts < basePts) continue;
 
         smp->SetSampleTime(ts - basePts);
+        smp->DeleteItem(MFSampleExtension_DecodeTimestamp);
         if (SUCCEEDED(sw->WriteSample(outMap[si], smp.Get())) && si == vIn) {
             ++vWritten;
         }
@@ -541,7 +542,27 @@ bool EditMp4Clip(const ClipEditSpec& spec, std::string& outError,
         }
         outBr = vBps;
     }
-    const bool needVp = (outW != srcW || outH != srcH || spec.vertical916);
+    UINT32 vpInW = srcW, vpInH = srcH;
+    if (hasInsert) {
+        ComPtr<IMFSourceReader> insProbe;
+        if (SUCCEEDED(MFCreateSourceReaderFromURL(spec.insertClipPath.c_str(), nullptr, insProbe.Put())) && insProbe) {
+            for (DWORD si = 0; si < 8; ++si) {
+                ComPtr<IMFMediaType> mt;
+                if (FAILED(insProbe->GetNativeMediaType(si, 0, mt.Put())) || !mt) break;
+                GUID maj{};
+                mt->GetGUID(MF_MT_MAJOR_TYPE, &maj);
+                if (maj == MFMediaType_Video) {
+                    UINT32 iw = 0, ih = 0;
+                    if (SUCCEEDED(MFGetAttributeSize(mt.Get(), MF_MT_FRAME_SIZE, &iw, &ih))) {
+                        vpInW = std::max(vpInW, iw);
+                        vpInH = std::max(vpInH, ih);
+                    }
+                    break;
+                }
+            }
+        }
+    }
+    const bool needVp = (outW != srcW || outH != srcH || spec.vertical916 || hasInsert);
     const LONGLONG outFrameDur100 = (10000000LL * outFpsD) / std::max<uint32_t>(1u, outFpsN);
 
     std::wstring tmpPath = spec.dstPath + L".tmp.mp4";
@@ -549,9 +570,12 @@ bool EditMp4Clip(const ClipEditSpec& spec, std::string& outError,
 
     ComPtr<IMFAttributes> wAttr;
     MFCreateAttributes(wAttr.Put(), 4);
-    if (dm && wAttr) {
-        wAttr->SetUINT32(MF_READWRITE_ENABLE_HARDWARE_TRANSFORMS, TRUE);
-        wAttr->SetUnknown(MF_SINK_WRITER_D3D_MANAGER, dm.Get());
+    if (wAttr) {
+        wAttr->SetUINT32(MF_SINK_WRITER_DISABLE_THROTTLING, TRUE);
+        if (dm) {
+            wAttr->SetUINT32(MF_READWRITE_ENABLE_HARDWARE_TRANSFORMS, TRUE);
+            wAttr->SetUnknown(MF_SINK_WRITER_D3D_MANAGER, dm.Get());
+        }
     }
 
     ComPtr<IMFSinkWriter> sw;
@@ -675,14 +699,14 @@ bool EditMp4Clip(const ClipEditSpec& spec, std::string& outError,
             ctx && SUCCEEDED(ctx->QueryInterface(__uuidof(ID3D11VideoContext), vctx.PutVoid()))) {
             D3D11_VIDEO_PROCESSOR_CONTENT_DESC cd{};
             cd.InputFrameFormat = D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE;
-            cd.InputWidth = srcW; cd.InputHeight = srcH;
+            cd.InputWidth = vpInW; cd.InputHeight = vpInH;
             cd.OutputWidth = outW; cd.OutputHeight = outH;
             cd.Usage = D3D11_VIDEO_USAGE_PLAYBACK_NORMAL;
             if (SUCCEEDED(vdev->CreateVideoProcessorEnumerator(&cd, vpEnum.Put())) && vpEnum) {
                 vdev->CreateVideoProcessor(vpEnum.Get(), 0, vp.Put());
             }
             D3D11_TEXTURE2D_DESC td{};
-            td.Width = srcW; td.Height = srcH; td.MipLevels = 1; td.ArraySize = 1;
+            td.Width = vpInW; td.Height = vpInH; td.MipLevels = 1; td.ArraySize = 1;
             td.Format = DXGI_FORMAT_NV12; td.SampleDesc.Count = 1;
             td.Usage = D3D11_USAGE_DEFAULT; td.BindFlags = D3D11_BIND_DECODER;
             dev->CreateTexture2D(&td, nullptr, vpInTex.Put());
@@ -789,6 +813,7 @@ bool EditMp4Clip(const ClipEditSpec& spec, std::string& outError,
         std::vector<int16_t> segPcm[3];
         const size_t targetOutPairs = static_cast<size_t>((outSpan100 * 48000LL) / 10000000LL);
         size_t segOutFlushed = 0;
+        int64_t segOutFrames = 0;
 
         while ((!vDone || !aDone[0] || !aDone[1] || !aDone[2]) && !aborted) {
             if (cancelFlag && cancelFlag->load()) { aborted = true; break; }
@@ -855,17 +880,19 @@ bool EditMp4Clip(const ClipEditSpec& spec, std::string& outError,
                         db->GetSubresourceIndex(&sub);
                         D3D11_TEXTURE2D_DESC dDesc{};
                         dtex->GetDesc(&dDesc);
-                        UINT copyW = std::min(srcW, dDesc.Width);
-                        UINT copyH = std::min(srcH, dDesc.Height);
+                        UINT copyW = std::min(vpInW, dDesc.Width) & ~1U;
+                        UINT copyH = std::min(vpInH, dDesc.Height) & ~1U;
                         D3D11_BOX box{ 0, 0, 0, copyW, copyH, 1 };
                         ctx->CopySubresourceRegion(vpInTex.Get(), 0, 0, 0, 0, dtex.Get(), sub, &box);
 
                         if (spec.vertical916) {
-                            LONG cropW = std::max<LONG>(16, (static_cast<LONG>(copyH) * static_cast<LONG>(outW)) / static_cast<LONG>(outH)) & ~1L;
+                            LONG cropW = std::min<LONG>(static_cast<LONG>(copyW),
+                                std::max<LONG>(16, (static_cast<LONG>(copyH) * static_cast<LONG>(outW)) / static_cast<LONG>(outH))) & ~1L;
                             LONG cropX = std::max<LONG>(0, (static_cast<LONG>(copyW) - cropW) / 2) & ~1L;
                             RECT bgSrc{ cropX, 0, cropX + cropW, static_cast<LONG>(copyH) };
                             RECT dstFull{ 0, 0, static_cast<LONG>(outW), static_cast<LONG>(outH) };
-                            LONG fgH = ((static_cast<LONG>(outW) * static_cast<LONG>(copyH)) / static_cast<LONG>(copyW)) & ~1L;
+                            LONG fgH = std::min<LONG>(static_cast<LONG>(outH),
+                                (static_cast<LONG>(outW) * static_cast<LONG>(copyH)) / std::max<LONG>(2, static_cast<LONG>(copyW))) & ~1L;
                             LONG fgY = std::max<LONG>(0, (static_cast<LONG>(outH) - fgH) / 2) & ~1L;
                             RECT fgSrc{ 0, 0, static_cast<LONG>(copyW), static_cast<LONG>(copyH) };
                             RECT fgDst{ 0, fgY, static_cast<LONG>(outW), fgY + fgH };
@@ -881,9 +908,25 @@ bool EditMp4Clip(const ClipEditSpec& spec, std::string& outError,
                             vctx->VideoProcessorBlt(vp.Get(), vpOutView.Get(), 0, 2, streams);
                         } else {
                             RECT srcFull{ 0, 0, static_cast<LONG>(copyW), static_cast<LONG>(copyH) };
-                            RECT dstFull{ 0, 0, static_cast<LONG>(outW), static_cast<LONG>(outH) };
+                            RECT dstRect{ 0, 0, static_cast<LONG>(outW), static_cast<LONG>(outH) };
+                            if (static_cast<uint64_t>(copyW) * outH != static_cast<uint64_t>(copyH) * outW) {
+                                D3D11_VIDEO_COLOR bgCol{};
+                                bgCol.RGBA = { 0.0f, 0.0f, 0.0f, 1.0f };
+                                vctx->VideoProcessorSetOutputBackgroundColor(vp.Get(), FALSE, &bgCol);
+                                double srcAr = static_cast<double>(copyW) / std::max(1.0, static_cast<double>(copyH));
+                                double dstAr = static_cast<double>(outW) / std::max(1.0, static_cast<double>(outH));
+                                if (srcAr < dstAr) {
+                                    LONG fitW = std::min<LONG>(static_cast<LONG>(outW), static_cast<LONG>(std::lround(outH * srcAr))) & ~1L;
+                                    LONG fitX = ((static_cast<LONG>(outW) - fitW) / 2) & ~1L;
+                                    dstRect = { fitX, 0, fitX + fitW, static_cast<LONG>(outH) };
+                                } else {
+                                    LONG fitH = std::min<LONG>(static_cast<LONG>(outH), static_cast<LONG>(std::lround(outW / srcAr))) & ~1L;
+                                    LONG fitY = ((static_cast<LONG>(outH) - fitH) / 2) & ~1L;
+                                    dstRect = { 0, fitY, static_cast<LONG>(outW), fitY + fitH };
+                                }
+                            }
                             vctx->VideoProcessorSetStreamSourceRect(vp.Get(), 0, TRUE, &srcFull);
-                            vctx->VideoProcessorSetStreamDestRect(vp.Get(), 0, TRUE, &dstFull);
+                            vctx->VideoProcessorSetStreamDestRect(vp.Get(), 0, TRUE, &dstRect);
                             D3D11_VIDEO_PROCESSOR_STREAM st{};
                             st.Enable = TRUE; st.pInputSurface = vpInView.Get();
                             vctx->VideoProcessorBlt(vp.Get(), vpOutView.Get(), 0, 1, &st);
@@ -956,6 +999,7 @@ bool EditMp4Clip(const ClipEditSpec& spec, std::string& outError,
                 if (!copied) continue;
                 if (SUCCEEDED(sw->WriteSample(vOutIdx, outSmp.Get()))) {
                     ++outFrameIdx;
+                    ++segOutFrames;
                     ++vWritten;
                 }
             } else {
@@ -983,6 +1027,7 @@ bool EditMp4Clip(const ClipEditSpec& spec, std::string& outError,
                             }
                             if ((segPcm[trackIdx].size() / 2) >= segMaxPairs) {
                                 aDone[trackIdx] = true;
+                                sr->SetStreamSelection(streamIdx, FALSE);
                             }
                             abuf->Unlock();
                         }
@@ -1031,8 +1076,13 @@ bool EditMp4Clip(const ClipEditSpec& spec, std::string& outError,
 
         if (aborted) break;
 
-        if (hasOutMix && segOutFlushed < targetOutPairs) {
-            const size_t remOutPairs = targetOutPairs - segOutFlushed;
+        const LONGLONG actualOutSpan100 = (segOutFrames > 0)
+            ? std::min(outSpan100, segOutFrames * outFrameDur100)
+            : outSpan100;
+        const size_t actualTargetOutPairs = static_cast<size_t>((actualOutSpan100 * 48000LL) / 10000000LL);
+
+        if (hasOutMix && segOutFlushed < actualTargetOutPairs) {
+            const size_t remOutPairs = actualTargetOutPairs - segOutFlushed;
             if (segHasGameMic) {
                 std::vector<int16_t> gRes, mRes;
                 AppendResampledPcm(segPcm[1], speed, gameGain, remOutPairs, gRes);
@@ -1054,7 +1104,7 @@ bool EditMp4Clip(const ClipEditSpec& spec, std::string& outError,
             if (hasOutMic)  FlushPcmChunks(sw.Get(), aOutMic, outMicAccum, micWrittenPairs, false);
         }
 
-        outVBase100 += outSpan100;
+        outVBase100 += actualOutSpan100;
     }
 
     if (aborted || vWritten == 0) {
