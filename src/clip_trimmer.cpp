@@ -635,15 +635,10 @@ bool EditMp4Clip(const ClipEditSpec& spec, std::string& outError,
             v.ulVal = std::max<uint32_t>(1u, outFpsN / outFpsD);
             encCodec->SetValue(&CODECAPI_AVEncMPVGOPSize, &v);
 
-            // Disable B-frame reordering & enable low-latency so hardware encoder never holds/overwrites queued DXGI frames
+            // Disable B-frame reordering so hardware encoder never holds/overwrites queued DXGI frames
+            // (Avoid AVEncCommonLowLatency=TRUE which can distort VUI/HRD timing in Chromium/Discord)
             v.ulVal = 0;
             encCodec->SetValue(&CODECAPI_AVEncMPVDefaultBPictureCount, &v);
-
-            VARIANT vb;
-            VariantInit(&vb);
-            vb.vt = VT_BOOL;
-            vb.boolVal = VARIANT_TRUE;
-            encCodec->SetValue(&CODECAPI_AVEncCommonLowLatency, &vb);
         }
     }
 
