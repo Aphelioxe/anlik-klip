@@ -135,7 +135,7 @@ bool FastPassthroughTrimMp4(const std::wstring& srcPath, const std::wstring& dst
             outMap[si] = outIdx;
             isStreamDone[si] = false;
             if (maj == MFMediaType_Video && vIn == DWORD(-1)) vIn = si;
-            streamCount = si + 1;
+            streamCount = std::max(streamCount, si + 1);
         }
     }
     if (vIn == DWORD(-1) || streamCount == 0) {
