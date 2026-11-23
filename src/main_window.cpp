@@ -3374,6 +3374,10 @@ LRESULT MainWindow::OnMessage(UINT msg, WPARAM wParam, LPARAM lParam) {
                     } else {
                         if (activeTab_ == 1) {
                             if (studioOpen_) CloseStudio();
+                            studioClips_.clear();
+                            studioMusic_.clear();
+                            studioSelClip_ = -1;
+                            studioSelMusic_ = -1;
                             montagePaths_.clear();
                             SwitchTab(0);
                         }
@@ -4346,6 +4350,17 @@ LRESULT MainWindow::OnMessage(UINT msg, WPARAM wParam, LPARAM lParam) {
             }
             return 0;
         }
+
+        case WM_CAPTURECHANGED:
+            studioDragMode_ = 0;
+            pressedBtnId_ = 0;
+            draggingSeek_ = false;
+            draggingVol_ = false;
+            draggingTrim_ = 0;
+            draggingEditGameVol_ = false;
+            draggingEditMicVol_ = false;
+            if (hwnd_) InvalidateRect(hwnd_, nullptr, FALSE);
+            return 0;
 
         case WM_CLOSE:
             captureHotkeyMode_ = 0;

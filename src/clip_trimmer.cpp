@@ -108,6 +108,7 @@ bool FastPassthroughTrimMp4(const std::wstring& srcPath, const std::wstring& dst
     }
 
     DWORD vIn = DWORD(-1);
+    bool addedA = false;
     std::vector<DWORD> outMap(16, DWORD(-1));
     std::vector<bool> isStreamDone(16, true);
     DWORD streamCount = 0;
@@ -117,7 +118,9 @@ bool FastPassthroughTrimMp4(const std::wstring& srcPath, const std::wstring& dst
         if (FAILED(sr->GetNativeMediaType(si, 0, mt.Put())) || !mt) break;
         GUID maj{};
         mt->GetGUID(MF_MT_MAJOR_TYPE, &maj);
-        if (maj == MFMediaType_Video || maj == MFMediaType_Audio) {
+        const bool takeVideo = (maj == MFMediaType_Video && vIn == DWORD(-1));
+        const bool takeAudio = (maj == MFMediaType_Audio && !addedA); // Stream 0 is Mix; avoids reversed Game/Mic tracks becoming track 0
+        if (takeVideo || takeAudio) {
             DWORD outIdx = 0;
             if (FAILED(sw->AddStream(mt.Get(), &outIdx)) ||
                 FAILED(sw->SetInputMediaType(outIdx, mt.Get(), nullptr))) {
@@ -128,7 +131,8 @@ bool FastPassthroughTrimMp4(const std::wstring& srcPath, const std::wstring& dst
             sr->SetStreamSelection(si, TRUE);
             outMap[si] = outIdx;
             isStreamDone[si] = false;
-            if (maj == MFMediaType_Video && vIn == DWORD(-1)) vIn = si;
+            if (takeVideo) vIn = si;
+            if (takeAudio) addedA = true;
             streamCount = std::max(streamCount, si + 1);
         }
     }
@@ -1063,10 +1067,12 @@ bool EditMp4Clip(const ClipEditSpec& spec, std::string& outError,
         return false;
     }
 
+    // Always emit a single clean Mix AAC stream on re-encoded outputs so Discord, browsers, and WMP play full audio reliably
     DWORD aOutMix = 0, aOutGame = 0, aOutMic = 0;
     bool hasOutMix = anyAudio && AddAacOutputStream(sw.Get(), aOutMix);
-    bool hasOutGame = !isDiscordExport && !isMontage && decodedMusic.empty() && hasOutMix && foundA && srcMultiTrack && AddAacOutputStream(sw.Get(), aOutGame);
-    bool hasOutMic = !isDiscordExport && !isMontage && decodedMusic.empty() && hasOutGame && AddAacOutputStream(sw.Get(), aOutMic);
+    bool hasOutGame = false;
+    bool hasOutMic = false;
+    (void)srcMultiTrack;
 
     {
         ComPtr<ICodecAPI> encCodec;
@@ -1602,13 +1608,12 @@ bool EditMp4Clip(const ClipEditSpec& spec, std::string& outError,
 
         if (aborted) break;
 
-        const LONGLONG actualOutSpan100 = (segOutFrames > 0)
-            ? std::min(outSpan100, segOutFrames * outFrameDur100)
-            : outSpan100;
-        const size_t actualTargetOutPairs = static_cast<size_t>((actualOutSpan100 * 48000LL) / 10000000LL);
+        const LONGLONG newOutVBase100 = (outFrameIdx * 10000000LL * outFpsD) / outFpsN;
+        const size_t totalTargetPairsAtSegEnd = static_cast<size_t>((newOutVBase100 * 48000LL) / 10000000LL);
+        const size_t curCumMixPairs = static_cast<size_t>(mixWrittenPairs) + (outMixAccum.size() / 2);
 
-        if (hasOutMix && segOutFlushed < actualTargetOutPairs) {
-            const size_t remOutPairs = actualTargetOutPairs - segOutFlushed;
+        if (hasOutMix && curCumMixPairs < totalTargetPairsAtSegEnd) {
+            const size_t remOutPairs = totalTargetPairsAtSegEnd - curCumMixPairs;
             if (segHasGameMic) {
                 std::vector<int16_t> gRes, mRes;
                 AppendResampledPcm(segPcm[1], seg.speed, seg.gameGain, remOutPairs, gRes);
@@ -1630,7 +1635,7 @@ bool EditMp4Clip(const ClipEditSpec& spec, std::string& outError,
             if (hasOutMic)  FlushPcmChunks(sw.Get(), aOutMic, outMicAccum, micWrittenPairs, false);
         }
 
-        outVBase100 += actualOutSpan100;
+        outVBase100 = newOutVBase100;
     }
 
     if (aborted || vWritten == 0) {

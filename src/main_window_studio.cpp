@@ -275,7 +275,7 @@ bool MainWindow::MapTimelineToClip(double tlSec, int& outIdx, double& outLocalSe
     for (size_t i = 0; i < studioClips_.size(); ++i) {
         const auto& c = studioClips_[i];
         double outDur = std::max(0.1, c.trimEndSec - c.trimStartSec) / std::max(0.5, c.speed);
-        if (tlSec <= acc + outDur || i + 1 == studioClips_.size()) {
+        if (tlSec < acc + outDur - 1e-6 || i + 1 == studioClips_.size()) {
             double relOut = std::max(0.0, std::min(outDur, tlSec - acc));
             outIdx = static_cast<int>(i);
             outClipStartSec = acc;
@@ -535,6 +535,7 @@ void MainWindow::SyncStudioMediaState(bool forceSeekVideo) {
             pos.hVal.QuadPart = static_cast<LONGLONG>(localSec * 1e7);
             studioPlayer_->SetPosition(MFP_POSITIONTYPE_100NS, &pos);
             PropVariantClear(&pos);
+            studioIgnoreEndUntilMs_ = GetTickCount64() + 180;
         }
         if (studioPlaying_) studioPlayer_->Play();
         else studioPlayer_->Pause();
@@ -593,10 +594,11 @@ void MainWindow::SyncStudioMediaState(bool forceSeekVideo) {
 
 void MainWindow::UpdateStudioMetrics() {
     if (!studioOpen_ || trimBusy_ || !studioPlaying_) return;
-    if (studioClips_.empty() || !studioPlayer_ || !studioVideoReady_) {
+    if (studioClips_.empty()) {
         studioPlaying_ = false;
         return;
     }
+    if (!studioPlayer_ || !studioVideoReady_) return;
 
     int curIdx = studioLoadedClipIdx_;
     if (curIdx < 0 || curIdx >= static_cast<int>(studioClips_.size())) {
@@ -619,7 +621,7 @@ void MainWindow::UpdateStudioMetrics() {
         clipStartOut += std::max(0.1, c.trimEndSec - c.trimStartSec) / std::max(0.5, c.speed);
     }
 
-    if (localPos >= clip.trimEndSec - 0.04) {
+    if (GetTickCount64() >= studioIgnoreEndUntilMs_ && localPos >= clip.trimEndSec - 0.04) {
         double nextTl = clipStartOut + std::max(0.1, clip.trimEndSec - clip.trimStartSec) / std::max(0.5, clip.speed);
         if (curIdx + 1 < static_cast<int>(studioClips_.size())) {
             studioPlayheadSec_ = nextTl;
@@ -631,7 +633,7 @@ void MainWindow::UpdateStudioMetrics() {
             if (studioMusicPlayer_) studioMusicPlayer_->Pause();
         }
     } else {
-        double relLocal = std::max(0.0, localPos - clip.trimStartSec);
+        double relLocal = std::max(0.0, std::min(clip.trimEndSec - clip.trimStartSec, localPos - clip.trimStartSec));
         studioPlayheadSec_ = clipStartOut + relLocal / std::max(0.5, clip.speed);
         SyncStudioMediaState(false);
     }
@@ -669,6 +671,13 @@ void MainWindow::StudioAddClipFromLibrary(size_t rawClipIdx) {
     item.speed = 1.0;
     item.gameVolPct = 100;
     item.micVolPct = 100;
+    for (const auto& existing : studioClips_) {
+        if (existing.waveLoaded && _wcsicmp(existing.path.c_str(), src.filePath.c_str()) == 0) {
+            item.waveLoaded = true;
+            item.wavePeaks = existing.wavePeaks;
+            break;
+        }
+    }
 
     studioClips_.push_back(std::move(item));
     studioSelClip_ = static_cast<int>(studioClips_.size()) - 1;
@@ -945,6 +954,7 @@ bool MainWindow::HandleStudioAppMessage(UINT msg, WPARAM /*wParam*/, LPARAM lPar
                             studioPlayer_->SetPosition(MFP_POSITIONTYPE_100NS, &sp);
                             PropVariantClear(&sp);
                             studioPendingSeekSec_ = -1.0;
+                            studioIgnoreEndUntilMs_ = GetTickCount64() + 180;
                         }
                         studioPlayer_->UpdateVideo();
                         if (studioPlaying_) studioPlayer_->Play();
@@ -1852,7 +1862,7 @@ bool MainWindow::OnStudioLButtonDown(int mx, int my) {
             return true;
         }
 
-        // Check V1 & A1 clips
+        // Check V1 & A1 clips with non-overlapping boundaries & guarded grip width for narrow zoomed-out clips
         if (my >= gm.v1Top && my <= gm.a1Top + gm.a1H) {
             double acc = 0.0;
             for (size_t i = 0; i < studioClips_.size(); ++i) {
@@ -1860,10 +1870,13 @@ bool MainWindow::OnStudioLButtonDown(int mx, int my) {
                 double outDur = std::max(0.1, c.trimEndSec - c.trimStartSec) / std::max(0.5, c.speed);
                 int x0 = secToX(acc);
                 int x1 = secToX(acc + outDur);
-                if (mx >= x0 - S(4) && mx <= x1 + S(4)) {
+                int hitLeft = (i == 0) ? (x0 - S(4)) : x0;
+                int hitRight = (i + 1 == studioClips_.size()) ? (x1 + S(4)) : (x1 - 1);
+                if (mx >= hitLeft && mx <= hitRight) {
                     studioSelClip_ = static_cast<int>(i);
                     studioSelMusic_ = -1;
-                    if (my <= gm.v1Top + gm.v1H && mx <= x0 + S(10)) {
+                    int handleW = ((x1 - x0) >= S(26)) ? S(9) : 0;
+                    if (handleW > 0 && my <= gm.v1Top + gm.v1H && mx <= x0 + handleW) {
                         studioDragMode_ = 2; // Trim Left
                         studioDragIdx_ = static_cast<int>(i);
                         studioDragStartX_ = mx;
@@ -1871,7 +1884,7 @@ bool MainWindow::OnStudioLButtonDown(int mx, int my) {
                         studioDragOrigB_ = acc;
                         studioPlaying_ = false;
                         SetCapture(hwnd_);
-                    } else if (my <= gm.v1Top + gm.v1H && mx >= x1 - S(10)) {
+                    } else if (handleW > 0 && my <= gm.v1Top + gm.v1H && mx >= x1 - handleW) {
                         studioDragMode_ = 3; // Trim Right
                         studioDragIdx_ = static_cast<int>(i);
                         studioDragStartX_ = mx;
@@ -1895,7 +1908,7 @@ bool MainWindow::OnStudioLButtonDown(int mx, int my) {
                 const auto& m = studioMusic_[i];
                 int x0 = secToX(m.timelineStartSec);
                 int x1 = secToX(m.timelineStartSec + m.durationSec);
-                if (mx >= x0 - S(4) && mx <= x1 + S(4)) {
+                if (mx >= x0 - S(2) && mx <= x1 + S(2)) {
                     studioSelMusic_ = static_cast<int>(i);
                     studioSelClip_ = -1;
                     studioDragIdx_ = static_cast<int>(i);
@@ -1903,9 +1916,10 @@ bool MainWindow::OnStudioLButtonDown(int mx, int my) {
                     studioDragOrigA_ = m.timelineStartSec;
                     studioDragOrigB_ = m.durationSec;
                     studioDragOrigC_ = m.trimStartSec;
-                    if (mx <= x0 + S(10)) studioDragMode_ = 5;      // trim L
-                    else if (mx >= x1 - S(10)) studioDragMode_ = 6; // trim R
-                    else studioDragMode_ = 4;                       // drag entire MP3 horizontally!
+                    int handleW = ((x1 - x0) >= S(26)) ? S(9) : 0;
+                    if (handleW > 0 && mx <= x0 + handleW) studioDragMode_ = 5;      // trim L
+                    else if (handleW > 0 && mx >= x1 - handleW) studioDragMode_ = 6; // trim R
+                    else studioDragMode_ = 4;                                        // drag entire MP3 horizontally!
                     SetCapture(hwnd_);
                     InvalidateRect(hwnd_, nullptr, FALSE);
                     return true;

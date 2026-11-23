@@ -310,6 +310,7 @@ private:
     double studioDragOrigC_ = 0.0;
     bool studioDragWasPlaying_ = false;
     ULONGLONG studioLastScrubMs_ = 0;
+    ULONGLONG studioIgnoreEndUntilMs_ = 0;
 
     void OpenStudio(bool loadQueued = true);
     void CloseStudio();
