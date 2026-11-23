@@ -174,6 +174,32 @@ inline double ClipOutDur(const T& c) {
     return std::max(0.1, c.trimEndSec - c.trimStartSec) / std::max(0.5, c.speed);
 }
 
+struct StudioFxPreset {
+    MontageTransitionType type;
+    const wchar_t* glyph;
+    const wchar_t* title;
+    const wchar_t* shortName;
+    const wchar_t* desc;
+    double defaultDurSec;
+    uint8_t r, g, b;
+};
+
+constexpr StudioFxPreset kStudioFxPresets[] = {
+    { MontageTransitionType::FlashWhite,  L"✦", L"Beyaz Flaş",    L"Flaş",   L"Vuruş anı parlak flaş",    0.45,  56, 189, 248 },
+    { MontageTransitionType::ZoomPunch,   L"◎", L"Zoom Darbe",    L"Zoom",   L"Merkeze ani yakınlaşma",   0.50,  59, 130, 246 },
+    { MontageTransitionType::GlitchShake, L"≈", L"Glitch / Sars", L"Glitch", L"Renk kayması + sarsıntı",  0.45, 236,  72, 153 },
+    { MontageTransitionType::FadeBlack,   L"◐", L"Karartma",      L"Karart", L"Siyaha yumuşak kararma",   0.60, 129, 140, 248 },
+    { MontageTransitionType::SlideWipe,   L"◫", L"Perde Geçişi",  L"Perde",  L"Yatay sinematik perde",    0.55,  16, 185, 129 },
+};
+constexpr int kNumStudioFxPresets = static_cast<int>(sizeof(kStudioFxPresets) / sizeof(kStudioFxPresets[0]));
+
+const StudioFxPreset& GetFxPreset(MontageTransitionType t) {
+    for (const auto& p : kStudioFxPresets) {
+        if (p.type == t) return p;
+    }
+    return kStudioFxPresets[0];
+}
+
 } // namespace
 
 class MainWindow::StudioMpCallback : public IMFPMediaPlayerCallback {
@@ -357,6 +383,60 @@ int MainWindow::StudioHitTestClipBody(int mx, int my, int cw, int ch) const {
     return -1;
 }
 
+int MainWindow::StudioHitTestTransition(int mx, int my, int cw, int ch) const {
+    if (!studioOpen_ || trimBusy_ || cw <= 0 || ch <= 0 || studioTransitions_.empty()) return -1;
+    const StudioGeometry gm = CalcStudioGeom(cw, ch, static_cast<int>(dpi_));
+    if (mx < gm.tlViewRc.left - S(10) || mx > gm.tlViewRc.right + S(12)) return -1;
+    if (my < gm.v1Top - S(3) || my > gm.v1Top + S(20)) return -1;
+    auto secToX = [&](double s) {
+        return static_cast<int>(std::lround(gm.tlViewRc.left + (s - studioTimelineScrollSec_) * studioPxPerSec_));
+    };
+    for (int i = static_cast<int>(studioTransitions_.size()) - 1; i >= 0; --i) {
+        const auto& tr = studioTransitions_[static_cast<size_t>(i)];
+        int cx = secToX(tr.timelineSec);
+        int x0 = secToX(std::max(0.0, tr.timelineSec - tr.durationSec * 0.5));
+        int x1 = secToX(tr.timelineSec + tr.durationSec * 0.5);
+        int hitL = std::min(x0, cx - S(32));
+        int hitR = std::max(x1, cx + S(32));
+        if (mx >= hitL && mx <= hitR) return i;
+    }
+    return -1;
+}
+
+void MainWindow::StudioAddTransition(MontageTransitionType type) {
+    if (trimBusy_) return;
+    double targetSec = std::max(0.0, studioPlayheadSec_);
+    for (const auto& c : studioClips_) {
+        double cs = std::max(0.0, c.timelineStartSec);
+        double ce = cs + ClipOutDur(c);
+        if (std::abs(targetSec - cs) <= 0.25) { targetSec = cs; break; }
+        if (std::abs(targetSec - ce) <= 0.25) { targetSec = ce; break; }
+    }
+    double maxTl = std::max(2.0, StudioTotalDuration());
+    for (int step = 0; step < 6; ++step) {
+        bool nearExisting = false;
+        for (const auto& ex : studioTransitions_) {
+            if (std::abs(ex.timelineSec - targetSec) < 0.15) {
+                nearExisting = true;
+                break;
+            }
+        }
+        if (!nearExisting) break;
+        targetSec = std::min(maxTl, targetSec + 0.55);
+    }
+    const StudioFxPreset& preset = GetFxPreset(type);
+    StudioTransitionItem item;
+    item.type = type;
+    item.timelineSec = targetSec;
+    item.durationSec = preset.defaultDurSec;
+    studioTransitions_.push_back(item);
+    studioSelFx_ = static_cast<int>(studioTransitions_.size()) - 1;
+    studioSelClip_ = -1;
+    studioSelMusic_ = -1;
+    SetFooterMessage(std::wstring(L"Efekt eklendi: ") + preset.title + L" — Üst şeritten sürükleyip istediğiniz saniyeye koyabilirsiniz.");
+    if (hwnd_) InvalidateRect(hwnd_, nullptr, FALSE);
+}
+
 void MainWindow::StudioTrimClipEdgeToPlayhead(bool leftEdge) {
     if (trimBusy_ || studioClips_.empty()) return;
     int idx = -1;
@@ -420,6 +500,8 @@ void MainWindow::OpenStudio(bool loadQueued) {
     studioHoverClipSide_ = 0;
     studioHoverMusicIdx_ = -1;
     studioHoverMusicSide_ = 0;
+    studioHoverFxIdx_ = -1;
+    studioSelFx_ = -1;
 
     if (loadQueued && studioClips_.empty() && !montagePaths_.empty()) {
         for (const auto& mp : montagePaths_) {
@@ -528,6 +610,8 @@ void MainWindow::CloseStudio() {
     studioHoverClipSide_ = 0;
     studioHoverMusicIdx_ = -1;
     studioHoverMusicSide_ = 0;
+    studioHoverFxIdx_ = -1;
+    studioSelFx_ = -1;
     // Free cached waveform peaks when leaving studio so idle RAM returns near baseline
     for (auto& c : studioClips_) { c.waveLoaded = false; std::vector<float>().swap(c.wavePeaks); }
     for (auto& m : studioMusic_) { m.waveLoaded = false; std::vector<float>().swap(m.wavePeaks); }
@@ -975,7 +1059,12 @@ void MainWindow::StudioDeleteSelection() {
     studioHoverClipSide_ = 0;
     studioHoverMusicIdx_ = -1;
     studioHoverMusicSide_ = 0;
-    if (studioSelMusic_ >= 0 && studioSelMusic_ < static_cast<int>(studioMusic_.size())) {
+    studioHoverFxIdx_ = -1;
+    if (studioSelFx_ >= 0 && studioSelFx_ < static_cast<int>(studioTransitions_.size())) {
+        studioTransitions_.erase(studioTransitions_.begin() + studioSelFx_);
+        studioSelFx_ = studioTransitions_.empty() ? -1 : std::min(studioSelFx_, static_cast<int>(studioTransitions_.size()) - 1);
+        if (studioSelFx_ < 0 && studioSelMusic_ < 0 && !studioClips_.empty()) studioSelClip_ = 0;
+    } else if (studioSelMusic_ >= 0 && studioSelMusic_ < static_cast<int>(studioMusic_.size())) {
         studioMusic_.erase(studioMusic_.begin() + studioSelMusic_);
         if (studioMusicPlayer_) studioMusicPlayer_->Pause();
         studioLoadedMusicPath_.clear();
@@ -1146,6 +1235,13 @@ void MainWindow::StartStudioRender() {
         mt.fadeIn = m.fadeIn;
         mt.fadeOut = m.fadeOut;
         editSpec.musicTracks.push_back(std::move(mt));
+    }
+    for (const auto& fx : studioTransitions_) {
+        MontageTransitionSpec ts;
+        ts.type = fx.type;
+        ts.timelineSec = fx.timelineSec;
+        ts.durationSec = fx.durationSec;
+        editSpec.transitions.push_back(ts);
     }
 
     SetFooterMessage(L"Montaj render alınıyor, lütfen bekleyin...");
@@ -1619,15 +1715,20 @@ void MainWindow::PaintStudio(void* gPtr, int cw, int ch) {
         Gdiplus::Pen pSep(Gc(42, 54, 80), 1.0f);
         g.DrawLine(&pSep, gm.leftW, gm.topH, gm.leftW, gm.timelineTop);
 
-        int halfTabW = (gm.leftW - S(26)) / 2;
-        addBtnPx(ui::BTN_STU_LEFT_CLIPS, S(10), gm.topH + S(10), halfTabW, S(30), L"Kliplerim",
+        int tabGap = S(4);
+        int tabW = (gm.leftW - S(20) - tabGap * 2) / 3;
+        addBtnPx(ui::BTN_STU_LEFT_CLIPS, S(10), gm.topH + S(10), tabW, S(30), L"Kliplerim",
             studioLeftTab_ == 0 ? Gc(37, 99, 235) : Gc(22, 28, 42),
             studioLeftTab_ == 0 ? Gc(59, 130, 246) : Gc(34, 43, 64),
             studioLeftTab_ == 0 ? Gc(96, 165, 250) : Gc(48, 60, 86), true, true);
-        addBtnPx(ui::BTN_STU_LEFT_MUSIC, S(16) + halfTabW, gm.topH + S(10), halfTabW, S(30), L"Müzik / MP3",
+        addBtnPx(ui::BTN_STU_LEFT_MUSIC, S(10) + tabW + tabGap, gm.topH + S(10), tabW, S(30), L"Müzik",
             studioLeftTab_ == 1 ? Gc(124, 58, 237) : Gc(22, 28, 42),
             studioLeftTab_ == 1 ? Gc(139, 92, 246) : Gc(34, 43, 64),
             studioLeftTab_ == 1 ? Gc(196, 181, 253) : Gc(48, 60, 86), true, true);
+        addBtnPx(ui::BTN_STU_LEFT_FX, S(10) + (tabW + tabGap) * 2, gm.topH + S(10), tabW, S(30), L"Geçişler",
+            studioLeftTab_ == 2 ? Gc(14, 116, 144) : Gc(22, 28, 42),
+            studioLeftTab_ == 2 ? Gc(6, 182, 212) : Gc(34, 43, 64),
+            studioLeftTab_ == 2 ? Gc(103, 232, 249) : Gc(48, 60, 86), true, true);
 
         int bodyTop = gm.topH + S(48);
         int bodyH = std::max(S(80), gm.timelineTop - bodyTop - S(6));
@@ -1671,7 +1772,7 @@ void MainWindow::PaintStudio(void* gPtr, int cw, int ch) {
                 addBtnPx(ui::BTN_STU_ADD_CLIP_BASE + ci, gm.leftW - S(62), ry + S(10), S(46), S(26), L"+ Ekle",
                     Gc(37, 99, 235), Gc(59, 130, 246), Gc(96, 165, 250), !trimBusy_ && ci < 900, true);
             }
-        } else {
+        } else if (studioLeftTab_ == 1) {
             addBtnPx(ui::BTN_STU_PICK_MP3, S(12), bodyTop + S(2), gm.leftW - S(24), S(36), L"+ PC'den MP3 / Ses Ekle",
                 Gc(124, 58, 237), Gc(139, 92, 246), Gc(196, 181, 253), !trimBusy_, true);
             g.DrawString(L"Eklediğiniz müziği alttaki M1\nşeridinde istediğiniz saniyeye\nsürükleyebilirsiniz.", -1, &fTiny,
@@ -1690,6 +1791,34 @@ void MainWindow::PaintStudio(void* gPtr, int cw, int ch) {
                     Gdiplus::RectF((float)S(18), (float)ry, (float)(gm.leftW - S(90)), (float)(recH - S(6))), &sfLeft, &brPurple);
                 addBtnPx(ui::BTN_STU_ADD_MUSIC_BASE + ri, gm.leftW - S(64), ry + S(4), S(48), S(26), L"+ Koy",
                     Gc(124, 58, 237), Gc(139, 92, 246), Gc(196, 181, 253), !trimBusy_ && ri < 500, true);
+            }
+        } else {
+            g.DrawString(L"İmleci hedef saniyeye getirin,\n'+ Koy'a basın ve V1 üstünden\nsürükleyip istediğiniz yere koyun.", -1, &fTiny,
+                Gdiplus::RectF((float)S(12), (float)(bodyTop + S(2)), (float)(gm.leftW - S(24)), (float)S(44)), &sfLeft, &brMuted);
+
+            const int fxTop = bodyTop + S(52);
+            const int fxRowH = S(52);
+            for (int fi = 0; fi < kNumStudioFxPresets; ++fi) {
+                const auto& fp = kStudioFxPresets[fi];
+                int ry = fxTop + fi * fxRowH;
+                if (ry + fxRowH - S(6) > gm.timelineTop - S(4)) break;
+                FillRoundRectGrad(g, (float)S(10), (float)ry, (float)(gm.leftW - S(20)), (float)(fxRowH - S(6)), (float)S(9),
+                    Gc(24, 31, 48), Gc(18, 24, 38));
+                StrokeRoundRect(g, (float)S(10), (float)ry, (float)(gm.leftW - S(20)), (float)(fxRowH - S(6)), (float)S(9),
+                    Gc(fp.r, fp.g, fp.b, 125));
+                FillRoundRect(g, (float)S(16), (float)(ry + S(9)), (float)S(28), (float)S(28), (float)S(7),
+                    Gc(fp.r, fp.g, fp.b, 48));
+                StrokeRoundRect(g, (float)S(16), (float)(ry + S(9)), (float)S(28), (float)S(28), (float)S(7),
+                    Gc(fp.r, fp.g, fp.b, 165));
+                Gdiplus::SolidBrush brFxGlyph(Gc(fp.r, fp.g, fp.b));
+                g.DrawString(fp.glyph, -1, &fBold,
+                    Gdiplus::RectF((float)S(16), (float)(ry + S(9)), (float)S(28), (float)S(28)), &sfCenter, &brFxGlyph);
+                g.DrawString(fp.title, -1, &fSmall,
+                    Gdiplus::RectF((float)S(50), (float)(ry + S(5)), (float)(gm.leftW - S(116)), (float)S(16)), &sfLeft, &brText);
+                g.DrawString(fp.desc, -1, &fTiny,
+                    Gdiplus::RectF((float)S(50), (float)(ry + S(22)), (float)(gm.leftW - S(116)), (float)S(16)), &sfLeft, &brMuted);
+                addBtnPx(ui::BTN_STU_ADD_FX_BASE + fi, gm.leftW - S(62), ry + S(10), S(46), S(26), L"+ Koy",
+                    Gc(fp.r / 2, fp.g / 2, fp.b / 2), Gc(fp.r, fp.g, fp.b), Gc(fp.r, fp.g, fp.b), !trimBusy_, true);
             }
         }
     }
@@ -1711,9 +1840,25 @@ void MainWindow::PaintStudio(void* gPtr, int cw, int ch) {
         int vx = gm.stageRc.left + (static_cast<int>(gm.stageRc.right - gm.stageRc.left) - vw) / 2;
         int vy = gm.stageRc.top + (static_cast<int>(gm.stageRc.bottom - gm.stageRc.top) - vh) / 2;
 
-        // Ambient frame glow around video viewport
+        const StudioTransitionItem* activeFx = nullptr;
+        for (const auto& fx : studioTransitions_) {
+            double halfW = std::max(0.15, fx.durationSec) * 0.5;
+            if (studioPlayheadSec_ >= fx.timelineSec - halfW && studioPlayheadSec_ <= fx.timelineSec + halfW) {
+                activeFx = &fx;
+                break;
+            }
+        }
+
+        // Ambient frame glow around video viewport (highlights when playhead enters a transition)
+        Gdiplus::Color stageGlowCol = studioVertical916_ ? Gc(139, 92, 246, 165) : Gc(59, 130, 246, 145);
+        float stageGlowW = 1.6f;
+        if (activeFx) {
+            const auto& ap = GetFxPreset(activeFx->type);
+            stageGlowCol = Gc(ap.r, ap.g, ap.b, 235);
+            stageGlowW = 2.6f;
+        }
         StrokeRoundRect(g, (float)(vx - 2), (float)(vy - 2), (float)(vw + 4), (float)(vh + 4), (float)S(10),
-            studioVertical916_ ? Gc(139, 92, 246, 165) : Gc(59, 130, 246, 145), 1.6f);
+            stageGlowCol, stageGlowW);
 
         if (trimBusy_) {
             int pw = S(380), ph = S(84);
@@ -1735,7 +1880,13 @@ void MainWindow::PaintStudio(void* gPtr, int cw, int ch) {
             int chkIdx = -1;
             double chkLoc = 0.0, chkStart = 0.0;
             if (!MapTimelineToClip(studioPlayheadSec_, chkIdx, chkLoc, chkStart)) {
-                FillRoundRect(g, (float)vx, (float)vy, (float)vw, (float)vh, (float)S(8), Gc(4, 6, 12));
+                Gdiplus::Color gapCol = Gc(4, 6, 12);
+                if (activeFx && activeFx->type == MontageTransitionType::FlashWhite) {
+                    double u = std::max(0.0, std::min(1.0, (studioPlayheadSec_ - (activeFx->timelineSec - activeFx->durationSec * 0.5)) / std::max(0.1, activeFx->durationSec)));
+                    uint8_t br = static_cast<uint8_t>(std::min(240.0, 220.0 * std::sin(u * 3.14159265)));
+                    gapCol = Gc(br, br, br);
+                }
+                FillRoundRect(g, (float)vx, (float)vy, (float)vw, (float)vh, (float)S(8), gapCol);
                 wchar_t gtxt[128] = L"Boşluk (Siyah Ekran)";
                 for (const auto& sc : studioClips_) {
                     if (sc.timelineStartSec > studioPlayheadSec_) {
@@ -1746,6 +1897,17 @@ void MainWindow::PaintStudio(void* gPtr, int cw, int ch) {
                 }
                 g.DrawString(gtxt, -1, &fSmall,
                     Gdiplus::RectF((float)vx, (float)vy, (float)vw, (float)vh), &sfCenter, &brMuted);
+            }
+            if (activeFx) {
+                const auto& ap = GetFxPreset(activeFx->type);
+                float badgeW = (float)S(168), badgeH = (float)S(22);
+                float bxFx = static_cast<float>(vx + vw - badgeW - S(8));
+                float byFx = static_cast<float>(gm.stageRc.top + S(2));
+                FillRoundRect(g, bxFx, byFx, badgeW, badgeH, 6.0f, Gc(14, 20, 36, 232));
+                StrokeRoundRect(g, bxFx, byFx, badgeW, badgeH, 6.0f, Gc(ap.r, ap.g, ap.b), 1.2f);
+                std::wstring fxlbl = std::wstring(ap.glyph) + L" Efekt: " + ap.title;
+                Gdiplus::SolidBrush brFxTxt(Gc(ap.r, ap.g, ap.b));
+                g.DrawString(fxlbl.c_str(), -1, &fTiny, Gdiplus::RectF(bxFx + 4.0f, byFx, badgeW - 8.0f, badgeH), &sfCenter, &brFxTxt);
             }
         }
     }
@@ -1765,6 +1927,7 @@ void MainWindow::PaintStudio(void* gPtr, int cw, int ch) {
         int by = gm.toolY + S(5);
         bool hasClipSel = (studioSelClip_ >= 0 && studioSelClip_ < static_cast<int>(studioClips_.size()));
         bool hasMusSel = (studioSelMusic_ >= 0 && studioSelMusic_ < static_cast<int>(studioMusic_.size()));
+        bool hasFxSel = (studioSelFx_ >= 0 && studioSelFx_ < static_cast<int>(studioTransitions_.size()));
         bool canSplit = false;
         if (!studioClips_.empty() && !trimBusy_) {
             int si = -1; double lSec = 0, cStart = 0;
@@ -1778,7 +1941,7 @@ void MainWindow::PaintStudio(void* gPtr, int cw, int ch) {
         addBtnPx(ui::BTN_STU_SPLIT, bx, by, S(60), S(26), L"✂ Böl",
             Gc(30, 41, 66), Gc(48, 64, 102), Gc(71, 85, 118), canSplit, true);
         addBtnPx(ui::BTN_STU_DELETE, bx + S(64), by, S(44), S(26), L"Sil",
-            Gc(127, 29, 29), Gc(185, 28, 28), Gc(248, 113, 113), !trimBusy_ && (hasClipSel || hasMusSel), true);
+            Gc(127, 29, 29), Gc(185, 28, 28), Gc(248, 113, 113), !trimBusy_ && (hasClipSel || hasMusSel || hasFxSel), true);
         addBtnPx(ui::BTN_STU_MOVE_LEFT, bx + S(112), by, S(26), S(26), L"◀",
             Gc(26, 33, 50), Gc(40, 50, 76), Gc(56, 70, 104), !trimBusy_ && hasClipSel && studioSelClip_ > 0, true);
         addBtnPx(ui::BTN_STU_MOVE_RIGHT, bx + S(140), by, S(26), S(26), L"▶",
@@ -1817,7 +1980,23 @@ void MainWindow::PaintStudio(void* gPtr, int cw, int ch) {
         };
 
         int mby = gm.toolRow2Y + S(5);
-        if (hasMusSel) {
+        if (hasFxSel) {
+            const auto& fx = studioTransitions_[static_cast<size_t>(studioSelFx_)];
+            const auto& fp = GetFxPreset(fx.type);
+            wchar_t fxTag[80] = {};
+            swprintf(fxTag, 80, L"%ls %ls @%.1fs", fp.glyph, fp.title, fx.timelineSec);
+            Gdiplus::SolidBrush brFx(Gc(fp.r, fp.g, fp.b));
+            g.DrawString(fxTag, -1, &fTiny,
+                Gdiplus::RectF((float)bx, (float)mby, (float)S(156), (float)S(24)), &sfLeft, &brFx);
+            addBtnPx(ui::BTN_STU_FX_TYPE, bx + S(160), mby, S(96), S(24), L"Efekt Değiştir",
+                Gc(28, 38, 60), Gc(48, 66, 104), Gc(fp.r, fp.g, fp.b), !trimBusy_, true);
+            wchar_t dLbl[32] = {};
+            swprintf(dLbl, 32, L"Süre: %.2fs", fx.durationSec);
+            addBtnPx(ui::BTN_STU_FX_DUR, bx + S(262), mby, S(82), S(24), dLbl,
+                Gc(28, 38, 60), Gc(48, 66, 104), Gc(96, 165, 250), !trimBusy_, true);
+            addBtnPx(ui::BTN_STU_FX_TO_PH, bx + S(350), mby, S(92), S(24), L"İmlece Taşı",
+                Gc(28, 38, 60), Gc(48, 66, 104), Gc(56, 189, 248), !trimBusy_, true);
+        } else if (hasMusSel) {
             const auto& m = studioMusic_[static_cast<size_t>(studioSelMusic_)];
             wchar_t selTag[64] = {};
             swprintf(selTag, 64, L"♪ Müzik @%.1fs", m.timelineStartSec);
@@ -2135,6 +2314,48 @@ void MainWindow::PaintStudio(void* gPtr, int cw, int ch) {
             }
         }
 
+        // Timeline Placed Transition / Impact Markers on top band of V1
+        for (size_t i = 0; i < studioTransitions_.size(); ++i) {
+            const auto& fx = studioTransitions_[i];
+            const auto& fp = GetFxPreset(fx.type);
+            double s0 = std::max(0.0, fx.timelineSec - fx.durationSec * 0.5);
+            double s1 = fx.timelineSec + fx.durationSec * 0.5;
+            float sx0 = secToX(s0);
+            float sx1 = secToX(s1);
+            float cx = secToX(fx.timelineSec);
+            float spanW = std::max(6.0f, sx1 - sx0);
+            const bool selFx = (studioSelFx_ == static_cast<int>(i));
+            const bool hovFx = (studioHoverFxIdx_ == static_cast<int>(i)) ||
+                               (studioDragMode_ == 11 && studioDragIdx_ == static_cast<int>(i));
+
+            FillRoundRect(g, sx0, (float)(gm.v1Top + S(1)), spanW, (float)S(18), 4.0f,
+                Gc(fp.r, fp.g, fp.b, selFx || hovFx ? 95 : 52));
+            StrokeRoundRect(g, sx0, (float)(gm.v1Top + S(1)), spanW, (float)S(18), 4.0f,
+                Gc(fp.r, fp.g, fp.b, selFx || hovFx ? 235 : 140), selFx ? 1.5f : 1.0f);
+
+            float pillW = std::max<float>((float)S(60), spanW);
+            float px = cx - pillW * 0.5f;
+            FillRoundRectGrad(g, px, (float)(gm.v1Top + S(1)), pillW, (float)S(17), (float)S(5),
+                Gc(selFx || hovFx ? std::min(255, fp.r + 35) : fp.r,
+                   selFx || hovFx ? std::min(255, fp.g + 35) : fp.g,
+                   selFx || hovFx ? std::min(255, fp.b + 35) : fp.b, 230),
+                Gc(fp.r / 2, fp.g / 2, fp.b / 2, 230));
+            StrokeRoundRect(g, px, (float)(gm.v1Top + S(1)), pillW, (float)S(17), (float)S(5),
+                selFx ? Gc(248, 250, 252) : Gc(fp.r, fp.g, fp.b), selFx ? 1.5f : 1.0f);
+            std::wstring pillLbl = std::wstring(fp.glyph) + L" " + fp.shortName;
+            g.DrawString(pillLbl.c_str(), -1, &fTiny,
+                Gdiplus::RectF(px + 2.0f, (float)(gm.v1Top + S(1)), pillW - 4.0f, (float)S(17)), &sfCenter, &brText);
+
+            if (studioDragMode_ == 11 && studioDragIdx_ == static_cast<int>(i)) {
+                hasTrimBadge = true;
+                trimBadgeX = cx;
+                trimBadgeTrackY = gm.v1Top;
+                wchar_t fxtxt[80] = {};
+                swprintf(fxtxt, 80, L"%ls %ls @ %ls", fp.glyph, fp.title, FormatSecTenths(fx.timelineSec).c_str());
+                trimBadgeText = fxtxt;
+            }
+        }
+
         // M1 Music / MP3 blocks placed anywhere along timeline
         if (studioMusic_.empty()) {
             g.DrawString(L"Müzik yok — Soldaki '+ MP3 Ekle'ye basın, ekledikten sonra müzik şeridini istediğiniz saniyeye sürükleyin",
@@ -2260,7 +2481,8 @@ bool MainWindow::OnStudioLButtonDown(int mx, int my) {
     // 1. Tool bar volume sliders
     bool hasMusSel = (studioSelMusic_ >= 0 && studioSelMusic_ < static_cast<int>(studioMusic_.size()));
     bool hasClipSel = (studioSelClip_ >= 0 && studioSelClip_ < static_cast<int>(studioClips_.size()));
-    if (hasMusSel && mx >= gm.musSlRc.left - S(4) && mx <= gm.musSlRc.right + S(4) && my >= gm.musSlRc.top - S(4) && my <= gm.musSlRc.bottom + S(4)) {
+    bool hasFxSel = (studioSelFx_ >= 0 && studioSelFx_ < static_cast<int>(studioTransitions_.size()));
+    if (!hasFxSel && hasMusSel && mx >= gm.musSlRc.left - S(4) && mx <= gm.musSlRc.right + S(4) && my >= gm.musSlRc.top - S(4) && my <= gm.musSlRc.bottom + S(4)) {
         studioDragMode_ = 9;
         SetCapture(hwnd_);
         double r = std::max(0.0, std::min(1.0, static_cast<double>(mx - gm.musSlRc.left) / std::max(1L, gm.musSlRc.right - gm.musSlRc.left)));
@@ -2269,7 +2491,7 @@ bool MainWindow::OnStudioLButtonDown(int mx, int my) {
         InvalidateRect(hwnd_, nullptr, FALSE);
         return true;
     }
-    if (!hasMusSel && (hasClipSel || !studioClips_.empty())) {
+    if (!hasFxSel && !hasMusSel && (hasClipSel || !studioClips_.empty())) {
         int ci = hasClipSel ? studioSelClip_ : 0;
         studioSelClip_ = ci;
         if (mx >= gm.gameSlRc.left - S(4) && mx <= gm.gameSlRc.right + S(4) && my >= gm.gameSlRc.top - S(4) && my <= gm.gameSlRc.bottom + S(4)) {
@@ -2304,6 +2526,21 @@ bool MainWindow::OnStudioLButtonDown(int mx, int my) {
             return static_cast<int>(std::lround(gm.tlViewRc.left + (s - studioTimelineScrollSec_) * studioPxPerSec_));
         };
 
+        int fxHit = StudioHitTestTransition(mx, my, cli.right, cli.bottom);
+        if (fxHit >= 0 && fxHit < static_cast<int>(studioTransitions_.size())) {
+            studioSelFx_ = fxHit;
+            studioSelClip_ = -1;
+            studioSelMusic_ = -1;
+            studioDragIdx_ = fxHit;
+            studioDragStartX_ = mx;
+            studioDragOrigA_ = studioTransitions_[static_cast<size_t>(fxHit)].timelineSec;
+            studioDragMode_ = 11;
+            SetCapture(hwnd_);
+            SetCursor(LoadCursorW(nullptr, IDC_SIZEALL));
+            InvalidateRect(hwnd_, nullptr, FALSE);
+            return true;
+        }
+
         int hKind = 0, hIdx = -1, hSide = 0;
         double hAcc = 0.0;
         if (StudioHitTestTrimEdge(mx, my, cli.right, cli.bottom, hKind, hIdx, hSide, hAcc)) {
@@ -2314,6 +2551,7 @@ bool MainWindow::OnStudioLButtonDown(int mx, int my) {
                 for (const auto& sc : studioClips_) studioDragOrigStarts_.push_back(std::max(0.0, sc.timelineStartSec));
                 studioSelClip_ = hIdx;
                 studioSelMusic_ = -1;
+                studioSelFx_ = -1;
                 studioDragMode_ = (hSide < 0) ? 2 : 3;
                 studioDragIdx_ = hIdx;
                 studioDragStartX_ = mx;
@@ -2334,6 +2572,7 @@ bool MainWindow::OnStudioLButtonDown(int mx, int my) {
                 const auto& m = studioMusic_[static_cast<size_t>(hIdx)];
                 studioSelMusic_ = hIdx;
                 studioSelClip_ = -1;
+                studioSelFx_ = -1;
                 studioDragIdx_ = hIdx;
                 studioDragStartX_ = mx;
                 studioDragOrigA_ = m.timelineStartSec;
@@ -2368,6 +2607,7 @@ bool MainWindow::OnStudioLButtonDown(int mx, int my) {
                 if (mx >= x0 && mx <= visX1) {
                     studioSelClip_ = static_cast<int>(i);
                     studioSelMusic_ = -1;
+                    studioSelFx_ = -1;
                     studioDragIdx_ = static_cast<int>(i);
                     studioDragStartX_ = mx;
                     studioDragOrigA_ = cStart;
@@ -2393,6 +2633,7 @@ bool MainWindow::OnStudioLButtonDown(int mx, int my) {
                 if (mx >= x0 - S(2) && mx <= x1 + S(2)) {
                     studioSelMusic_ = static_cast<int>(i);
                     studioSelClip_ = -1;
+                    studioSelFx_ = -1;
                     studioDragIdx_ = static_cast<int>(i);
                     studioDragStartX_ = mx;
                     studioDragOrigA_ = m.timelineStartSec;
@@ -2413,13 +2654,21 @@ bool MainWindow::OnStudioLButtonDown(int mx, int my) {
         return true;
     }
 
-    // 3. Clicking a clip row in left panel also appends it cleanly
-    if (mx >= S(10) && mx <= gm.leftW - S(10) && my >= gm.topH + S(48) && my < gm.timelineTop && studioLeftTab_ == 0) {
-        int vi = (my - (gm.topH + S(48))) / S(52);
-        int ci = studioLibScroll_ + vi;
-        if (ci >= 0 && ci < static_cast<int>(clips_.size())) {
-            StudioAddClipFromLibrary(static_cast<size_t>(ci));
-            return true;
+    // 3. Clicking a row in left panel (Clips append / Effects place at playhead)
+    if (mx >= S(10) && mx <= gm.leftW - S(10) && my >= gm.topH + S(48) && my < gm.timelineTop) {
+        if (studioLeftTab_ == 0) {
+            int vi = (my - (gm.topH + S(48))) / S(52);
+            int ci = studioLibScroll_ + vi;
+            if (ci >= 0 && ci < static_cast<int>(clips_.size())) {
+                StudioAddClipFromLibrary(static_cast<size_t>(ci));
+                return true;
+            }
+        } else if (studioLeftTab_ == 2 && my >= gm.topH + S(100)) {
+            int fi = (my - (gm.topH + S(100))) / S(52);
+            if (fi >= 0 && fi < kNumStudioFxPresets) {
+                StudioAddTransition(kStudioFxPresets[fi].type);
+                return true;
+            }
         }
     }
     return true;
@@ -2429,19 +2678,24 @@ bool MainWindow::OnStudioMouseMove(int mx, int my) {
     if (!studioOpen_ || activeTab_ != 1) return false;
     RECT cli{}; GetClientRect(hwnd_, &cli);
     if (studioDragMode_ == 0) {
+        int newFxHov = StudioHitTestTransition(mx, my, cli.right, cli.bottom);
         int hKind = 0, hIdx = -1, hSide = 0;
         double dummyAcc = 0.0;
-        StudioHitTestTrimEdge(mx, my, cli.right, cli.bottom, hKind, hIdx, hSide, dummyAcc);
+        if (newFxHov < 0) {
+            StudioHitTestTrimEdge(mx, my, cli.right, cli.bottom, hKind, hIdx, hSide, dummyAcc);
+        }
         int newCIdx = (hKind == 1) ? hIdx : -1;
         int newCSide = (hKind == 1) ? hSide : 0;
         int newMIdx = (hKind == 2) ? hIdx : -1;
         int newMSide = (hKind == 2) ? hSide : 0;
         if (newCIdx != studioHoverClipIdx_ || newCSide != studioHoverClipSide_ ||
-            newMIdx != studioHoverMusicIdx_ || newMSide != studioHoverMusicSide_) {
+            newMIdx != studioHoverMusicIdx_ || newMSide != studioHoverMusicSide_ ||
+            newFxHov != studioHoverFxIdx_) {
             studioHoverClipIdx_ = newCIdx;
             studioHoverClipSide_ = newCSide;
             studioHoverMusicIdx_ = newMIdx;
             studioHoverMusicSide_ = newMSide;
+            studioHoverFxIdx_ = newFxHov;
             InvalidateRect(hwnd_, nullptr, FALSE);
         }
         UpdateHover(mx, my);
@@ -2561,6 +2815,28 @@ bool MainWindow::OnStudioMouseMove(int mx, int my) {
         InvalidateRect(hwnd_, nullptr, FALSE);
         return true;
     }
+    if (studioDragMode_ == 11 && studioDragIdx_ >= 0 && studioDragIdx_ < static_cast<int>(studioTransitions_.size())) {
+        auto& fx = studioTransitions_[static_cast<size_t>(studioDragIdx_)];
+        double dt = static_cast<double>(mx - studioDragStartX_) / studioPxPerSec_;
+        double maxTl = std::max(2.0, StudioTotalDuration() + 2.0);
+        double cand = std::max(0.0, std::min(maxTl, studioDragOrigA_ + dt));
+        double snapThresh = 8.0 / studioPxPerSec_;
+        if (std::abs(cand - 0.0) < snapThresh) cand = 0.0;
+        else if (std::abs(cand - studioPlayheadSec_) < snapThresh) cand = studioPlayheadSec_;
+        else {
+            for (const auto& c : studioClips_) {
+                double cs = std::max(0.0, c.timelineStartSec);
+                double ce = cs + ClipOutDur(c);
+                if (std::abs(cand - cs) < snapThresh) { cand = cs; break; }
+                if (std::abs(cand - ce) < snapThresh) { cand = ce; break; }
+            }
+        }
+        fx.timelineSec = cand;
+        autoPanDrag(std::max(0.0, cand - fx.durationSec * 0.5), cand + fx.durationSec * 0.5);
+        SetCursor(LoadCursorW(nullptr, IDC_SIZEALL));
+        InvalidateRect(hwnd_, nullptr, FALSE);
+        return true;
+    }
     if (studioDragMode_ == 4 && studioDragIdx_ >= 0 && studioDragIdx_ < static_cast<int>(studioMusic_.size())) {
         auto& m = studioMusic_[static_cast<size_t>(studioDragIdx_)];
         double dt = static_cast<double>(mx - studioDragStartX_) / studioPxPerSec_;
@@ -2632,6 +2908,7 @@ bool MainWindow::OnStudioLButtonUp(int mx, int my) {
         studioHoverClipSide_ = 0;
         studioHoverMusicIdx_ = -1;
         studioHoverMusicSide_ = 0;
+        studioHoverFxIdx_ = -1;
         ReleaseCapture();
         if (m == 2 && dIdx >= 0 && dIdx < static_cast<int>(studioClips_.size())) {
             studioPlayheadSec_ = std::max(0.0, std::min(StudioTotalDuration(), studioClips_[static_cast<size_t>(dIdx)].timelineStartSec));
@@ -2646,9 +2923,11 @@ bool MainWindow::OnStudioLButtonUp(int mx, int my) {
         studioClipDragged_ = false;
         studioDragOrigStarts_.clear();
         RECT cli{}; GetClientRect(hwnd_, &cli);
+        studioHoverFxIdx_ = StudioHitTestTransition(mx, my, cli.right, cli.bottom);
         int hKind = 0, hIdx = -1, hSide = 0;
         double dummyAcc = 0.0;
-        if (StudioHitTestTrimEdge(mx, my, cli.right, cli.bottom, hKind, hIdx, hSide, dummyAcc)) {
+        if (studioHoverFxIdx_ < 0 &&
+            StudioHitTestTrimEdge(mx, my, cli.right, cli.bottom, hKind, hIdx, hSide, dummyAcc)) {
             if (hKind == 1) { studioHoverClipIdx_ = hIdx; studioHoverClipSide_ = hSide; }
             else if (hKind == 2) { studioHoverMusicIdx_ = hIdx; studioHoverMusicSide_ = hSide; }
         }
@@ -2708,6 +2987,11 @@ bool MainWindow::OnStudioButtonClick(int target) {
         }
         return true;
     }
+    if (target >= ui::BTN_STU_ADD_FX_BASE && target < ui::BTN_STU_ADD_FX_BASE + kNumStudioFxPresets) {
+        int fi = target - ui::BTN_STU_ADD_FX_BASE;
+        StudioAddTransition(kStudioFxPresets[fi].type);
+        return true;
+    }
 
     switch (target) {
         case ui::BTN_STU_EXIT: CloseStudio(); return true;
@@ -2739,6 +3023,8 @@ bool MainWindow::OnStudioButtonClick(int target) {
             studioLeftTab_ = 0; InvalidateRect(hwnd_, nullptr, FALSE); return true;
         case ui::BTN_STU_LEFT_MUSIC:
             studioLeftTab_ = 1; InvalidateRect(hwnd_, nullptr, FALSE); return true;
+        case ui::BTN_STU_LEFT_FX:
+            studioLeftTab_ = 2; InvalidateRect(hwnd_, nullptr, FALSE); return true;
         case ui::BTN_STU_PICK_MP3:
             StudioAddMusicFile(L""); return true;
         case ui::BTN_STU_PLAYPAUSE:
@@ -2780,6 +3066,34 @@ bool MainWindow::OnStudioButtonClick(int target) {
         case ui::BTN_STU_MUS_FADEOUT:
             if (studioSelMusic_ >= 0 && studioSelMusic_ < static_cast<int>(studioMusic_.size())) {
                 studioMusic_[static_cast<size_t>(studioSelMusic_)].fadeOut = !studioMusic_[static_cast<size_t>(studioSelMusic_)].fadeOut;
+                InvalidateRect(hwnd_, nullptr, FALSE);
+            }
+            return true;
+        case ui::BTN_STU_FX_TYPE:
+            if (studioSelFx_ >= 0 && studioSelFx_ < static_cast<int>(studioTransitions_.size())) {
+                auto& fx = studioTransitions_[static_cast<size_t>(studioSelFx_)];
+                int cur = 0;
+                for (int i = 0; i < kNumStudioFxPresets; ++i) {
+                    if (kStudioFxPresets[i].type == fx.type) { cur = i; break; }
+                }
+                fx.type = kStudioFxPresets[(cur + 1) % kNumStudioFxPresets].type;
+                InvalidateRect(hwnd_, nullptr, FALSE);
+            }
+            return true;
+        case ui::BTN_STU_FX_DUR:
+            if (studioSelFx_ >= 0 && studioSelFx_ < static_cast<int>(studioTransitions_.size())) {
+                auto& fx = studioTransitions_[static_cast<size_t>(studioSelFx_)];
+                if (fx.durationSec < 0.40) fx.durationSec = 0.45;
+                else if (fx.durationSec < 0.60) fx.durationSec = 0.65;
+                else if (fx.durationSec < 0.85) fx.durationSec = 0.90;
+                else if (fx.durationSec < 1.15) fx.durationSec = 1.20;
+                else fx.durationSec = 0.30;
+                InvalidateRect(hwnd_, nullptr, FALSE);
+            }
+            return true;
+        case ui::BTN_STU_FX_TO_PH:
+            if (studioSelFx_ >= 0 && studioSelFx_ < static_cast<int>(studioTransitions_.size())) {
+                studioTransitions_[static_cast<size_t>(studioSelFx_)].timelineSec = studioPlayheadSec_;
                 InvalidateRect(hwnd_, nullptr, FALSE);
             }
             return true;

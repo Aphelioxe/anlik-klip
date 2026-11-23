@@ -117,6 +117,7 @@ enum CustomBtnId {
     BTN_STU_TARGET,
     BTN_STU_LEFT_CLIPS,
     BTN_STU_LEFT_MUSIC,
+    BTN_STU_LEFT_FX,
     BTN_STU_PICK_MP3,
     BTN_STU_PLAYPAUSE,
     BTN_STU_TO_START,
@@ -129,6 +130,9 @@ enum CustomBtnId {
     BTN_STU_MIC_MUTE,
     BTN_STU_MUS_FADEIN,
     BTN_STU_MUS_FADEOUT,
+    BTN_STU_FX_TYPE,
+    BTN_STU_FX_DUR,
+    BTN_STU_FX_TO_PH,
     BTN_STU_ZOOM_IN,
     BTN_STU_ZOOM_OUT,
     BTN_STU_ZOOM_FIT,
@@ -138,7 +142,8 @@ enum CustomBtnId {
     BTN_MNT_DOWN_BASE     = 4000,
     BTN_MNT_DEL_BASE      = 5000,
     BTN_STU_ADD_CLIP_BASE = 6000,
-    BTN_STU_ADD_MUSIC_BASE = 7000
+    BTN_STU_ADD_MUSIC_BASE = 7000,
+    BTN_STU_ADD_FX_BASE   = 8000
 };
 
 inline Gdiplus::Color Gc(uint8_t r, uint8_t g, uint8_t b, uint8_t a = 255) {

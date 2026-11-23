@@ -27,6 +27,20 @@ struct MontageMusicTrackSpec {
     bool fadeOut = true;
 };
 
+enum class MontageTransitionType {
+    FadeBlack = 0,
+    FlashWhite = 1,
+    ZoomPunch = 2,
+    GlitchShake = 3,
+    SlideWipe = 4
+};
+
+struct MontageTransitionSpec {
+    MontageTransitionType type = MontageTransitionType::FlashWhite;
+    double timelineSec = 0.0;  // Center timestamp along the timeline
+    double durationSec = 0.50; // Total transition duration in seconds
+};
+
 struct ClipEditSpec {
     std::wstring srcPath;
     std::wstring dstPath;
@@ -59,6 +73,9 @@ struct ClipEditSpec {
 
     // Optional background music/SFX tracks (.mp3, .wav, .m4a, etc.) placed at timeline timestamps
     std::vector<MontageMusicTrackSpec> musicTracks;
+
+    // Optional placed transition/impact effects along the timeline
+    std::vector<MontageTransitionSpec> transitions;
 };
 
 /** Probes audio/media file duration in seconds. */

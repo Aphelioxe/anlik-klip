@@ -3,6 +3,7 @@
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include "clip_library.h"
+#include "clip_trimmer.h"
 #include "recorder_app.h"
 #include <atomic>
 #include <condition_variable>
@@ -256,6 +257,12 @@ private:
         std::vector<float> wavePeaks;
     };
 
+    struct StudioTransitionItem {
+        MontageTransitionType type = MontageTransitionType::FlashWhite;
+        double timelineSec = 0.0;
+        double durationSec = 0.45;
+    };
+
     class StudioMpCallback;
 
     std::vector<std::wstring> montagePaths_;
@@ -277,9 +284,11 @@ private:
     int studioTargetMb_ = 0;
     std::vector<StudioClipItem> studioClips_;
     std::vector<StudioMusicItem> studioMusic_;
+    std::vector<StudioTransitionItem> studioTransitions_;
     std::vector<std::wstring> studioRecentAudio_;
     int studioSelClip_ = -1;
     int studioSelMusic_ = -1;
+    int studioSelFx_ = -1;
 
     double studioPlayheadSec_ = 0.0;
     double studioTimelineScrollSec_ = 0.0;
@@ -320,6 +329,7 @@ private:
     int studioHoverClipSide_ = 0;  // -1=left, +1=right, 0=none
     int studioHoverMusicIdx_ = -1;
     int studioHoverMusicSide_ = 0; // -1=left, +1=right, 0=none
+    int studioHoverFxIdx_ = -1;
 
     void OpenStudio(bool loadQueued = true);
     void CloseStudio();
@@ -327,12 +337,14 @@ private:
     void UpdateStudioMetrics();
     double StudioTotalDuration() const;
     bool MapTimelineToClip(double tlSec, int& outIdx, double& outLocalSec, double& outClipStartSec) const;
+    int StudioHitTestTransition(int mx, int my, int cw, int ch) const;
     bool StudioHitTestTrimEdge(int mx, int my, int cw, int ch, int& outKind, int& outIdx, int& outSide, double& outAccSec) const;
     int StudioHitTestClipBody(int mx, int my, int cw, int ch) const;
     void StudioFitZoomToView(int cw, int ch);
     void StudioTrimClipEdgeToPlayhead(bool leftEdge);
     void StudioAddClipFromLibrary(size_t rawClipIdx);
     void StudioAddMusicFile(const std::wstring& audioPath = L"");
+    void StudioAddTransition(MontageTransitionType type);
     void StudioSplitAtPlayhead();
     void StudioDeleteSelection();
     void StudioMoveSelectedClip(int dir);

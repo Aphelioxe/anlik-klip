@@ -3686,7 +3686,7 @@ LRESULT MainWindow::OnMessage(UINT msg, WPARAM wParam, LPARAM lParam) {
                 if (studioOpen_ && activeTab_ == 1) {
                     if (studioDragMode_ == 2 || studioDragMode_ == 3 || studioDragMode_ == 5 || studioDragMode_ == 6) {
                         wantSizeWE = true;
-                    } else if ((studioDragMode_ == 10 && studioClipDragged_) || studioDragMode_ == 4) {
+                    } else if ((studioDragMode_ == 10 && studioClipDragged_) || studioDragMode_ == 4 || studioDragMode_ == 11) {
                         wantSizeAll = true;
                     } else if (studioDragMode_ == 0 && !trimBusy_) {
                         POINT pt{};
@@ -3694,11 +3694,15 @@ LRESULT MainWindow::OnMessage(UINT msg, WPARAM wParam, LPARAM lParam) {
                         ScreenToClient(hwnd_, &pt);
                         RECT cli{};
                         GetClientRect(hwnd_, &cli);
-                        int k = 0, idx = -1, side = 0;
-                        double acc = 0.0;
-                        wantSizeWE = StudioHitTestTrimEdge(pt.x, pt.y, cli.right, cli.bottom, k, idx, side, acc);
-                        if (!wantSizeWE) {
-                            wantSizeAll = (StudioHitTestClipBody(pt.x, pt.y, cli.right, cli.bottom) >= 0);
+                        if (StudioHitTestTransition(pt.x, pt.y, cli.right, cli.bottom) >= 0) {
+                            wantSizeAll = true;
+                        } else {
+                            int k = 0, idx = -1, side = 0;
+                            double acc = 0.0;
+                            wantSizeWE = StudioHitTestTrimEdge(pt.x, pt.y, cli.right, cli.bottom, k, idx, side, acc);
+                            if (!wantSizeWE) {
+                                wantSizeAll = (StudioHitTestClipBody(pt.x, pt.y, cli.right, cli.bottom) >= 0);
+                            }
                         }
                     }
                 } else if (activeTab_ == 0 && playerOpen_ && !playerFullscreen_ && !trimBusy_) {
@@ -3816,6 +3820,7 @@ LRESULT MainWindow::OnMessage(UINT msg, WPARAM wParam, LPARAM lParam) {
             studioHoverClipSide_ = 0;
             studioHoverMusicIdx_ = -1;
             studioHoverMusicSide_ = 0;
+            studioHoverFxIdx_ = -1;
             if (!draggingSeek_ && !draggingVol_ && draggingTrim_ == 0) pressedBtnId_ = 0;
             InvalidateRect(hwnd_, nullptr, FALSE);
             return 0;
@@ -4372,6 +4377,7 @@ LRESULT MainWindow::OnMessage(UINT msg, WPARAM wParam, LPARAM lParam) {
             studioClipDragged_ = false;
             studioDragOrigStarts_.clear();
             studioGapLastTickMs_ = 0;
+            studioHoverFxIdx_ = -1;
             pressedBtnId_ = 0;
             draggingSeek_ = false;
             draggingVol_ = false;
