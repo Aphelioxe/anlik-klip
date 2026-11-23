@@ -14,6 +14,7 @@ struct MontageSegmentSpec {
     double speed = 0.0;  // <= 0.0 uses ClipEditSpec::speed
     int gameVolPct = -1; // < 0 uses ClipEditSpec::gameVolPct
     int micVolPct = -1;  // < 0 uses ClipEditSpec::micVolPct
+    double timelineStartSec = -1.0; // < 0.0 appends seamlessly after previous segment
 };
 
 struct MontageMusicTrackSpec {

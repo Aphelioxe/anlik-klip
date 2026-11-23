@@ -231,6 +231,7 @@ private:
         std::wstring path;
         std::wstring name;
         double sourceDurSec = 0.0;
+        double timelineStartSec = 0.0;
         double trimStartSec = 0.0;
         double trimEndSec = 0.0;
         double speed = 1.0;
@@ -309,6 +310,9 @@ private:
     double studioDragOrigB_ = 0.0;
     double studioDragOrigC_ = 0.0;
     bool studioDragWasPlaying_ = false;
+    bool studioClipDragged_ = false;
+    std::vector<double> studioDragOrigStarts_;
+    ULONGLONG studioGapLastTickMs_ = 0;
     ULONGLONG studioLastScrubMs_ = 0;
     ULONGLONG studioIgnoreEndUntilMs_ = 0;
     bool studioSeekPending_ = false;
@@ -324,6 +328,7 @@ private:
     double StudioTotalDuration() const;
     bool MapTimelineToClip(double tlSec, int& outIdx, double& outLocalSec, double& outClipStartSec) const;
     bool StudioHitTestTrimEdge(int mx, int my, int cw, int ch, int& outKind, int& outIdx, int& outSide, double& outAccSec) const;
+    int StudioHitTestClipBody(int mx, int my, int cw, int ch) const;
     void StudioFitZoomToView(int cw, int ch);
     void StudioTrimClipEdgeToPlayhead(bool leftEdge);
     void StudioAddClipFromLibrary(size_t rawClipIdx);
@@ -334,6 +339,7 @@ private:
     void StudioCycleClipSpeed();
     void StudioTogglePlayPause();
     void StudioSeekTimeline(double targetSec, bool syncAudio = true);
+    void AdvancePastStudioClip(int curIdx);
     void SyncStudioMediaState(bool forceSeekVideo);
     void StartStudioWaveformWorker();
     void StopStudioWaveformWorker();

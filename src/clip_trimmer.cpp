@@ -513,6 +513,27 @@ void ApplyNv12FadeInSample(IMFSample* smp, uint32_t w, uint32_t h, float alpha) 
     }
 }
 
+bool CreateBlackNv12Sample(const std::vector<BYTE>& blackNv12, LONGLONG ts100, LONGLONG dur100,
+                           ComPtr<IMFSample>& outSmp) {
+    outSmp.Reset();
+    if (blackNv12.empty()) return false;
+    ComPtr<IMFMediaBuffer> buf;
+    const DWORD len = static_cast<DWORD>(blackNv12.size());
+    if (FAILED(MFCreateMemoryBuffer(len, buf.Put())) || !buf) return false;
+    BYTE* dst = nullptr;
+    if (FAILED(buf->Lock(&dst, nullptr, nullptr)) || !dst) return false;
+    memcpy(dst, blackNv12.data(), len);
+    buf->Unlock();
+    buf->SetCurrentLength(len);
+    ComPtr<IMFSample> smp;
+    if (FAILED(MFCreateSample(smp.Put())) || !smp) return false;
+    smp->AddBuffer(buf.Get());
+    smp->SetSampleTime(ts100);
+    smp->SetSampleDuration(dur100);
+    outSmp = smp;
+    return true;
+}
+
 struct SourceSegment {
     std::wstring path;
     double startSec = 0.0;
@@ -520,6 +541,7 @@ struct SourceSegment {
     double speed = 1.0;
     float gameGain = 1.0f;
     float micGain = 1.0f;
+    double timelineStartSec = -1.0;
 };
 
 } // namespace
@@ -1065,7 +1087,8 @@ bool EditMp4Clip(const ClipEditSpec& spec, std::string& outError,
                 double segSpd = (ms.speed > 0.05) ? std::max(0.5, std::min(2.0, ms.speed)) : defaultSpeed;
                 float segGame = (ms.gameVolPct >= 0) ? std::max(0.0f, std::min(2.0f, static_cast<float>(ms.gameVolPct) / 100.0f)) : defaultGameGain;
                 float segMic = (ms.micVolPct >= 0) ? std::max(0.0f, std::min(2.0f, static_cast<float>(ms.micVolPct) / 100.0f)) : defaultMicGain;
-                segments.push_back({ ms.path, s0, s1, segSpd, segGame, segMic });
+                double tlStart = (ms.timelineStartSec >= 0.0) ? ms.timelineStartSec : -1.0;
+                segments.push_back({ ms.path, s0, s1, segSpd, segGame, segMic, tlStart });
             }
         }
         if (segments.empty()) {
@@ -1176,8 +1199,13 @@ bool EditMp4Clip(const ClipEditSpec& spec, std::string& outError,
     double totalOutDurSec = 0.0;
     double minSegSpeed = 2.0;
     double maxSegSpeed = 0.5;
-    for (const auto& sg : segments) {
-        totalOutDurSec += std::max(0.0, sg.endSec - sg.startSec) / sg.speed;
+    for (auto& sg : segments) {
+        double outDur = std::max(0.0, sg.endSec - sg.startSec) / sg.speed;
+        if (sg.timelineStartSec >= 0.0) {
+            totalOutDurSec = std::max(totalOutDurSec, sg.timelineStartSec);
+        }
+        sg.timelineStartSec = totalOutDurSec;
+        totalOutDurSec += outDur;
         minSegSpeed = std::min(minSegSpeed, sg.speed);
         maxSegSpeed = std::max(maxSegSpeed, sg.speed);
     }
@@ -1405,9 +1433,66 @@ bool EditMp4Clip(const ClipEditSpec& spec, std::string& outError,
     std::vector<int16_t> outMixAccum, outGameAccum, outMicAccum;
     int64_t mixWrittenPairs = 0, gameWrittenPairs = 0, micWrittenPairs = 0;
 
+    std::vector<BYTE> blackNv12(static_cast<size_t>(outW) * outH * 3 / 2, 128);
+    {
+        BYTE blackY = (nomRange == MFNominalRange_0_255) ? 0 : 16;
+        memset(blackNv12.data(), blackY, static_cast<size_t>(outW) * outH);
+    }
+
     for (size_t segIdx = 0; segIdx < segments.size(); ++segIdx) {
         const auto& seg = segments[segIdx];
         if (cancelFlag && cancelFlag->load()) { aborted = true; break; }
+
+        // Fill any intentional timeline gap before this segment with black NV12 video + silent/music audio
+        const LONGLONG segStart100 = static_cast<LONGLONG>(std::llround(std::max(0.0, seg.timelineStartSec) * 1e7));
+        bool emittedGap = false;
+        while (true) {
+            if (cancelFlag && cancelFlag->load()) { aborted = true; break; }
+            LONGLONG gridTs = (outFrameIdx * 10000000LL * outFpsD) / outFpsN;
+            if (gridTs + (outFrameDur100 / 2) >= segStart100) break;
+            LONGLONG nextGridTs = ((outFrameIdx + 1) * 10000000LL * outFpsD) / outFpsN;
+            LONGLONG newDur = std::max<LONGLONG>(1, nextGridTs - gridTs);
+            ComPtr<IMFSample> blkSmp;
+            if (!CreateBlackNv12Sample(blackNv12, gridTs, newDur, blkSmp) ||
+                FAILED(sw->WriteSample(vOutIdx, blkSmp.Get()))) {
+                aborted = true;
+                break;
+            }
+            ++outFrameIdx;
+            ++vWritten;
+            emittedGap = true;
+
+            if (hasOutMix) {
+                constexpr size_t kSilentChunk = 16384;
+                const size_t targetGapPairs = static_cast<size_t>((nextGridTs * 48000LL) / 10000000LL);
+                const size_t curPairs = static_cast<size_t>(mixWrittenPairs) + (outMixAccum.size() / 2);
+                if (curPairs + kSilentChunk <= targetGapPairs) {
+                    outMixAccum.insert(outMixAccum.end(), kSilentChunk * 2, 0);
+                    if (hasOutGame) outGameAccum.insert(outGameAccum.end(), kSilentChunk * 2, 0);
+                    if (hasOutMic)  outMicAccum.insert(outMicAccum.end(), kSilentChunk * 2, 0);
+                    FlushMixPcmChunks(sw.Get(), aOutMix, outMixAccum, mixWrittenPairs, decodedMusic, false);
+                    if (hasOutGame) FlushPcmChunks(sw.Get(), aOutGame, outGameAccum, gameWrittenPairs, false);
+                    if (hasOutMic)  FlushPcmChunks(sw.Get(), aOutMic, outMicAccum, micWrittenPairs, false);
+                }
+            }
+        }
+        if (aborted) break;
+        if (emittedGap) {
+            outVBase100 = (outFrameIdx * 10000000LL * outFpsD) / outFpsN;
+            if (hasOutMix) {
+                const size_t targetGapPairs = static_cast<size_t>((outVBase100 * 48000LL) / 10000000LL);
+                const size_t curPairs = static_cast<size_t>(mixWrittenPairs) + (outMixAccum.size() / 2);
+                if (curPairs < targetGapPairs) {
+                    const size_t padPairs = targetGapPairs - curPairs;
+                    outMixAccum.insert(outMixAccum.end(), padPairs * 2, 0);
+                    if (hasOutGame) outGameAccum.insert(outGameAccum.end(), padPairs * 2, 0);
+                    if (hasOutMic)  outMicAccum.insert(outMicAccum.end(), padPairs * 2, 0);
+                    FlushMixPcmChunks(sw.Get(), aOutMix, outMixAccum, mixWrittenPairs, decodedMusic, false);
+                    if (hasOutGame) FlushPcmChunks(sw.Get(), aOutGame, outGameAccum, gameWrittenPairs, false);
+                    if (hasOutMic)  FlushPcmChunks(sw.Get(), aOutMic, outMicAccum, micWrittenPairs, false);
+                }
+            }
+        }
 
         ComPtr<IMFAttributes> rAttr;
         MFCreateAttributes(rAttr.Put(), 4);

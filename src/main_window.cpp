@@ -3682,9 +3682,12 @@ LRESULT MainWindow::OnMessage(UINT msg, WPARAM wParam, LPARAM lParam) {
         case WM_SETCURSOR: {
             if (LOWORD(lParam) == HTCLIENT) {
                 bool wantSizeWE = false;
+                bool wantSizeAll = false;
                 if (studioOpen_ && activeTab_ == 1) {
                     if (studioDragMode_ == 2 || studioDragMode_ == 3 || studioDragMode_ == 5 || studioDragMode_ == 6) {
                         wantSizeWE = true;
+                    } else if ((studioDragMode_ == 10 && studioClipDragged_) || studioDragMode_ == 4) {
+                        wantSizeAll = true;
                     } else if (studioDragMode_ == 0 && !trimBusy_) {
                         POINT pt{};
                         GetCursorPos(&pt);
@@ -3694,6 +3697,9 @@ LRESULT MainWindow::OnMessage(UINT msg, WPARAM wParam, LPARAM lParam) {
                         int k = 0, idx = -1, side = 0;
                         double acc = 0.0;
                         wantSizeWE = StudioHitTestTrimEdge(pt.x, pt.y, cli.right, cli.bottom, k, idx, side, acc);
+                        if (!wantSizeWE) {
+                            wantSizeAll = (StudioHitTestClipBody(pt.x, pt.y, cli.right, cli.bottom) >= 0);
+                        }
                     }
                 } else if (activeTab_ == 0 && playerOpen_ && !playerFullscreen_ && !trimBusy_) {
                     if (draggingTrim_ != 0) {
@@ -3707,6 +3713,10 @@ LRESULT MainWindow::OnMessage(UINT msg, WPARAM wParam, LPARAM lParam) {
                 }
                 if (wantSizeWE) {
                     SetCursor(LoadCursorW(nullptr, IDC_SIZEWE));
+                    return TRUE;
+                }
+                if (wantSizeAll) {
+                    SetCursor(LoadCursorW(nullptr, IDC_SIZEALL));
                     return TRUE;
                 }
             }
@@ -4359,6 +4369,9 @@ LRESULT MainWindow::OnMessage(UINT msg, WPARAM wParam, LPARAM lParam) {
 
         case WM_CAPTURECHANGED:
             studioDragMode_ = 0;
+            studioClipDragged_ = false;
+            studioDragOrigStarts_.clear();
+            studioGapLastTickMs_ = 0;
             pressedBtnId_ = 0;
             draggingSeek_ = false;
             draggingVol_ = false;
