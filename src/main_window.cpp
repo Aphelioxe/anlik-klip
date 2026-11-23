@@ -1,3 +1,4 @@
+#include "ui_gfx.h"
 #include "main_window.h"
 #include "clip_trimmer.h"
 #include "clip_uploader.h"
@@ -5,15 +6,6 @@
 #include "hotkey_engine.h"
 #include "qr_code.h"
 #include "sound_fx.h"
-
-#include <objidl.h>
-#include <gdiplus.h>
-#ifdef min
-#undef min
-#endif
-#ifdef max
-#undef max
-#endif
 
 #include <commctrl.h>
 #include <mfapi.h>
@@ -33,23 +25,14 @@
 
 namespace {
 
+using namespace ui;
+
 constexpr COLORREF kRgbBg      = RGB(9, 12, 19);
 constexpr COLORREF kRgbCard    = RGB(16, 21, 33);
 constexpr COLORREF kRgbInput   = RGB(24, 31, 48);
 constexpr COLORREF kRgbBorder  = RGB(42, 54, 78);
 constexpr COLORREF kRgbText    = RGB(238, 242, 248);
 constexpr COLORREF kRgbMuted   = RGB(148, 160, 180);
-
-constexpr UINT_PTR TIMER_PLAYER_ID    = 2;
-constexpr UINT_PTR TIMER_MIC_METER_ID = 3;
-constexpr UINT_PTR TIMER_UI_ANIM_ID   = 4;
-constexpr UINT WM_MW_THUMB_READY      = WM_APP + 20;
-constexpr UINT WM_MW_PLAYER_EVENT     = WM_APP + 21;
-constexpr UINT WM_MW_TRIM_DONE        = WM_APP + 22;
-constexpr UINT WM_MW_UPLOAD_PROGRESS  = WM_APP + 24;
-constexpr UINT WM_MW_UPLOAD_DONE      = WM_APP + 25;
-constexpr UINT WM_MW_WAVE_READY       = WM_APP + 26;
-constexpr UINT WM_MW_SCRUB_READY      = WM_APP + 27;
 
 struct WaveReadyMsg {
     uint64_t gen = 0;
@@ -63,38 +46,6 @@ struct ScrubReadyMsg {
     HBITMAP bmp = nullptr;
 };
 
-inline Gdiplus::Color Gc(uint8_t r, uint8_t g, uint8_t b, uint8_t a = 255) {
-    return Gdiplus::Color(a, r, g, b);
-}
-
-void AddRoundedRect(Gdiplus::GraphicsPath& path, float x, float y, float w, float h, float r) {
-    float d = r * 2.0f;
-    if (d > w) d = w;
-    if (d > h) d = h;
-    path.Reset();
-    path.AddArc(x, y, d, d, 180.0f, 90.0f);
-    path.AddArc(x + w - d, y, d, d, 270.0f, 90.0f);
-    path.AddArc(x + w - d, y + h - d, d, d, 0.0f, 90.0f);
-    path.AddArc(x, y + h - d, d, d, 90.0f, 90.0f);
-    path.CloseFigure();
-}
-
-void FillRoundRect(Gdiplus::Graphics& g, float x, float y, float w, float h, float r, Gdiplus::Color fill) {
-    Gdiplus::GraphicsPath path;
-    AddRoundedRect(path, x, y, w, h, r);
-    Gdiplus::SolidBrush br(fill);
-    g.FillPath(&br, &path);
-}
-
-void FillRoundRectGrad(Gdiplus::Graphics& g, float x, float y, float w, float h, float r,
-                       Gdiplus::Color cTop, Gdiplus::Color cBot) {
-    Gdiplus::GraphicsPath path;
-    AddRoundedRect(path, x, y, w, h, r);
-    Gdiplus::LinearGradientBrush br(
-        Gdiplus::PointF(x, y), Gdiplus::PointF(x, y + std::max(1.0f, h)), cTop, cBot);
-    g.FillPath(&br, &path);
-}
-
 std::wstring ExtractGameTagFromName(const std::wstring& fileName) {
     size_t us = fileName.find(L'_');
     if (us == std::wstring::npos || us <= 1 || us > 20) return L"";
@@ -102,87 +53,6 @@ std::wstring ExtractGameTagFromName(const std::wstring& fileName) {
     if (_wcsicmp(prefix.c_str(), L"Klip") == 0) return L"";
     return prefix;
 }
-
-void StrokeRoundRect(Gdiplus::Graphics& g, float x, float y, float w, float h, float r, Gdiplus::Color col, float width = 1.0f) {
-    Gdiplus::GraphicsPath path;
-    AddRoundedRect(path, x, y, w, h, r);
-    Gdiplus::Pen pen(col, width);
-    g.DrawPath(&pen, &path);
-}
-
-enum CustomBtnId {
-    BTN_TAB_CLIPS = 1,
-    BTN_TAB_MONTAGE,
-    BTN_TAB_SETTINGS,
-    BTN_SIDE_SAVE,
-    BTN_SIDE_TOGGLE,
-    BTN_SIDE_MIC,
-    BTN_TOP_FAV_FILTER,
-    BTN_TOP_CLEAR_SEARCH,
-    BTN_TOP_FOLDER,
-    BTN_TOP_REFRESH,
-    BTN_CLIP_PLAY,
-    BTN_CLIP_FAV,
-    BTN_CLIP_SHARE,
-    BTN_CLIP_COPY_LINK,
-    BTN_CLIP_OPEN_LINK,
-    BTN_CLIP_RENAME,
-    BTN_CLIP_REVEAL,
-    BTN_CLIP_DELETE,
-    BTN_SET_720P,
-    BTN_SET_1080P,
-
-    // Player & Trim controls
-    BTN_PLY_BACK = 50,
-    BTN_PLY_FAV,
-    BTN_PLY_SHARE,
-    BTN_PLY_RENAME,
-    BTN_PLY_FOLDER,
-    BTN_PLY_DELETE,
-    BTN_PLY_PLAYPAUSE,
-    BTN_PLY_MINUS5,
-    BTN_PLY_PLUS5,
-    BTN_PLY_RESTART,
-    BTN_PLY_RATE,
-    BTN_PLY_TRIM,
-    BTN_PLY_MUTE,
-    BTN_PLY_FULLSCREEN,
-    BTN_PLY_EXTERNAL,
-    BTN_TRIM_SET_START,
-    BTN_TRIM_SET_END,
-    BTN_EDIT_CUT_TOGGLE,
-    BTN_EDIT_SPEED,
-    BTN_EDIT_ADD_CLIP,
-    BTN_EDIT_GAME_MUTE,
-    BTN_EDIT_MIC_MUTE,
-    BTN_EDIT_VERTICAL,
-    BTN_EDIT_DISCORD10,
-    BTN_EDIT_DISCORD25,
-    BTN_TRIM_SAVE_COPY,
-    BTN_TRIM_REPLACE,
-    BTN_TRIM_CANCEL,
-    BTN_CMB_DURATION,
-    BTN_CMB_RESFPS,
-    BTN_CMB_BITRATE,
-    BTN_CMB_MIC_DEV,
-
-    // Montage tab controls
-    BTN_MNT_CLEAR = 100,
-    BTN_MNT_FADE,
-    BTN_MNT_V916,
-    BTN_MNT_SPEED,
-    BTN_MNT_GAME_MUTE,
-    BTN_MNT_MIC_MUTE,
-    BTN_MNT_EXPORT_NORMAL,
-    BTN_MNT_EXPORT_DISC10,
-    BTN_MNT_EXPORT_DISC25,
-    BTN_MNT_CANCEL,
-
-    BTN_MNT_ADD_BASE  = 2000,
-    BTN_MNT_UP_BASE   = 3000,
-    BTN_MNT_DOWN_BASE = 4000,
-    BTN_MNT_DEL_BASE  = 5000
-};
 
 enum NativeCtrlId {
     ID_EDT_SEARCH = 2999,
@@ -217,14 +87,6 @@ enum NativeCtrlId {
     ID_CTX_RENAME,
     ID_CTX_REVEAL,
     ID_CTX_DELETE
-};
-
-struct TrimDoneMsg {
-    bool ok = false;
-    bool replaceOriginal = false;
-    std::wstring origPath;
-    std::wstring outPath;
-    std::wstring message;
 };
 
 void DrawStarPolygon(Gdiplus::Graphics& g, float cx, float cy, float rOut, float rIn, bool filled) {
@@ -509,6 +371,7 @@ MainWindow::MainWindow(HINSTANCE hInst, RecorderApp& app, HotkeyEngine& hotkeys,
 MainWindow::~MainWindow() {
     StopTrimWorker();
     StopUploadWorker();
+    CloseStudio();
     CloseEmbeddedPlayer();
     StopThumbnailWorker();
     ClearThumbnails();
@@ -622,10 +485,10 @@ void MainWindow::UpdateLayoutForSize(int cw, int ch) {
     const int newSox = std::max(0, (cw - S(220) - S(700)) / 2);
     const int dx = newSox - settingsOffsetX_;
     if (dx != 0) {
-        struct ShiftCtx { int dx; HWND edtSearch; HWND videoHwnd; } sc{ dx, edtSearch_, videoHwnd_ };
+        struct ShiftCtx { int dx; HWND edtSearch; HWND videoHwnd; HWND studioVideoHwnd; } sc{ dx, edtSearch_, videoHwnd_, studioVideoHwnd_ };
         EnumChildWindows(hwnd_, [](HWND child, LPARAM lp) -> BOOL {
             auto* s = reinterpret_cast<ShiftCtx*>(lp);
-            if (child == s->edtSearch || child == s->videoHwnd) return TRUE;
+            if (child == s->edtSearch || child == s->videoHwnd || child == s->studioVideoHwnd) return TRUE;
             RECT rc{};
             if (GetWindowRect(child, &rc)) {
                 HWND parent = GetParent(child);
@@ -665,6 +528,7 @@ void MainWindow::UpdateLayoutForSize(int cw, int ch) {
         }
         if (player_) player_->UpdateVideo();
     }
+    if (studioOpen_) UpdateStudioLayout(cw, ch);
     ClampScroll();
 }
 
@@ -737,6 +601,8 @@ bool MainWindow::HandlePreTranslateMessage(const MSG& msg) {
         if (hwnd_) InvalidateRect(hwnd_, nullptr, FALSE);
         return true;
     }
+
+    if (HandleStudioPreTranslate(msg)) return true;
 
     // Embedded player keyboard shortcuts
     if (activeTab_ == 0 && playerOpen_ && !trimBusy_ && msg.message == WM_KEYDOWN) {
@@ -887,12 +753,15 @@ void MainWindow::CreateControls() {
 
 void MainWindow::UpdateGalleryControlVisibility() {
     if (edtSearch_) {
-        ShowWindow(edtSearch_, (activeTab_ == 0 && !playerOpen_) ? SW_SHOW : SW_HIDE);
+        ShowWindow(edtSearch_, (activeTab_ == 0 && !playerOpen_ && !studioOpen_) ? SW_SHOW : SW_HIDE);
     }
 }
 
 void MainWindow::SwitchTab(int tabIndex) {
     int nextTab = std::max(0, std::min(2, tabIndex));
+    if (nextTab != 1 && studioOpen_) {
+        CloseStudio();
+    }
     if (nextTab != 0 && playerOpen_) {
         CloseEmbeddedPlayer();
     }
@@ -2373,6 +2242,9 @@ void MainWindow::PaintWindow(HDC targetDc) {
         g.SetTextRenderingHint(Gdiplus::TextRenderingHintClearTypeGridFit);
         g.SetPixelOffsetMode(Gdiplus::PixelOffsetModeHalf);
 
+        if (activeTab_ == 1 && studioOpen_) {
+            PaintStudio(&g, cw, ch);
+        } else {
         g.Clear(Gc(9, 12, 19));
 
         // Ambient radial/gradient glow orbs (vibrant modern backdrop)
@@ -3224,155 +3096,8 @@ void MainWindow::PaintWindow(HDC targetDc) {
             g.ResetTransform();
             g.ResetClip();
         } else if (activeTab_ == 1) {
-            // ================= TAB 1: MONTAJ =================
-            g.DrawString(L"Klip Montajı", -1, &fTitle,
-                Gdiplus::RectF((float)S(242), (float)S(14), (float)S(260), (float)S(28)), &sfLeft, &brText);
-            g.DrawString(L"Klipleri sırayla birleştirin, karartma geçişi, hız, 9:16 dikey ve Discord boyut seçeneklerini uygulayın.", -1, &fSmall,
-                Gdiplus::RectF((float)S(242), (float)S(42), (float)std::max(S(300), cw - S(266)), (float)S(18)), &sfLeft, &brMuted);
-
-            const int colGap = S(16);
-            const int bodyW = std::max(S(640), cw - S(264));
-            const int leftW = (bodyW - colGap) / 2;
-            const int rightX = S(242) + leftW + colGap;
-            const int rightW = bodyW - leftW - colGap;
-            const int listTop = S(70);
-            const int listH = std::max(S(240), ch - S(300));
-
-            // Left Card: Clip Library
-            FillRoundRect(g, (float)S(242), (float)listTop, (float)leftW, (float)listH, (float)S(12), Gc(16, 21, 33));
-            StrokeRoundRect(g, (float)S(242), (float)listTop, (float)leftW, (float)listH, (float)S(12), Gc(44, 56, 80));
-            g.DrawString(L"Kliplerim (Sıraya Ekle)", -1, &fBold,
-                Gdiplus::RectF((float)S(256), (float)(listTop + S(10)), (float)(leftW - S(28)), (float)S(22)), &sfLeft, &brBlueTxt);
-
-            const int rowH = S(40);
-            const int rowStartY = listTop + S(38);
-            const int maxVisLib = std::max(1, (listH - S(46)) / rowH);
-            const int maxLibSc = std::max(0, static_cast<int>(clips_.size()) - maxVisLib);
-            montageLibScroll_ = std::max(0, std::min(montageLibScroll_, maxLibSc));
-
-            for (int vi = 0; vi < maxVisLib; ++vi) {
-                int ci = montageLibScroll_ + vi;
-                if (ci >= static_cast<int>(clips_.size())) break;
-                const auto& c = clips_[static_cast<size_t>(ci)];
-                int ry = rowStartY + vi * rowH;
-                FillRoundRect(g, (float)S(252), (float)ry, (float)(leftW - S(20)), (float)(rowH - S(5)), (float)S(8), Gc(22, 29, 45));
-                wchar_t meta[64] = {};
-                swprintf(meta, 64, L"%.1f sn • %.1f MB", c.durationSeconds, static_cast<double>(c.fileSizeBytes) / (1024.0 * 1024.0));
-                g.DrawString(c.fileName.c_str(), -1, &fSmall,
-                    Gdiplus::RectF((float)S(260), (float)(ry + S(3)), (float)(leftW - S(94)), (float)S(16)), &sfLeft, &brText);
-                g.DrawString(meta, -1, &fSmall,
-                    Gdiplus::RectF((float)S(260), (float)(ry + S(18)), (float)(leftW - S(94)), (float)S(14)), &sfLeft, &brMuted);
-                addBtnPx(BTN_MNT_ADD_BASE + ci, S(242) + leftW - S(72), ry + S(5), S(54), S(25), L"+ Ekle",
-                    Gc(37, 99, 235), Gc(59, 130, 246), Gc(96, 165, 250), !trimBusy_ && ci < 900);
-            }
-
-            // Right Card: Montage Queue
-            FillRoundRect(g, (float)rightX, (float)listTop, (float)rightW, (float)listH, (float)S(12), Gc(16, 21, 33));
-            StrokeRoundRect(g, (float)rightX, (float)listTop, (float)rightW, (float)listH, (float)S(12), Gc(59, 130, 246, 110));
-
-            double totalMntSec = 0.0;
-            for (const auto& mp : montagePaths_) {
-                for (const auto& c : clips_) {
-                    if (_wcsicmp(c.filePath.c_str(), mp.c_str()) == 0) {
-                        totalMntSec += c.durationSeconds;
-                        break;
-                    }
-                }
-            }
-            wchar_t qHdr[96] = {};
-            swprintf(qHdr, 96, L"Montaj Sırası (%zu klip • %.1f sn)", montagePaths_.size(), totalMntSec / montageSpeed_);
-            g.DrawString(qHdr, -1, &fBold,
-                Gdiplus::RectF((float)(rightX + S(14)), (float)(listTop + S(10)), (float)(rightW - S(100)), (float)S(22)), &sfLeft, &brBlueTxt);
-            addBtnPx(BTN_MNT_CLEAR, rightX + rightW - S(78), listTop + S(8), S(64), S(24), L"Temizle",
-                Gc(45, 55, 75), Gc(65, 80, 108), Gc(90, 110, 140), !trimBusy_ && !montagePaths_.empty());
-
-            if (montagePaths_.empty()) {
-                g.DrawString(L"Soldan '+ Ekle' ile en az 2 klip ekleyin.", -1, &fSmall,
-                    Gdiplus::RectF((float)(rightX + S(16)), (float)(listTop + S(52)), (float)(rightW - S(32)), (float)S(24)), &sfLeft, &brMuted);
-            } else {
-                const int maxVisQ = std::max(1, (listH - S(46)) / rowH);
-                const int maxQSc = std::max(0, static_cast<int>(montagePaths_.size()) - maxVisQ);
-                montageQueueScroll_ = std::max(0, std::min(montageQueueScroll_, maxQSc));
-                for (int vi = 0; vi < maxVisQ; ++vi) {
-                    int qi = montageQueueScroll_ + vi;
-                    if (qi >= static_cast<int>(montagePaths_.size())) break;
-                    const std::wstring& qp = montagePaths_[static_cast<size_t>(qi)];
-                    size_t sl = qp.find_last_of(L"\\/");
-                    std::wstring qName = (sl != std::wstring::npos) ? qp.substr(sl + 1) : qp;
-                    double qDur = 0.0;
-                    for (const auto& c : clips_) {
-                        if (_wcsicmp(c.filePath.c_str(), qp.c_str()) == 0) { qDur = c.durationSeconds; break; }
-                    }
-                    int ry = rowStartY + vi * rowH;
-                    FillRoundRect(g, (float)(rightX + S(10)), (float)ry, (float)(rightW - S(20)), (float)(rowH - S(5)), (float)S(8), Gc(22, 29, 45));
-                    wchar_t qLine[256] = {};
-                    swprintf(qLine, 256, L"#%d  %s", qi + 1, qName.c_str());
-                    g.DrawString(qLine, -1, &fSmall,
-                        Gdiplus::RectF((float)(rightX + S(18)), (float)(ry + S(3)), (float)(rightW - S(124)), (float)S(16)), &sfLeft, &brText);
-                    wchar_t qMeta[48] = {};
-                    swprintf(qMeta, 48, L"%.1f sn", qDur);
-                    g.DrawString(qMeta, -1, &fSmall,
-                        Gdiplus::RectF((float)(rightX + S(18)), (float)(ry + S(18)), (float)(rightW - S(124)), (float)S(14)), &sfLeft, &brMuted);
-
-                    int bx = rightX + rightW - S(104);
-                    addBtnPx(BTN_MNT_UP_BASE + qi, bx, ry + S(5), S(26), S(25), L"↑",
-                        Gc(34, 42, 58), Gc(50, 62, 86), Gc(70, 86, 116), !trimBusy_ && qi > 0);
-                    addBtnPx(BTN_MNT_DOWN_BASE + qi, bx + S(30), ry + S(5), S(26), S(25), L"↓",
-                        Gc(34, 42, 58), Gc(50, 62, 86), Gc(70, 86, 116), !trimBusy_ && (qi + 1 < static_cast<int>(montagePaths_.size())));
-                    addBtnPx(BTN_MNT_DEL_BASE + qi, bx + S(60), ry + S(5), S(26), S(25), L"×",
-                        Gc(127, 29, 29), Gc(185, 28, 28), Gc(220, 38, 38), !trimBusy_);
-                }
-            }
-
-            // Bottom Card: Options & Export
-            const int optY = listTop + listH + S(12);
-            const int optH = S(142);
-            FillRoundRect(g, (float)S(242), (float)optY, (float)bodyW, (float)optH, (float)S(12), Gc(16, 21, 33));
-            StrokeRoundRect(g, (float)S(242), (float)optY, (float)bodyW, (float)optH, (float)S(12), Gc(44, 56, 80));
-
-            g.DrawString(L"Montaj Ayarları ve Dışa Aktarma", -1, &fBold,
-                Gdiplus::RectF((float)S(256), (float)(optY + S(10)), (float)S(260), (float)S(20)), &sfLeft, &brBlueTxt);
-
-            const int r1Y = optY + S(38);
-            addBtnPx(BTN_MNT_FADE, S(256), r1Y, S(162), S(28),
-                montageFade_ ? L"Geçiş: Karartma (0.35s)" : L"Geçiş: Keskin",
-                montageFade_ ? Gc(37, 99, 235) : Gc(34, 42, 58),
-                montageFade_ ? Gc(59, 130, 246) : Gc(50, 62, 86), Gc(96, 165, 250), !trimBusy_);
-            addBtnPx(BTN_MNT_V916, S(426), r1Y, S(124), S(28),
-                montageVertical916_ ? L"9:16 Dikey: Açık" : L"9:16 Dikey: Kapalı",
-                montageVertical916_ ? Gc(124, 58, 237) : Gc(34, 42, 58),
-                montageVertical916_ ? Gc(139, 92, 246) : Gc(50, 62, 86), Gc(167, 139, 250), !trimBusy_);
-            wchar_t spdBuf[32] = {};
-            swprintf(spdBuf, 32, L"Hız: %.1fx", montageSpeed_);
-            addBtnPx(BTN_MNT_SPEED, S(558), r1Y, S(94), S(28), spdBuf,
-                Gc(34, 42, 58), Gc(50, 62, 86), Gc(70, 86, 116), !trimBusy_);
-            addBtnPx(BTN_MNT_GAME_MUTE, S(660), r1Y, S(110), S(28),
-                montageGameMuted_ ? L"Oyun: Sustu" : L"Oyun: Açık",
-                montageGameMuted_ ? Gc(153, 27, 27) : Gc(34, 42, 58),
-                montageGameMuted_ ? Gc(185, 28, 28) : Gc(50, 62, 86), Gc(248, 113, 113), !trimBusy_);
-            addBtnPx(BTN_MNT_MIC_MUTE, S(778), r1Y, S(104), S(28),
-                montageMicMuted_ ? L"Mic: Sustu" : L"Mic: Açık",
-                montageMicMuted_ ? Gc(153, 27, 27) : Gc(34, 42, 58),
-                montageMicMuted_ ? Gc(185, 28, 28) : Gc(50, 62, 86), Gc(248, 113, 113), !trimBusy_);
-
-            const int r2Y = optY + S(78);
-            const bool canExportMnt = !trimBusy_ && !montagePaths_.empty();
-            addBtnPx(BTN_MNT_EXPORT_NORMAL, S(256), r2Y, S(156), S(32), L"Montajı Oluştur",
-                Gc(16, 185, 129), Gc(5, 150, 105), Gc(52, 211, 153), canExportMnt);
-            addBtnPx(BTN_MNT_EXPORT_DISC10, S(420), r2Y, S(132), S(32), L"Discord ≤10 MB",
-                Gc(88, 101, 242), Gc(104, 117, 248), Gc(165, 180, 252), canExportMnt);
-            addBtnPx(BTN_MNT_EXPORT_DISC25, S(560), r2Y, S(132), S(32), L"Discord ≤25 MB",
-                Gc(67, 56, 202), Gc(79, 70, 229), Gc(165, 180, 252), canExportMnt);
-            if (trimBusy_) {
-                addBtnPx(BTN_MNT_CANCEL, S(700), r2Y, S(96), S(32), L"İptal",
-                    Gc(153, 27, 27), Gc(185, 28, 28), Gc(248, 113, 113), true);
-                Gdiplus::SolidBrush brBusy(Gc(110, 231, 183));
-                g.DrawString(L"Montaj işleniyor, lütfen bekleyin...", -1, &fBold,
-                    Gdiplus::RectF((float)S(256), (float)(optY + S(114)), (float)(bodyW - S(28)), (float)S(20)), &sfLeft, &brBusy);
-            } else {
-                g.DrawString(footerMsg_.c_str(), -1, &fSmall,
-                    Gdiplus::RectF((float)S(256), (float)(optY + S(116)), (float)(bodyW - S(28)), (float)S(18)), &sfLeft, &brMuted);
-            }
+            // ================= TAB 1: MONTAJ & STUDIO LANDING =================
+            PaintMontajLanding(&g, cw, ch);
         } else {
             // ================= TAB 2: AYARLAR =================
             const int sox = settingsOffsetX_;
@@ -3508,6 +3233,7 @@ void MainWindow::PaintWindow(HDC targetDc) {
             g.ResetTransform();
             g.ResetClip();
         }
+        }
     }
 
     BitBlt(targetDc, 0, 0, cw, ch, memDc, 0, 0, SRCCOPY);
@@ -3559,7 +3285,8 @@ LRESULT MainWindow::OnMessage(UINT msg, WPARAM wParam, LPARAM lParam) {
 
         case WM_TIMER:
             if (wParam == TIMER_PLAYER_ID) {
-                UpdatePlayerMetrics();
+                if (studioOpen_) UpdateStudioMetrics();
+                else UpdatePlayerMetrics();
             } else if (wParam == TIMER_MIC_METER_ID && activeTab_ == 2) {
                 RECT mrc{ S(590) + settingsOffsetX_, S(220), S(892) + settingsOffsetX_, S(245) };
                 InvalidateRect(hwnd_, &mrc, FALSE);
@@ -3601,7 +3328,7 @@ LRESULT MainWindow::OnMessage(UINT msg, WPARAM wParam, LPARAM lParam) {
                 if (!fastTick) {
                     if (hwnd_) SetTimer(hwnd_, TIMER_UI_ANIM_ID, 48, nullptr);
                     animPhase_ += 0.16;
-                    if (hwnd_ && !playerFullscreen_) {
+                    if (hwnd_ && !playerFullscreen_ && !studioOpen_) {
                         RECT sidePulseRc{ S(14), S(68), S(208), S(104) };
                         InvalidateRect(hwnd_, &sidePulseRc, FALSE);
                     }
@@ -3642,6 +3369,7 @@ LRESULT MainWindow::OnMessage(UINT msg, WPARAM wParam, LPARAM lParam) {
                         SetFooterMessage(L"Klip kırpıldı ve ana klip güncellendi (eski kopya çöp kutusunda).");
                     } else {
                         if (activeTab_ == 1) {
+                            if (studioOpen_) CloseStudio();
                             montagePaths_.clear();
                             SwitchTab(0);
                         }
@@ -3659,6 +3387,11 @@ LRESULT MainWindow::OnMessage(UINT msg, WPARAM wParam, LPARAM lParam) {
                     if (tm->replaceOriginal) DeleteFileW(tm->outPath.c_str());
                     std::wstring msg = tm->message;
                     if (activeTab_ == 1) {
+                        if (studioOpen_) {
+                            RECT cli{}; GetClientRect(hwnd_, &cli);
+                            UpdateStudioLayout(cli.right, cli.bottom);
+                            SyncStudioMediaState(true);
+                        }
                         SetFooterMessage(msg);
                     } else {
                         double savedStart = trimStartSec_, savedEnd = trimEndSec_;
@@ -3978,6 +3711,7 @@ LRESULT MainWindow::OnMessage(UINT msg, WPARAM wParam, LPARAM lParam) {
             }
             int mx = static_cast<short>(LOWORD(lParam));
             int my = static_cast<short>(HIWORD(lParam));
+            if (studioOpen_ && OnStudioMouseMove(mx, my)) return 0;
             if (draggingTrim_ != 0 && playerOpen_ && !trimBusy_) {
                 RECT sk = GetSeekBarRect();
                 double ratio = static_cast<double>(mx - sk.left) / std::max(1L, sk.right - sk.left);
@@ -4063,6 +3797,13 @@ LRESULT MainWindow::OnMessage(UINT msg, WPARAM wParam, LPARAM lParam) {
             return 0;
 
         case WM_MOUSEWHEEL:
+            if (studioOpen_) {
+                POINT pt{ static_cast<short>(LOWORD(lParam)), static_cast<short>(HIWORD(lParam)) };
+                ScreenToClient(hwnd_, &pt);
+                int delta = GET_WHEEL_DELTA_WPARAM(wParam);
+                bool ctrl = (GetKeyState(VK_CONTROL) & 0x8000) != 0;
+                if (OnStudioMouseWheel(pt.x, pt.y, delta, ctrl)) return 0;
+            }
             if (activeTab_ == 0 && !playerOpen_ && maxScrollY_ > 0) {
                 int delta = GET_WHEEL_DELTA_WPARAM(wParam);
                 scrollY_ -= (delta / WHEEL_DELTA) * S(68);
@@ -4088,6 +3829,8 @@ LRESULT MainWindow::OnMessage(UINT msg, WPARAM wParam, LPARAM lParam) {
         case WM_LBUTTONDOWN: {
             int mx = static_cast<short>(LOWORD(lParam));
             int my = static_cast<short>(HIWORD(lParam));
+
+            if (studioOpen_ && OnStudioLButtonDown(mx, my)) return 0;
 
             if (activeTab_ == 0 && playerOpen_ && !trimBusy_) {
                 int th = HitTestTrimHandle(mx, my);
@@ -4165,6 +3908,7 @@ LRESULT MainWindow::OnMessage(UINT msg, WPARAM wParam, LPARAM lParam) {
         case WM_LBUTTONUP: {
             int mx = static_cast<short>(LOWORD(lParam));
             int my = static_cast<short>(HIWORD(lParam));
+            if (studioOpen_ && OnStudioLButtonUp(mx, my)) return 0;
             if (draggingTrim_ != 0) {
                 int which = draggingTrim_;
                 draggingTrim_ = 0;
@@ -4228,6 +3972,7 @@ LRESULT MainWindow::OnMessage(UINT msg, WPARAM wParam, LPARAM lParam) {
                             RefreshClips();
                             break;
                         case BTN_TAB_SETTINGS: SwitchTab(2); break;
+                        case BTN_MNT_OPEN_STUDIO: OpenStudio(true); break;
                         case BTN_MNT_CLEAR:
                             if (!trimBusy_) montagePaths_.clear();
                             break;
@@ -4472,6 +4217,7 @@ LRESULT MainWindow::OnMessage(UINT msg, WPARAM wParam, LPARAM lParam) {
         case WM_COMMAND: {
             int id = LOWORD(wParam);
             int code = HIWORD(wParam);
+            if (studioOpen_ && code == 0 && OnStudioButtonClick(id)) return 0;
             if (id == ID_EDT_SEARCH && code == EN_CHANGE && edtSearch_) {
                 wchar_t sbuf[256] = {};
                 GetWindowTextW(edtSearch_, sbuf, 256);
@@ -4600,6 +4346,7 @@ LRESULT MainWindow::OnMessage(UINT msg, WPARAM wParam, LPARAM lParam) {
         case WM_CLOSE:
             captureHotkeyMode_ = 0;
             hotkeys_.SetPaused(false);
+            CloseStudio();
             CloseEmbeddedPlayer();
             if (cb_.onClosed) cb_.onClosed();
             return 0;
@@ -4607,6 +4354,12 @@ LRESULT MainWindow::OnMessage(UINT msg, WPARAM wParam, LPARAM lParam) {
         case WM_NCDESTROY:
             FreeBackbuffer();
             return 0;
+
+        default: {
+            LRESULT sr = 0;
+            if (HandleStudioAppMessage(msg, wParam, lParam, sr)) return sr;
+            break;
+        }
     }
     return DefWindowProcW(hwnd_, msg, wParam, lParam);
 }

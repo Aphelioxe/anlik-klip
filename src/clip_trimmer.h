@@ -11,6 +11,19 @@ struct MontageSegmentSpec {
     std::wstring path;
     double startSec = 0.0;
     double endSec = 0.0; // <= 0.0 means full clip duration
+    double speed = 0.0;  // <= 0.0 uses ClipEditSpec::speed
+    int gameVolPct = -1; // < 0 uses ClipEditSpec::gameVolPct
+    int micVolPct = -1;  // < 0 uses ClipEditSpec::micVolPct
+};
+
+struct MontageMusicTrackSpec {
+    std::wstring path;            // .mp3 / .wav / .m4a / .aac
+    double timelineStartSec = 0.0;// start position on the montage timeline
+    double trimStartSec = 0.0;    // offset inside the audio file
+    double durationSec = 0.0;     // <= 0.0 plays full remaining duration
+    int volPct = 100;             // 0 .. 200%
+    bool fadeIn = true;
+    bool fadeOut = true;
 };
 
 struct ClipEditSpec {
@@ -42,7 +55,16 @@ struct ClipEditSpec {
 
     // Optional 0.35s fade-to-black & audio smooth transitions between montage clips
     bool fadeTransitions = false;
+
+    // Optional background music/SFX tracks (.mp3, .wav, .m4a, etc.) placed at timeline timestamps
+    std::vector<MontageMusicTrackSpec> musicTracks;
 };
+
+/** Probes audio/media file duration in seconds. */
+bool ProbeAudioFileDuration(const std::wstring& path, double& outDurSec);
+
+/** Extracts normalized [0..1] audio peak/RMS buckets from a video or audio file. */
+bool ExtractAudioWaveform(const std::wstring& path, int trackChoice, int numBuckets, std::vector<float>& outPeaks);
 
 /** Returns a non-colliding copy path alongside srcPath (e.g. "Clip_kesit.mp4"). */
 std::wstring BuildTrimmedCopyPath(const std::wstring& srcPath);

@@ -22,12 +22,6 @@ bool EndsWithMp4(const std::wstring& s) {
     return s.size() > 4 && _wcsicmp(s.c_str() + s.size() - 4, L".mp4") == 0;
 }
 
-inline float SoftClipSample(float x) {
-    if (x > 1.0f) return 1.0f - std::exp(-(x - 1.0f)) * 0.25f > 1.0f ? 1.0f : 1.0f;
-    if (x < -1.0f) return -1.0f;
-    return x;
-}
-
 inline int16_t FloatToPcm16(float v) {
     if (v > 1.0f) v = 1.0f;
     if (v < -1.0f) v = -1.0f;
@@ -334,10 +328,178 @@ void AppendResampledPcm(const std::vector<int16_t>& srcPcm, double speed, float 
     }
 }
 
+struct DecodedMusicTrack {
+    size_t startPair = 0;
+    std::vector<int16_t> pcm; // stereo 48kHz interleaved (L, R)
+};
+
+bool FlushMixPcmChunks(IMFSinkWriter* sw, DWORD audioStream, std::vector<int16_t>& pcmAccum,
+                       int64_t& writtenPairs, const std::vector<DecodedMusicTrack>& music, bool flushTail) {
+    while (pcmAccum.size() >= 2048 || (flushTail && pcmAccum.size() >= 2)) {
+        const size_t availPairs = pcmAccum.size() / 2;
+        const size_t takePairs = std::min<size_t>(1024, availPairs);
+        const DWORD cb = static_cast<DWORD>(takePairs * 4);
+
+        ComPtr<IMFMediaBuffer> buf;
+        if (FAILED(MFCreateMemoryBuffer(cb, buf.Put())) || !buf) return false;
+        BYTE* dst = nullptr;
+        if (SUCCEEDED(buf->Lock(&dst, nullptr, nullptr))) {
+            int16_t* out16 = reinterpret_cast<int16_t*>(dst);
+            if (music.empty()) {
+                memcpy(out16, pcmAccum.data(), cb);
+            } else {
+                const size_t basePair = static_cast<size_t>(writtenPairs);
+                for (size_t k = 0; k < takePairs; ++k) {
+                    const size_t gPair = basePair + k;
+                    float l = static_cast<float>(pcmAccum[k * 2]) / 32767.0f;
+                    float r = static_cast<float>(pcmAccum[k * 2 + 1]) / 32767.0f;
+                    for (const auto& m : music) {
+                        if (gPair >= m.startPair) {
+                            const size_t mp = gPair - m.startPair;
+                            if (mp * 2 + 1 < m.pcm.size()) {
+                                l += static_cast<float>(m.pcm[mp * 2]) / 32767.0f;
+                                r += static_cast<float>(m.pcm[mp * 2 + 1]) / 32767.0f;
+                            }
+                        }
+                    }
+                    out16[k * 2] = FloatToPcm16(l);
+                    out16[k * 2 + 1] = FloatToPcm16(r);
+                }
+            }
+            buf->Unlock();
+            buf->SetCurrentLength(cb);
+        }
+
+        ComPtr<IMFSample> smp;
+        if (FAILED(MFCreateSample(smp.Put())) || !smp) return false;
+        smp->AddBuffer(buf.Get());
+        smp->SetSampleTime((writtenPairs * 10000000LL) / 48000LL);
+        smp->SetSampleDuration((static_cast<int64_t>(takePairs) * 10000000LL) / 48000LL);
+
+        if (FAILED(sw->WriteSample(audioStream, smp.Get()))) return false;
+        writtenPairs += static_cast<int64_t>(takePairs);
+        pcmAccum.erase(pcmAccum.begin(), pcmAccum.begin() + static_cast<ptrdiff_t>(takePairs * 2));
+    }
+    return true;
+}
+
+bool DecodeAudioToPcm48k(const std::wstring& path, double trimStartSec, double maxDurSec,
+                          float gain, bool fadeIn, bool fadeOut, std::vector<int16_t>& outPcm) {
+    outPcm.clear();
+    ComPtr<IMFSourceReader> sr;
+    if (FAILED(MFCreateSourceReaderFromURL(path.c_str(), nullptr, sr.Put())) || !sr) return false;
+
+    DWORD aStream = DWORD(-1);
+    sr->SetStreamSelection(static_cast<DWORD>(MF_SOURCE_READER_ALL_STREAMS), FALSE);
+    for (DWORD i = 0; i < 8; ++i) {
+        ComPtr<IMFMediaType> mt;
+        if (FAILED(sr->GetNativeMediaType(i, 0, mt.Put())) || !mt) break;
+        GUID maj{};
+        mt->GetGUID(MF_MT_MAJOR_TYPE, &maj);
+        if (maj == MFMediaType_Audio) { aStream = i; break; }
+    }
+    if (aStream == DWORD(-1)) return false;
+    sr->SetStreamSelection(aStream, TRUE);
+
+    ComPtr<IMFMediaType> decA;
+    MFCreateMediaType(decA.Put());
+    decA->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Audio);
+    decA->SetGUID(MF_MT_SUBTYPE, MFAudioFormat_PCM);
+    decA->SetUINT32(MF_MT_AUDIO_BITS_PER_SAMPLE, 16);
+    decA->SetUINT32(MF_MT_AUDIO_SAMPLES_PER_SECOND, 48000);
+    decA->SetUINT32(MF_MT_AUDIO_NUM_CHANNELS, 2);
+    if (FAILED(sr->SetCurrentMediaType(aStream, nullptr, decA.Get()))) return false;
+
+    const LONGLONG start100 = static_cast<LONGLONG>(std::max(0.0, trimStartSec) * 1e7);
+    const size_t maxPairs = (maxDurSec > 0.05) ? static_cast<size_t>(maxDurSec * 48000.0) : (48000ULL * 300ULL);
+    if (start100 > 0) {
+        PROPVARIANT pv;
+        PropVariantInit(&pv);
+        pv.vt = VT_I8;
+        pv.hVal.QuadPart = std::max(0LL, start100 - 5000000LL);
+        sr->SetCurrentPosition(GUID_NULL, pv);
+        PropVariantClear(&pv);
+    }
+
+    while ((outPcm.size() / 2) < maxPairs) {
+        DWORD si = 0, fl = 0; LONGLONG ts = 0;
+        ComPtr<IMFSample> smp;
+        if (FAILED(sr->ReadSample(aStream, 0, &si, &fl, &ts, smp.Put())) || (fl & MF_SOURCE_READERF_ENDOFSTREAM)) break;
+        if (!smp) continue;
+        LONGLONG dur = 0; smp->GetSampleDuration(&dur);
+        if (dur <= 0) dur = 213333LL;
+        if (ts + dur <= start100) continue;
+
+        ComPtr<IMFMediaBuffer> buf;
+        if (SUCCEEDED(smp->ConvertToContiguousBuffer(buf.Put())) && buf) {
+            BYTE* p = nullptr; DWORD len = 0;
+            if (SUCCEEDED(buf->Lock(&p, nullptr, &len)) && len >= 4) {
+                const size_t nPairs = len / 4;
+                size_t skip = (ts < start100) ? static_cast<size_t>(((start100 - ts) * 48000LL) / 10000000LL) : 0;
+                const size_t curPairs = outPcm.size() / 2;
+                if (skip < nPairs && curPairs < maxPairs) {
+                    const size_t take = std::min(nPairs - skip, maxPairs - curPairs);
+                    const int16_t* s = reinterpret_cast<const int16_t*>(p) + skip * 2;
+                    outPcm.reserve(outPcm.size() + take * 2);
+                    for (size_t k = 0; k < take * 2; ++k) {
+                        outPcm.push_back(FloatToPcm16((static_cast<float>(s[k]) / 32767.0f) * gain));
+                    }
+                }
+                buf->Unlock();
+            }
+        }
+    }
+
+    const size_t totalPairs = outPcm.size() / 2;
+    if (totalPairs == 0) return false;
+    const size_t fadePairs = std::min<size_t>(19200, totalPairs / 4); // up to 0.4s
+    if (fadeIn && fadePairs > 0) {
+        for (size_t i = 0; i < fadePairs; ++i) {
+            float f = static_cast<float>(i) / static_cast<float>(fadePairs);
+            outPcm[i * 2] = FloatToPcm16((static_cast<float>(outPcm[i * 2]) / 32767.0f) * f);
+            outPcm[i * 2 + 1] = FloatToPcm16((static_cast<float>(outPcm[i * 2 + 1]) / 32767.0f) * f);
+        }
+    }
+    if (fadeOut && fadePairs > 0) {
+        for (size_t i = 0; i < fadePairs; ++i) {
+            size_t idx = totalPairs - 1 - i;
+            float f = static_cast<float>(i) / static_cast<float>(fadePairs);
+            outPcm[idx * 2] = FloatToPcm16((static_cast<float>(outPcm[idx * 2]) / 32767.0f) * f);
+            outPcm[idx * 2 + 1] = FloatToPcm16((static_cast<float>(outPcm[idx * 2 + 1]) / 32767.0f) * f);
+        }
+    }
+    return true;
+}
+
+void ApplyNv12FadeInSample(IMFSample* smp, uint32_t w, uint32_t h, float alpha) {
+    if (!smp || alpha >= 0.999f) return;
+    alpha = std::max(0.0f, std::min(1.0f, alpha));
+    ComPtr<IMFMediaBuffer> buf;
+    if (FAILED(smp->ConvertToContiguousBuffer(buf.Put())) || !buf) return;
+    BYTE* p = nullptr; DWORD len = 0;
+    const size_t yBytes = static_cast<size_t>(w) * h;
+    const size_t uvBytes = yBytes / 2;
+    if (SUCCEEDED(buf->Lock(&p, nullptr, &len)) && len >= yBytes + uvBytes) {
+        const int32_t aFixed = static_cast<int32_t>(std::lround(alpha * 256.0f));
+        for (size_t i = 0; i < yBytes; ++i) {
+            int32_t v = 16 + (((static_cast<int32_t>(p[i]) - 16) * aFixed) >> 8);
+            p[i] = static_cast<BYTE>(std::max(16, std::min(235, v)));
+        }
+        for (size_t i = yBytes; i < yBytes + uvBytes; ++i) {
+            int32_t v = 128 + (((static_cast<int32_t>(p[i]) - 128) * aFixed) >> 8);
+            p[i] = static_cast<BYTE>(std::max(16, std::min(240, v)));
+        }
+        buf->Unlock();
+    }
+}
+
 struct SourceSegment {
     std::wstring path;
     double startSec = 0.0;
     double endSec = 0.0;
+    double speed = 1.0;
+    float gameGain = 1.0f;
+    float micGain = 1.0f;
 };
 
 } // namespace
@@ -531,6 +693,95 @@ bool ProbeClipAudioTracks(const std::wstring& path, bool& outHasSeparateGameMic,
     return true;
 }
 
+bool ProbeAudioFileDuration(const std::wstring& path, double& outDurSec) {
+    outDurSec = 0.0;
+    ComPtr<IMFSourceReader> sr;
+    if (FAILED(MFCreateSourceReaderFromURL(path.c_str(), nullptr, sr.Put())) || !sr) return false;
+    PROPVARIANT pv;
+    PropVariantInit(&pv);
+    if (SUCCEEDED(sr->GetPresentationAttribute(MF_SOURCE_READER_MEDIASOURCE, MF_PD_DURATION, &pv))) {
+        if (pv.vt == VT_UI8) outDurSec = static_cast<double>(pv.uhVal.QuadPart) / 1e7;
+        else if (pv.vt == VT_I8) outDurSec = static_cast<double>(pv.hVal.QuadPart) / 1e7;
+    }
+    PropVariantClear(&pv);
+    return outDurSec > 0.05;
+}
+
+bool ExtractAudioWaveform(const std::wstring& path, int trackChoice, int numBuckets, std::vector<float>& outPeaks) {
+    outPeaks.clear();
+    if (numBuckets <= 0) return false;
+    ComPtr<IMFSourceReader> sr;
+    if (FAILED(MFCreateSourceReaderFromURL(path.c_str(), nullptr, sr.Put())) || !sr) return false;
+
+    std::vector<DWORD> aStreams;
+    sr->SetStreamSelection(static_cast<DWORD>(MF_SOURCE_READER_ALL_STREAMS), FALSE);
+    for (DWORD i = 0; i < 8; ++i) {
+        ComPtr<IMFMediaType> mt;
+        if (FAILED(sr->GetNativeMediaType(i, 0, mt.Put())) || !mt) break;
+        GUID maj{}; mt->GetGUID(MF_MT_MAJOR_TYPE, &maj);
+        if (maj == MFMediaType_Audio) aStreams.push_back(i);
+    }
+    if (aStreams.empty()) return false;
+
+    double durSec = 0.0;
+    PROPVARIANT pv;
+    PropVariantInit(&pv);
+    if (SUCCEEDED(sr->GetPresentationAttribute(MF_SOURCE_READER_MEDIASOURCE, MF_PD_DURATION, &pv))) {
+        if (pv.vt == VT_UI8) durSec = static_cast<double>(pv.uhVal.QuadPart) / 1e7;
+        else if (pv.vt == VT_I8) durSec = static_cast<double>(pv.hVal.QuadPart) / 1e7;
+    }
+    PropVariantClear(&pv);
+    if (durSec <= 0.05) return false;
+
+    size_t idx = (trackChoice >= 0 && static_cast<size_t>(trackChoice) < aStreams.size()) ? static_cast<size_t>(trackChoice) : 0;
+    DWORD si = aStreams[idx];
+    sr->SetStreamSelection(si, TRUE);
+    ComPtr<IMFMediaType> pcm;
+    MFCreateMediaType(pcm.Put());
+    pcm->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Audio);
+    pcm->SetGUID(MF_MT_SUBTYPE, MFAudioFormat_PCM);
+    pcm->SetUINT32(MF_MT_AUDIO_BITS_PER_SAMPLE, 16);
+    pcm->SetUINT32(MF_MT_AUDIO_SAMPLES_PER_SECOND, 48000);
+    pcm->SetUINT32(MF_MT_AUDIO_NUM_CHANNELS, 2);
+    if (FAILED(sr->SetCurrentMediaType(si, nullptr, pcm.Get()))) return false;
+
+    outPeaks.assign(static_cast<size_t>(numBuckets), 0.0f);
+    for (int b = 0; b < numBuckets; ++b) {
+        double t = (static_cast<double>(b) + 0.5) * durSec / static_cast<double>(numBuckets);
+        PROPVARIANT pos;
+        PropVariantInit(&pos);
+        pos.vt = VT_I8;
+        pos.hVal.QuadPart = static_cast<LONGLONG>(t * 1e7);
+        sr->SetCurrentPosition(GUID_NULL, pos);
+        PropVariantClear(&pos);
+
+        for (int tries = 0; tries < 4; ++tries) {
+            DWORD rSi = 0, fl = 0; LONGLONG ts = 0;
+            ComPtr<IMFSample> smp;
+            if (FAILED(sr->ReadSample(si, 0, &rSi, &fl, &ts, smp.Put())) || (fl & MF_SOURCE_READERF_ENDOFSTREAM)) break;
+            if (!smp) continue;
+            ComPtr<IMFMediaBuffer> buf;
+            if (SUCCEEDED(smp->ConvertToContiguousBuffer(buf.Put())) && buf) {
+                BYTE* p = nullptr; DWORD len = 0;
+                if (SUCCEEDED(buf->Lock(&p, nullptr, &len)) && len >= 2) {
+                    const int16_t* s = reinterpret_cast<const int16_t*>(p);
+                    DWORD n = len / 2;
+                    double sumSq = 0.0;
+                    for (DWORD k = 0; k < n; ++k) {
+                        double v = static_cast<double>(s[k]) / 32768.0;
+                        sumSq += v * v;
+                    }
+                    float rms = (n > 0) ? static_cast<float>(std::sqrt(sumSq / n)) : 0.0f;
+                    outPeaks[static_cast<size_t>(b)] = std::min(1.0f, rms * 3.8f);
+                    buf->Unlock();
+                }
+            }
+            break;
+        }
+    }
+    return true;
+}
+
 bool EditMp4Clip(const ClipEditSpec& spec, std::string& outError,
                  std::atomic<bool>* cancelFlag) {
     const bool isMontage = !spec.montageSegments.empty();
@@ -541,9 +792,9 @@ bool EditMp4Clip(const ClipEditSpec& spec, std::string& outError,
         return false;
     }
 
-    const double speed = std::max(0.5, std::min(2.0, spec.speed));
-    const float gameGain = std::max(0.0f, std::min(2.0f, static_cast<float>(spec.gameVolPct) / 100.0f));
-    const float micGain = std::max(0.0f, std::min(2.0f, static_cast<float>(spec.micVolPct) / 100.0f));
+    const double defaultSpeed = std::max(0.5, std::min(2.0, spec.speed));
+    const float defaultGameGain = std::max(0.0f, std::min(2.0f, static_cast<float>(spec.gameVolPct) / 100.0f));
+    const float defaultMicGain = std::max(0.0f, std::min(2.0f, static_cast<float>(spec.micVolPct) / 100.0f));
 
     std::vector<SourceSegment> segments;
     bool hasCut = false;
@@ -562,7 +813,10 @@ bool EditMp4Clip(const ClipEditSpec& spec, std::string& outError,
                 s1 = probedDur;
             }
             if (s1 > s0 + 0.2) {
-                segments.push_back({ ms.path, s0, s1 });
+                double segSpd = (ms.speed > 0.05) ? std::max(0.5, std::min(2.0, ms.speed)) : defaultSpeed;
+                float segGame = (ms.gameVolPct >= 0) ? std::max(0.0f, std::min(2.0f, static_cast<float>(ms.gameVolPct) / 100.0f)) : defaultGameGain;
+                float segMic = (ms.micVolPct >= 0) ? std::max(0.0f, std::min(2.0f, static_cast<float>(ms.micVolPct) / 100.0f)) : defaultMicGain;
+                segments.push_back({ ms.path, s0, s1, segSpd, segGame, segMic });
             }
         }
         if (segments.empty()) {
@@ -581,19 +835,20 @@ bool EditMp4Clip(const ClipEditSpec& spec, std::string& outError,
                     insertDur > 0.2;
 
         if (hasCut) {
-            segments.push_back({ spec.srcPath, startSec, spec.cutStartSec });
-            if (hasInsert) segments.push_back({ spec.insertClipPath, 0.0, insertDur });
-            segments.push_back({ spec.srcPath, spec.cutEndSec, endSec });
+            segments.push_back({ spec.srcPath, startSec, spec.cutStartSec, defaultSpeed, defaultGameGain, defaultMicGain });
+            if (hasInsert) segments.push_back({ spec.insertClipPath, 0.0, insertDur, defaultSpeed, defaultGameGain, defaultMicGain });
+            segments.push_back({ spec.srcPath, spec.cutEndSec, endSec, defaultSpeed, defaultGameGain, defaultMicGain });
         } else {
-            segments.push_back({ spec.srcPath, startSec, endSec });
-            if (hasInsert) segments.push_back({ spec.insertClipPath, 0.0, insertDur });
+            segments.push_back({ spec.srcPath, startSec, endSec, defaultSpeed, defaultGameGain, defaultMicGain });
+            if (hasInsert) segments.push_back({ spec.insertClipPath, 0.0, insertDur, defaultSpeed, defaultGameGain, defaultMicGain });
         }
     }
 
     // Fast lossless passthrough trim (<0.3s, minimal RAM) when only start/end changed
     if (!isMontage && !hasCut && !hasInsert && !spec.fadeTransitions &&
+        spec.musicTracks.empty() &&
         spec.targetSizeMb == 0 && !spec.vertical916 &&
-        std::abs(speed - 1.0) < 0.01 &&
+        std::abs(defaultSpeed - 1.0) < 0.01 &&
         spec.gameVolPct == 100 && spec.micVolPct == 100) {
         if (FastPassthroughTrimMp4(spec.srcPath, spec.dstPath, startSec, endSec, cancelFlag)) {
             return true;
@@ -670,10 +925,54 @@ bool EditMp4Clip(const ClipEditSpec& spec, std::string& outError,
     probeSr.Reset();
 
     double totalOutDurSec = 0.0;
+    double minSegSpeed = 2.0;
+    double maxSegSpeed = 0.5;
     for (const auto& sg : segments) {
-        totalOutDurSec += std::max(0.0, sg.endSec - sg.startSec) / speed;
+        totalOutDurSec += std::max(0.0, sg.endSec - sg.startSec) / sg.speed;
+        minSegSpeed = std::min(minSegSpeed, sg.speed);
+        maxSegSpeed = std::max(maxSegSpeed, sg.speed);
     }
     if (totalOutDurSec < 0.2) totalOutDurSec = 0.2;
+
+    std::vector<DecodedMusicTrack> decodedMusic;
+    for (const auto& mt : spec.musicTracks) {
+        if (mt.path.empty() || mt.volPct <= 0) continue;
+        const double tlStart = std::max(0.0, mt.timelineStartSec);
+        if (tlStart >= totalOutDurSec - 0.05) continue;
+        double availDur = totalOutDurSec - tlStart;
+        double maxD = (mt.durationSec > 0.05) ? std::min(mt.durationSec, availDur) : availDur;
+        if (maxD <= 0.05) continue;
+        DecodedMusicTrack dmt;
+        dmt.startPair = static_cast<size_t>(tlStart * 48000.0);
+        float mGain = std::max(0.0f, std::min(2.0f, static_cast<float>(mt.volPct) / 100.0f));
+        if (DecodeAudioToPcm48k(mt.path, std::max(0.0, mt.trimStartSec), maxD, mGain, mt.fadeIn, mt.fadeOut, dmt.pcm)) {
+            decodedMusic.push_back(std::move(dmt));
+        }
+    }
+
+    UINT32 vpInW = srcW, vpInH = srcH;
+    for (const auto& sg : segments) {
+        if (_wcsicmp(sg.path.c_str(), primaryPath.c_str()) == 0) continue;
+        ComPtr<IMFSourceReader> segProbe;
+        if (SUCCEEDED(MFCreateSourceReaderFromURL(sg.path.c_str(), nullptr, segProbe.Put())) && segProbe) {
+            for (DWORD si = 0; si < 8; ++si) {
+                ComPtr<IMFMediaType> mt;
+                if (FAILED(segProbe->GetNativeMediaType(si, 0, mt.Put())) || !mt) break;
+                GUID maj{};
+                mt->GetGUID(MF_MT_MAJOR_TYPE, &maj);
+                if (maj == MFMediaType_Video) {
+                    UINT32 iw = 0, ih = 0;
+                    if (SUCCEEDED(MFGetAttributeSize(mt.Get(), MF_MT_FRAME_SIZE, &iw, &ih))) {
+                        vpInW = std::max(vpInW, iw);
+                        vpInH = std::max(vpInH, ih);
+                    }
+                } else if (maj == MFMediaType_Audio) {
+                    foundA = true;
+                }
+            }
+        }
+    }
+    const bool anyAudio = foundA || !decodedMusic.empty();
 
     UINT32 outW = srcW, outH = srcH, outFpsN = fpsN, outFpsD = fpsD, outBr = avgBr;
     const bool isDiscordExport = (spec.targetSizeMb > 0);
@@ -681,15 +980,15 @@ bool EditMp4Clip(const ClipEditSpec& spec, std::string& outError,
         outW = (srcH >= 1080) ? 1080u : 720u;
         outH = (srcH >= 1080) ? 1920u : 1280u;
     }
-    if (speed < 0.99) {
-        outFpsN = std::max<uint32_t>(15u, static_cast<uint32_t>(std::lround((static_cast<double>(fpsN) / fpsD) * speed)));
+    if (maxSegSpeed < 0.99) {
+        outFpsN = std::max<uint32_t>(15u, static_cast<uint32_t>(std::lround((static_cast<double>(fpsN) / fpsD) * maxSegSpeed)));
         outFpsD = 1;
-    } else if (!isDiscordExport && speed > 1.01) {
+    } else if (!isDiscordExport && maxSegSpeed > 1.01) {
         outBr = std::min<uint32_t>(24000000u, static_cast<uint32_t>(outBr * 1.25));
     }
     if (isDiscordExport) {
         const double targetBits = static_cast<double>(spec.targetSizeMb) * 8.0 * 1024.0 * 1024.0 * 0.88;
-        const double audioBits = foundA ? (96000.0 * totalOutDurSec) : 0.0;
+        const double audioBits = anyAudio ? (96000.0 * totalOutDurSec) : 0.0;
         double vBpsD = (targetBits - audioBits) / totalOutDurSec;
         uint32_t vBps = static_cast<uint32_t>(std::max(450000.0, std::min(12000000.0, vBpsD)));
         if (vBps < 2000000u) {
@@ -707,28 +1006,8 @@ bool EditMp4Clip(const ClipEditSpec& spec, std::string& outError,
         }
         outBr = vBps;
     }
-    UINT32 vpInW = srcW, vpInH = srcH;
-    for (const auto& sg : segments) {
-        if (_wcsicmp(sg.path.c_str(), primaryPath.c_str()) == 0) continue;
-        ComPtr<IMFSourceReader> segProbe;
-        if (SUCCEEDED(MFCreateSourceReaderFromURL(sg.path.c_str(), nullptr, segProbe.Put())) && segProbe) {
-            for (DWORD si = 0; si < 8; ++si) {
-                ComPtr<IMFMediaType> mt;
-                if (FAILED(segProbe->GetNativeMediaType(si, 0, mt.Put())) || !mt) break;
-                GUID maj{};
-                mt->GetGUID(MF_MT_MAJOR_TYPE, &maj);
-                if (maj == MFMediaType_Video) {
-                    UINT32 iw = 0, ih = 0;
-                    if (SUCCEEDED(MFGetAttributeSize(mt.Get(), MF_MT_FRAME_SIZE, &iw, &ih))) {
-                        vpInW = std::max(vpInW, iw);
-                        vpInH = std::max(vpInH, ih);
-                    }
-                    break;
-                }
-            }
-        }
-    }
-    const bool needVp = (outW != srcW || outH != srcH || spec.vertical916 || hasInsert || segments.size() > 1 || spec.fadeTransitions);
+    (void)minSegSpeed;
+    const bool needVp = (outW != srcW || outH != srcH || spec.vertical916 || hasInsert || segments.size() > 1);
     const LONGLONG outFrameDur100 = (10000000LL * outFpsD) / std::max<uint32_t>(1u, outFpsN);
 
     std::wstring tmpPath = spec.dstPath + L".tmp.mp4";
@@ -785,9 +1064,9 @@ bool EditMp4Clip(const ClipEditSpec& spec, std::string& outError,
     }
 
     DWORD aOutMix = 0, aOutGame = 0, aOutMic = 0;
-    bool hasOutMix = foundA && AddAacOutputStream(sw.Get(), aOutMix);
-    bool hasOutGame = !isDiscordExport && hasOutMix && srcMultiTrack && AddAacOutputStream(sw.Get(), aOutGame);
-    bool hasOutMic = !isDiscordExport && hasOutGame && AddAacOutputStream(sw.Get(), aOutMic);
+    bool hasOutMix = anyAudio && AddAacOutputStream(sw.Get(), aOutMix);
+    bool hasOutGame = !isDiscordExport && !isMontage && decodedMusic.empty() && hasOutMix && foundA && srcMultiTrack && AddAacOutputStream(sw.Get(), aOutGame);
+    bool hasOutMic = !isDiscordExport && !isMontage && decodedMusic.empty() && hasOutGame && AddAacOutputStream(sw.Get(), aOutMic);
 
     {
         ComPtr<ICodecAPI> encCodec;
@@ -943,7 +1222,7 @@ bool EditMp4Clip(const ClipEditSpec& spec, std::string& outError,
         const LONGLONG start100 = static_cast<LONGLONG>(seg.startSec * 1e7);
         const LONGLONG end100 = static_cast<LONGLONG>(seg.endSec * 1e7);
         const LONGLONG span100 = std::max<LONGLONG>(1, end100 - start100);
-        const LONGLONG outSpan100 = static_cast<LONGLONG>(static_cast<double>(span100) / speed);
+        const LONGLONG outSpan100 = static_cast<LONGLONG>(static_cast<double>(span100) / seg.speed);
 
         PROPVARIANT pv;
         PropVariantInit(&pv);
@@ -995,7 +1274,7 @@ bool EditMp4Clip(const ClipEditSpec& spec, std::string& outError,
 
             if (streamIdx == vIn && !vDone) {
                 LONGLONG relIn = std::max(0LL, ts - start100);
-                LONGLONG mappedTs = outVBase100 + static_cast<LONGLONG>(static_cast<double>(relIn) / speed);
+                LONGLONG mappedTs = outVBase100 + static_cast<LONGLONG>(static_cast<double>(relIn) / seg.speed);
                 LONGLONG gridTs = (outFrameIdx * 10000000LL * outFpsD) / outFpsN;
                 if (mappedTs + (outFrameDur100 / 2) < gridTs) {
                     continue; // cleanly pace to output fps without cramming or stuttering
@@ -1005,6 +1284,19 @@ bool EditMp4Clip(const ClipEditSpec& spec, std::string& outError,
                 }
                 LONGLONG nextGridTs = ((outFrameIdx + 1) * 10000000LL * outFpsD) / outFpsN;
                 LONGLONG newDur = std::max<LONGLONG>(1, nextGridTs - gridTs);
+
+                float segFadeAlpha = 1.0f;
+                if (spec.fadeTransitions && segments.size() > 1) {
+                    const double segOutDurSec = static_cast<double>(outSpan100) / 1e7;
+                    const double fadeSec = std::min(0.35, segOutDurSec * 0.25);
+                    const double relOutSec = static_cast<double>(std::max<LONGLONG>(0, gridTs - outVBase100)) / 1e7;
+                    if (segIdx > 0 && relOutSec < fadeSec && fadeSec > 0.01) {
+                        segFadeAlpha = std::min(segFadeAlpha, std::max(0.05f, static_cast<float>(relOutSec / fadeSec)));
+                    }
+                    if (segIdx + 1 < segments.size() && relOutSec > (segOutDurSec - fadeSec) && fadeSec > 0.01) {
+                        segFadeAlpha = std::min(segFadeAlpha, std::max(0.05f, static_cast<float>((segOutDurSec - relOutSec) / fadeSec)));
+                    }
+                }
 
                 ComPtr<IMFSample> outSmp;
                 MFCreateSample(outSmp.Put());
@@ -1045,22 +1337,6 @@ bool EditMp4Clip(const ClipEditSpec& spec, std::string& outError,
                         D3D11_BOX box{ 0, 0, 0, copyW, copyH, 1 };
                         ctx->CopySubresourceRegion(vpInTex.Get(), 0, 0, 0, 0, dtex.Get(), sub, &box);
 
-                        float segAlpha = 1.0f;
-                        if (spec.fadeTransitions && segments.size() > 1) {
-                            const double segOutDurSec = static_cast<double>(outSpan100) / 1e7;
-                            const double fadeSec = std::min(0.35, segOutDurSec * 0.25);
-                            const double relOutSec = static_cast<double>(std::max<LONGLONG>(0, gridTs - outVBase100)) / 1e7;
-                            if (segIdx > 0 && relOutSec < fadeSec && fadeSec > 0.01) {
-                                segAlpha = std::min(segAlpha, std::max(0.05f, static_cast<float>(relOutSec / fadeSec)));
-                            }
-                            if (segIdx + 1 < segments.size() && relOutSec > (segOutDurSec - fadeSec) && fadeSec > 0.01) {
-                                segAlpha = std::min(segAlpha, std::max(0.05f, static_cast<float>((segOutDurSec - relOutSec) / fadeSec)));
-                            }
-                            D3D11_VIDEO_COLOR bgCol{};
-                            bgCol.RGBA = { 0.0f, 0.0f, 0.0f, 1.0f };
-                            vctx->VideoProcessorSetOutputBackgroundColor(vp.Get(), FALSE, &bgCol);
-                        }
-
                         if (spec.vertical916) {
                             LONG cropW = std::min<LONG>(static_cast<LONG>(copyW),
                                 std::max<LONG>(16, (static_cast<LONG>(copyH) * static_cast<LONG>(outW)) / static_cast<LONG>(outH))) & ~1L;
@@ -1075,10 +1351,8 @@ bool EditMp4Clip(const ClipEditSpec& spec, std::string& outError,
 
                             vctx->VideoProcessorSetStreamSourceRect(vp.Get(), 0, TRUE, &bgSrc);
                             vctx->VideoProcessorSetStreamDestRect(vp.Get(), 0, TRUE, &dstFull);
-                            vctx->VideoProcessorSetStreamAlpha(vp.Get(), 0, TRUE, segAlpha);
                             vctx->VideoProcessorSetStreamSourceRect(vp.Get(), 1, TRUE, &fgSrc);
                             vctx->VideoProcessorSetStreamDestRect(vp.Get(), 1, TRUE, &fgDst);
-                            vctx->VideoProcessorSetStreamAlpha(vp.Get(), 1, TRUE, segAlpha);
 
                             D3D11_VIDEO_PROCESSOR_STREAM streams[2]{};
                             streams[0].Enable = TRUE; streams[0].pInputSurface = vpInView.Get();
@@ -1105,7 +1379,6 @@ bool EditMp4Clip(const ClipEditSpec& spec, std::string& outError,
                             }
                             vctx->VideoProcessorSetStreamSourceRect(vp.Get(), 0, TRUE, &srcFull);
                             vctx->VideoProcessorSetStreamDestRect(vp.Get(), 0, TRUE, &dstRect);
-                            vctx->VideoProcessorSetStreamAlpha(vp.Get(), 0, TRUE, segAlpha);
                             D3D11_VIDEO_PROCESSOR_STREAM st{};
                             st.Enable = TRUE; st.pInputSurface = vpInView.Get();
                             if (FAILED(vctx->VideoProcessorBlt(vp.Get(), vpOutView.Get(), 0, 1, &st))) {
@@ -1178,6 +1451,9 @@ bool EditMp4Clip(const ClipEditSpec& spec, std::string& outError,
                     }
                 }
                 if (!copied) continue;
+                if (segFadeAlpha < 0.999f) {
+                    ApplyNv12FadeInSample(outSmp.Get(), outW, outH, segFadeAlpha);
+                }
                 if (SUCCEEDED(sw->WriteSample(vOutIdx, outSmp.Get()))) {
                     ++outFrameIdx;
                     ++segOutFrames;
@@ -1235,6 +1511,22 @@ bool EditMp4Clip(const ClipEditSpec& spec, std::string& outError,
                         ++vWritten;
                         ++dupCap;
                     }
+
+                    // Keep IMFSinkWriter interleaved smoothly even when a video segment lacks an audio stream
+                    if (hasOutMix && !segHasAudio) {
+                        constexpr size_t kSilentChunk = 16384;
+                        const size_t vProducedPairs = static_cast<size_t>((segOutFrames * outFpsD * 48000LL) / outFpsN);
+                        const size_t capPairs = std::min(vProducedPairs, targetOutPairs);
+                        while (segOutFlushed + kSilentChunk <= capPairs) {
+                            outMixAccum.insert(outMixAccum.end(), kSilentChunk * 2, 0);
+                            if (hasOutGame) outGameAccum.insert(outGameAccum.end(), kSilentChunk * 2, 0);
+                            if (hasOutMic)  outMicAccum.insert(outMicAccum.end(), kSilentChunk * 2, 0);
+                            FlushMixPcmChunks(sw.Get(), aOutMix, outMixAccum, mixWrittenPairs, decodedMusic, false);
+                            if (hasOutGame) FlushPcmChunks(sw.Get(), aOutGame, outGameAccum, gameWrittenPairs, false);
+                            if (hasOutMic)  FlushPcmChunks(sw.Get(), aOutMic, outMicAccum, micWrittenPairs, false);
+                            segOutFlushed += kSilentChunk;
+                        }
+                    }
                 }
             } else {
                 int trackIdx = -1;
@@ -1270,21 +1562,21 @@ bool EditMp4Clip(const ClipEditSpec& spec, std::string& outError,
                 // Live-flush audio chunks (~0.34s) so IMFSinkWriter interleaver never stalls video WriteSample
                 if (hasOutMix) {
                     constexpr size_t kChunkOut = 16384;
-                    const size_t needIn = static_cast<size_t>(std::ceil(static_cast<double>(kChunkOut) * speed)) + 4;
+                    const size_t needIn = static_cast<size_t>(std::ceil(static_cast<double>(kChunkOut) * seg.speed)) + 4;
                     while (segOutFlushed + kChunkOut <= targetOutPairs) {
                         bool ready = segHasGameMic
                             ? (segPcm[1].size() / 2 >= needIn && segPcm[2].size() / 2 >= needIn)
                             : (segPcm[0].size() / 2 >= needIn);
                         if (!ready) break;
-                        const size_t consumeIn = static_cast<size_t>(std::lround(static_cast<double>(kChunkOut) * speed));
+                        const size_t consumeIn = static_cast<size_t>(std::lround(static_cast<double>(kChunkOut) * seg.speed));
                         if (segHasGameMic) {
                             std::vector<int16_t> gIn(segPcm[1].begin(), segPcm[1].begin() + consumeIn * 2);
                             std::vector<int16_t> mIn(segPcm[2].begin(), segPcm[2].begin() + consumeIn * 2);
                             segPcm[1].erase(segPcm[1].begin(), segPcm[1].begin() + consumeIn * 2);
                             segPcm[2].erase(segPcm[2].begin(), segPcm[2].begin() + consumeIn * 2);
                             std::vector<int16_t> gRes, mRes;
-                            AppendResampledPcm(gIn, speed, gameGain, kChunkOut, gRes);
-                            AppendResampledPcm(mIn, speed, micGain, kChunkOut, mRes);
+                            AppendResampledPcm(gIn, seg.speed, seg.gameGain, kChunkOut, gRes);
+                            AppendResampledPcm(mIn, seg.speed, seg.micGain, kChunkOut, mRes);
                             outMixAccum.reserve(outMixAccum.size() + kChunkOut * 2);
                             for (size_t i = 0; i < kChunkOut * 2; ++i) {
                                 float mix = static_cast<float>(gRes[i]) / 32767.0f + static_cast<float>(mRes[i]) / 32767.0f;
@@ -1295,11 +1587,11 @@ bool EditMp4Clip(const ClipEditSpec& spec, std::string& outError,
                         } else {
                             std::vector<int16_t> sIn(segPcm[0].begin(), segPcm[0].begin() + consumeIn * 2);
                             segPcm[0].erase(segPcm[0].begin(), segPcm[0].begin() + consumeIn * 2);
-                            AppendResampledPcm(sIn, speed, gameGain, kChunkOut, outMixAccum);
-                            if (hasOutGame) AppendResampledPcm(sIn, speed, gameGain, kChunkOut, outGameAccum);
+                            AppendResampledPcm(sIn, seg.speed, seg.gameGain, kChunkOut, outMixAccum);
+                            if (hasOutGame) AppendResampledPcm(sIn, seg.speed, seg.gameGain, kChunkOut, outGameAccum);
                             if (hasOutMic)  outMicAccum.insert(outMicAccum.end(), kChunkOut * 2, 0);
                         }
-                        FlushPcmChunks(sw.Get(), aOutMix, outMixAccum, mixWrittenPairs, false);
+                        FlushMixPcmChunks(sw.Get(), aOutMix, outMixAccum, mixWrittenPairs, decodedMusic, false);
                         if (hasOutGame) FlushPcmChunks(sw.Get(), aOutGame, outGameAccum, gameWrittenPairs, false);
                         if (hasOutMic)  FlushPcmChunks(sw.Get(), aOutMic, outMicAccum, micWrittenPairs, false);
                         segOutFlushed += kChunkOut;
@@ -1319,8 +1611,8 @@ bool EditMp4Clip(const ClipEditSpec& spec, std::string& outError,
             const size_t remOutPairs = actualTargetOutPairs - segOutFlushed;
             if (segHasGameMic) {
                 std::vector<int16_t> gRes, mRes;
-                AppendResampledPcm(segPcm[1], speed, gameGain, remOutPairs, gRes);
-                AppendResampledPcm(segPcm[2], speed, micGain, remOutPairs, mRes);
+                AppendResampledPcm(segPcm[1], seg.speed, seg.gameGain, remOutPairs, gRes);
+                AppendResampledPcm(segPcm[2], seg.speed, seg.micGain, remOutPairs, mRes);
                 outMixAccum.reserve(outMixAccum.size() + remOutPairs * 2);
                 for (size_t i = 0; i < remOutPairs * 2; ++i) {
                     float mix = static_cast<float>(gRes[i]) / 32767.0f + static_cast<float>(mRes[i]) / 32767.0f;
@@ -1329,11 +1621,11 @@ bool EditMp4Clip(const ClipEditSpec& spec, std::string& outError,
                 if (hasOutGame) outGameAccum.insert(outGameAccum.end(), gRes.begin(), gRes.end());
                 if (hasOutMic)  outMicAccum.insert(outMicAccum.end(), mRes.begin(), mRes.end());
             } else {
-                AppendResampledPcm(segPcm[0], speed, gameGain, remOutPairs, outMixAccum);
-                if (hasOutGame) AppendResampledPcm(segPcm[0], speed, gameGain, remOutPairs, outGameAccum);
+                AppendResampledPcm(segPcm[0], seg.speed, seg.gameGain, remOutPairs, outMixAccum);
+                if (hasOutGame) AppendResampledPcm(segPcm[0], seg.speed, seg.gameGain, remOutPairs, outGameAccum);
                 if (hasOutMic)  outMicAccum.insert(outMicAccum.end(), remOutPairs * 2, 0);
             }
-            FlushPcmChunks(sw.Get(), aOutMix, outMixAccum, mixWrittenPairs, false);
+            FlushMixPcmChunks(sw.Get(), aOutMix, outMixAccum, mixWrittenPairs, decodedMusic, false);
             if (hasOutGame) FlushPcmChunks(sw.Get(), aOutGame, outGameAccum, gameWrittenPairs, false);
             if (hasOutMic)  FlushPcmChunks(sw.Get(), aOutMic, outMicAccum, micWrittenPairs, false);
         }
@@ -1348,7 +1640,7 @@ bool EditMp4Clip(const ClipEditSpec& spec, std::string& outError,
         return false;
     }
 
-    if (hasOutMix)  FlushPcmChunks(sw.Get(), aOutMix, outMixAccum, mixWrittenPairs, true);
+    if (hasOutMix)  FlushMixPcmChunks(sw.Get(), aOutMix, outMixAccum, mixWrittenPairs, decodedMusic, true);
     if (hasOutGame) FlushPcmChunks(sw.Get(), aOutGame, outGameAccum, gameWrittenPairs, true);
     if (hasOutMic)  FlushPcmChunks(sw.Get(), aOutMic, outMicAccum, micWrittenPairs, true);
 

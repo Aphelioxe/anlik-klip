@@ -40,6 +40,7 @@ public:
     HWND Hwnd() const { return hwnd_; }
     bool IsPlayerOpen() const { return playerOpen_; }
     bool IsPlayerReady() const { return playerReady_; }
+    bool IsStudioOpen() const { return studioOpen_; }
 
 private:
     static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam);
@@ -225,7 +226,37 @@ private:
     void RequestHoverScrub(double sec);
     void StopHoverScrubWorker();
 
-    // Montage tab state
+    // Montage tab state & Medal-style Studio NLE
+    struct StudioClipItem {
+        std::wstring path;
+        std::wstring name;
+        double sourceDurSec = 0.0;
+        double trimStartSec = 0.0;
+        double trimEndSec = 0.0;
+        double speed = 1.0;
+        bool hasMultiTrack = false;
+        int gameVolPct = 100;
+        int micVolPct = 100;
+        bool waveLoaded = false;
+        std::vector<float> wavePeaks;
+    };
+
+    struct StudioMusicItem {
+        std::wstring path;
+        std::wstring name;
+        double sourceDurSec = 0.0;
+        double timelineStartSec = 0.0;
+        double trimStartSec = 0.0;
+        double durationSec = 0.0;
+        int volPct = 85;
+        bool fadeIn = true;
+        bool fadeOut = true;
+        bool waveLoaded = false;
+        std::vector<float> wavePeaks;
+    };
+
+    class StudioMpCallback;
+
     std::vector<std::wstring> montagePaths_;
     int montageLibScroll_ = 0;
     int montageQueueScroll_ = 0;
@@ -235,6 +266,78 @@ private:
     bool montageGameMuted_ = false;
     bool montageMicMuted_ = false;
     void StartMontageExport(int targetSizeMb);
+
+    bool studioOpen_ = false;
+    int studioLeftTab_ = 0;
+    int studioLibScroll_ = 0;
+    int studioMusicLibScroll_ = 0;
+    bool studioFade_ = true;
+    bool studioVertical916_ = false;
+    int studioTargetMb_ = 0;
+    std::vector<StudioClipItem> studioClips_;
+    std::vector<StudioMusicItem> studioMusic_;
+    std::vector<std::wstring> studioRecentAudio_;
+    int studioSelClip_ = -1;
+    int studioSelMusic_ = -1;
+
+    double studioPlayheadSec_ = 0.0;
+    double studioTimelineScrollSec_ = 0.0;
+    double studioPxPerSec_ = 76.0;
+
+    bool studioPlaying_ = false;
+    bool studioVideoReady_ = false;
+    bool studioAudioReady_ = false;
+    int studioLoadedClipIdx_ = -1;
+    std::wstring studioLoadedClipPath_;
+    std::wstring studioLoadedMusicPath_;
+    double studioPendingSeekSec_ = -1.0;
+    double studioPendingAudioSeekSec_ = -1.0;
+    std::atomic<uint64_t> studioGen_{0};
+    HWND studioVideoHwnd_ = nullptr;
+    IMFPMediaPlayer* studioPlayer_ = nullptr;
+    IMFPMediaPlayer* studioMusicPlayer_ = nullptr;
+    StudioMpCallback* studioVideoCb_ = nullptr;
+    StudioMpCallback* studioAudioCb_ = nullptr;
+
+    std::thread studioWaveThread_;
+    std::atomic<bool> studioWaveStop_{false};
+
+    int studioDragMode_ = 0;
+    int studioDragIdx_ = -1;
+    int studioDragStartX_ = 0;
+    double studioDragOrigA_ = 0.0;
+    double studioDragOrigB_ = 0.0;
+    double studioDragOrigC_ = 0.0;
+    bool studioDragWasPlaying_ = false;
+    ULONGLONG studioLastScrubMs_ = 0;
+
+    void OpenStudio(bool loadQueued = true);
+    void CloseStudio();
+    void UpdateStudioLayout(int cw, int ch);
+    void UpdateStudioMetrics();
+    double StudioTotalDuration() const;
+    bool MapTimelineToClip(double tlSec, int& outIdx, double& outLocalSec, double& outClipStartSec) const;
+    void StudioAddClipFromLibrary(size_t rawClipIdx);
+    void StudioAddMusicFile(const std::wstring& audioPath = L"");
+    void StudioSplitAtPlayhead();
+    void StudioDeleteSelection();
+    void StudioMoveSelectedClip(int dir);
+    void StudioCycleClipSpeed();
+    void StudioTogglePlayPause();
+    void StudioSeekTimeline(double targetSec, bool syncAudio = true);
+    void SyncStudioMediaState(bool forceSeekVideo);
+    void StartStudioWaveformWorker();
+    void StopStudioWaveformWorker();
+    void StartStudioRender();
+    void PaintMontajLanding(void* gPtr, int cw, int ch);
+    void PaintStudio(void* gPtr, int cw, int ch);
+    bool HandleStudioPreTranslate(const MSG& msg);
+    bool HandleStudioAppMessage(UINT msg, WPARAM wParam, LPARAM lParam, LRESULT& outRes);
+    bool OnStudioLButtonDown(int mx, int my);
+    bool OnStudioMouseMove(int mx, int my);
+    bool OnStudioLButtonUp(int mx, int my);
+    bool OnStudioMouseWheel(int mx, int my, int delta, bool ctrl);
+    bool OnStudioButtonClick(int targetBtnId);
 
     bool uploadBusy_ = false;
     std::atomic<bool> uploadCancel_{false};

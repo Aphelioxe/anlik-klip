@@ -1,0 +1,2088 @@
+#include "ui_gfx.h"
+#include "main_window.h"
+#include "clip_trimmer.h"
+#include "com_ptr.h"
+
+#include <mfapi.h>
+#include <mfplay.h>
+#include <mfreadwrite.h>
+#include <mfobjects.h>
+#include <propvarutil.h>
+#include <shobjidl.h>
+
+#include <algorithm>
+#include <cmath>
+#include <cstdio>
+
+namespace {
+
+using ui::Gc;
+using ui::FillRoundRect;
+using ui::FillRoundRectGrad;
+using ui::StrokeRoundRect;
+
+struct StudioWaveDoneMsg {
+    uint64_t gen = 0;
+    bool isMusic = false;
+    std::wstring path;
+    std::vector<float> peaks;
+};
+
+struct StudioMpEventMsg {
+    uint64_t gen = 0;
+    bool isAudio = false;
+    MFP_EVENT_TYPE type = MFP_EVENT_TYPE_PLAY;
+};
+
+std::wstring FormatSecTenths(double sec) {
+    if (sec < 0.0) sec = 0.0;
+    int totalTenths = static_cast<int>(std::lround(sec * 10.0));
+    int mins = totalTenths / 600;
+    int secs = (totalTenths / 10) % 60;
+    int tenths = totalTenths % 10;
+    wchar_t buf[32] = {};
+    swprintf(buf, 32, L"%02d:%02d.%d", mins, secs, tenths);
+    return buf;
+}
+
+std::wstring BaseNameNoExt(const std::wstring& path) {
+    size_t sl = path.find_last_of(L"\\/");
+    std::wstring fn = (sl != std::wstring::npos) ? path.substr(sl + 1) : path;
+    size_t dot = fn.find_last_of(L'.');
+    if (dot != std::wstring::npos && dot > 0) return fn.substr(0, dot);
+    return fn;
+}
+
+// Select highest-energy audio track inside multi-track MP4 so preview matches rendered Mix
+void SelectBestPreviewAudioTrack(IMFPMediaItem* item, const std::wstring& path) {
+    if (!item) return;
+    DWORD nStreams = 0;
+    if (FAILED(item->GetNumberOfStreams(&nStreams)) || nStreams <= 1) return;
+    std::vector<DWORD> audioStreams;
+    for (DWORD si = 0; si < nStreams; ++si) {
+        PROPVARIANT vt;
+        PropVariantInit(&vt);
+        if (SUCCEEDED(item->GetStreamAttribute(si, MF_MT_MAJOR_TYPE, &vt)) &&
+            vt.vt == VT_CLSID && vt.puuid && *vt.puuid == MFMediaType_Audio) {
+            audioStreams.push_back(si);
+        }
+        PropVariantClear(&vt);
+    }
+    if (audioStreams.size() <= 1) return;
+
+    DWORD chosenAudio = audioStreams.front();
+    double bestEnergy = -1.0;
+    IMFSourceReader* sr = nullptr;
+    if (SUCCEEDED(MFCreateSourceReaderFromURL(path.c_str(), nullptr, &sr)) && sr) {
+        sr->SetStreamSelection(MF_SOURCE_READER_ALL_STREAMS, FALSE);
+        std::vector<double> energy(nStreams, 0.0);
+        for (DWORD asi : audioStreams) {
+            sr->SetStreamSelection(asi, TRUE);
+            IMFMediaType* pcm = nullptr;
+            if (SUCCEEDED(MFCreateMediaType(&pcm)) && pcm) {
+                pcm->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Audio);
+                pcm->SetGUID(MF_MT_SUBTYPE, MFAudioFormat_PCM);
+                sr->SetCurrentMediaType(asi, nullptr, pcm);
+                pcm->Release();
+            }
+        }
+        for (int iter = 0; iter < 600; ++iter) {
+            DWORD si = 0, fl = 0;
+            LONGLONG ts = 0;
+            IMFSample* smp = nullptr;
+            if (FAILED(sr->ReadSample(MF_SOURCE_READER_ANY_STREAM, 0, &si, &fl, &ts, &smp))) break;
+            if (!smp) {
+                if (fl & MF_SOURCE_READERF_ENDOFSTREAM) break;
+                continue;
+            }
+            if (si < nStreams) {
+                IMFMediaBuffer* buf = nullptr;
+                if (SUCCEEDED(smp->ConvertToContiguousBuffer(&buf)) && buf) {
+                    BYTE* p = nullptr;
+                    DWORD len = 0;
+                    if (SUCCEEDED(buf->Lock(&p, nullptr, &len)) && len >= 4) {
+                        const int16_t* s16 = reinterpret_cast<const int16_t*>(p);
+                        DWORD n = len / 2;
+                        double sum = 0.0;
+                        for (DWORD k = 0; k < n; k += 4) sum += std::abs(static_cast<double>(s16[k]));
+                        energy[si] += sum;
+                        buf->Unlock();
+                    }
+                    buf->Release();
+                }
+            }
+            smp->Release();
+        }
+        sr->Release();
+        for (DWORD asi : audioStreams) {
+            if (energy[asi] > bestEnergy) {
+                bestEnergy = energy[asi];
+                chosenAudio = asi;
+            }
+        }
+    }
+    for (DWORD asi : audioStreams) {
+        item->SetStreamSelection(asi, asi == chosenAudio ? TRUE : FALSE);
+    }
+}
+
+LRESULT CALLBACK StudioVideoHostProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+    auto* mw = reinterpret_cast<MainWindow*>(GetWindowLongPtrW(hwnd, GWLP_USERDATA));
+    if (msg == WM_NCCREATE) {
+        auto* cs = reinterpret_cast<CREATESTRUCTW*>(lParam);
+        SetWindowLongPtrW(hwnd, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(cs->lpCreateParams));
+        return TRUE;
+    }
+    switch (msg) {
+        case WM_ERASEBKGND:
+            return 1;
+        case WM_PAINT: {
+            PAINTSTRUCT ps{};
+            HDC hdc = BeginPaint(hwnd, &ps);
+            RECT rc{};
+            GetClientRect(hwnd, &rc);
+            HBRUSH br = CreateSolidBrush(RGB(6, 8, 14));
+            FillRect(hdc, &rc, br);
+            DeleteObject(br);
+            EndPaint(hwnd, &ps);
+            return 0;
+        }
+        case WM_LBUTTONDOWN:
+            if (mw) SendMessageW(mw->Hwnd(), WM_COMMAND, MAKEWPARAM(ui::BTN_STU_PLAYPAUSE, 0), 0);
+            return 0;
+    }
+    return DefWindowProcW(hwnd, msg, wParam, lParam);
+}
+
+struct StudioGeometry {
+    int leftW = 0;
+    int topH = 0;
+    int timelineTop = 0;
+    int toolY = 0;
+    int toolRow1H = 0;
+    int toolRow2Y = 0;
+    int toolRow2H = 0;
+    int toolH = 0;
+    int rulerH = 0;
+    int v1Top = 0, v1H = 0;
+    int a1Top = 0, a1H = 0;
+    int m1Top = 0, m1H = 0;
+    int hdrW = 0;
+    RECT stageRc{};
+    RECT tlViewRc{};
+    RECT rulerRc{};
+    RECT gameSlRc{};
+    RECT micSlRc{};
+    RECT musSlRc{};
+};
+
+StudioGeometry CalcStudioGeom(int cw, int ch, int dpi) {
+    auto S = [dpi](int px) { return MulDiv(px, dpi, 96); };
+    StudioGeometry gm;
+    gm.leftW = S(246);
+    gm.topH = S(48);
+    int tlH = std::max(S(204), std::min(S(248), (ch * 34) / 100));
+    gm.timelineTop = std::max(S(280), ch - tlH);
+    gm.toolRow1H = S(36);
+    gm.toolRow2H = S(34);
+    gm.toolH = gm.toolRow1H + gm.toolRow2H;
+    gm.toolY = gm.timelineTop - gm.toolH;
+    gm.toolRow2Y = gm.toolY + gm.toolRow1H;
+    gm.rulerH = S(24);
+    gm.hdrW = S(118);
+
+    int tracksAvail = std::max(S(154), ch - gm.timelineTop - gm.rulerH - S(12));
+    gm.v1H = std::max(S(50), (tracksAvail * 38) / 100);
+    gm.a1H = std::max(S(42), (tracksAvail * 30) / 100);
+    gm.m1H = std::max(S(46), tracksAvail - gm.v1H - gm.a1H - S(8));
+    gm.v1Top = gm.timelineTop + gm.rulerH + S(4);
+    gm.a1Top = gm.v1Top + gm.v1H + S(4);
+    gm.m1Top = gm.a1Top + gm.a1H + S(4);
+
+    gm.stageRc = RECT{ gm.leftW + S(10), gm.topH + S(6), cw - S(10), gm.toolY - S(6) };
+    gm.tlViewRc = RECT{ gm.hdrW, gm.timelineTop, cw - S(6), ch - S(4) };
+    gm.rulerRc = RECT{ gm.hdrW, gm.timelineTop, cw - S(6), gm.timelineTop + gm.rulerH };
+
+    // Audio mixer sliders cleanly placed in dedicated Row 2 with zero overlap at 920px+ width
+    int slTop = gm.toolRow2Y + S(9);
+    int slBot = gm.toolRow2Y + S(25);
+    int gx = gm.leftW + S(176);
+    gm.gameSlRc = RECT{ gx, slTop, gx + S(116), slBot };
+    int mx = gm.gameSlRc.right + S(114);
+    gm.micSlRc = RECT{ mx, slTop, mx + S(116), slBot };
+    gm.musSlRc = RECT{ gm.leftW + S(136), slTop, gm.leftW + S(276), slBot };
+    return gm;
+}
+
+} // namespace
+
+class MainWindow::StudioMpCallback : public IMFPMediaPlayerCallback {
+public:
+    StudioMpCallback(HWND notifyHwnd, uint64_t gen, bool isAudio)
+        : notifyHwnd_(notifyHwnd), gen_(gen), isAudio_(isAudio) {}
+
+    void Detach() { alive_.store(false); notifyHwnd_ = nullptr; }
+
+    STDMETHODIMP QueryInterface(REFIID riid, void** ppv) override {
+        if (!ppv) return E_POINTER;
+        if (riid == __uuidof(IUnknown) || riid == __uuidof(IMFPMediaPlayerCallback)) {
+            *ppv = static_cast<IMFPMediaPlayerCallback*>(this);
+            AddRef();
+            return S_OK;
+        }
+        *ppv = nullptr;
+        return E_NOINTERFACE;
+    }
+
+    STDMETHODIMP_(ULONG) AddRef() override { return static_cast<ULONG>(InterlockedIncrement(&ref_)); }
+    STDMETHODIMP_(ULONG) Release() override {
+        ULONG r = static_cast<ULONG>(InterlockedDecrement(&ref_));
+        if (r == 0) delete this;
+        return r;
+    }
+
+    void STDMETHODCALLTYPE OnMediaPlayerEvent(MFP_EVENT_HEADER* pEventHeader) override {
+        if (!pEventHeader || !alive_.load() || !notifyHwnd_) return;
+        auto* m = new StudioMpEventMsg{ gen_, isAudio_, pEventHeader->eEventType };
+        if (!PostMessageW(notifyHwnd_, ui::WM_MW_STUDIO_VIDEO_EV, 0, reinterpret_cast<LPARAM>(m))) {
+            delete m;
+        }
+    }
+
+private:
+    virtual ~StudioMpCallback() = default;
+    volatile LONG ref_ = 1;
+    HWND notifyHwnd_;
+    uint64_t gen_;
+    bool isAudio_;
+    std::atomic<bool> alive_{true};
+};
+
+double MainWindow::StudioTotalDuration() const {
+    double sum = 0.0;
+    for (const auto& c : studioClips_) {
+        sum += std::max(0.1, c.trimEndSec - c.trimStartSec) / std::max(0.5, c.speed);
+    }
+    return sum;
+}
+
+bool MainWindow::MapTimelineToClip(double tlSec, int& outIdx, double& outLocalSec, double& outClipStartSec) const {
+    outIdx = -1;
+    outLocalSec = 0.0;
+    outClipStartSec = 0.0;
+    if (studioClips_.empty()) return false;
+    double acc = 0.0;
+    for (size_t i = 0; i < studioClips_.size(); ++i) {
+        const auto& c = studioClips_[i];
+        double outDur = std::max(0.1, c.trimEndSec - c.trimStartSec) / std::max(0.5, c.speed);
+        if (tlSec <= acc + outDur || i + 1 == studioClips_.size()) {
+            double relOut = std::max(0.0, std::min(outDur, tlSec - acc));
+            outIdx = static_cast<int>(i);
+            outClipStartSec = acc;
+            outLocalSec = std::max(c.trimStartSec, std::min(c.trimEndSec, c.trimStartSec + relOut * c.speed));
+            return true;
+        }
+        acc += outDur;
+    }
+    return false;
+}
+
+void MainWindow::OpenStudio(bool loadQueued) {
+    if (!hwnd_ || studioOpen_) return;
+    if (playerOpen_) CloseEmbeddedPlayer();
+    if (edtSearch_) ShowWindow(edtSearch_, SW_HIDE);
+    for (HWND h : settingsCtrls_) ShowWindow(h, SW_HIDE);
+
+    studioOpen_ = true;
+    studioLeftTab_ = 0;
+    studioFade_ = montageFade_;
+    studioVertical916_ = montageVertical916_;
+    studioTargetMb_ = 0;
+    studioPlayheadSec_ = 0.0;
+    studioTimelineScrollSec_ = 0.0;
+    studioPlaying_ = false;
+    studioVideoReady_ = false;
+    studioAudioReady_ = false;
+    studioLoadedClipIdx_ = -1;
+    studioLoadedClipPath_.clear();
+    studioLoadedMusicPath_.clear();
+    studioPendingSeekSec_ = -1.0;
+    studioPendingAudioSeekSec_ = -1.0;
+    studioDragMode_ = 0;
+
+    if (loadQueued && studioClips_.empty() && !montagePaths_.empty()) {
+        for (const auto& mp : montagePaths_) {
+            StudioClipItem item;
+            item.path = mp;
+            item.name = BaseNameNoExt(mp);
+            for (const auto& c : clips_) {
+                if (_wcsicmp(c.filePath.c_str(), mp.c_str()) == 0) {
+                    item.sourceDurSec = c.durationSeconds;
+                    break;
+                }
+            }
+            bool multi = false;
+            double probedDur = 0.0;
+            ProbeClipAudioTracks(mp, multi, &probedDur);
+            if (probedDur > 0.2) item.sourceDurSec = probedDur;
+            if (item.sourceDurSec <= 0.2) continue;
+            item.hasMultiTrack = multi;
+            item.trimStartSec = 0.0;
+            item.trimEndSec = item.sourceDurSec;
+            item.speed = std::max(0.5, std::min(2.0, montageSpeed_));
+            item.gameVolPct = montageGameMuted_ ? 0 : 100;
+            item.micVolPct = montageMicMuted_ ? 0 : 100;
+            studioClips_.push_back(std::move(item));
+        }
+    }
+    if (!studioClips_.empty() && studioSelClip_ < 0) {
+        studioSelClip_ = 0;
+        studioSelMusic_ = -1;
+    }
+
+    static bool s_reg = false;
+    const wchar_t* vCls = L"AnlikKlipStudioVideo";
+    if (!s_reg) {
+        WNDCLASSEXW wc{};
+        wc.cbSize = sizeof(wc);
+        wc.lpfnWndProc = StudioVideoHostProc;
+        wc.hInstance = hInst_;
+        wc.lpszClassName = vCls;
+        wc.hCursor = LoadCursorW(nullptr, IDC_HAND);
+        RegisterClassExW(&wc);
+        s_reg = true;
+    }
+
+    studioVideoHwnd_ = CreateWindowExW(0, vCls, L"", WS_CHILD | WS_CLIPSIBLINGS,
+        0, 0, 160, 90, hwnd_, nullptr, hInst_, this);
+
+    RECT cli{};
+    GetClientRect(hwnd_, &cli);
+    UpdateStudioLayout(cli.right, cli.bottom);
+    StartStudioWaveformWorker();
+    if (!studioClips_.empty()) {
+        SyncStudioMediaState(true);
+    }
+    SetTimer(hwnd_, ui::TIMER_PLAYER_ID, 60, nullptr);
+    InvalidateRect(hwnd_, nullptr, FALSE);
+}
+
+void MainWindow::CloseStudio() {
+    StopStudioWaveformWorker();
+    if (hwnd_) KillTimer(hwnd_, ui::TIMER_PLAYER_ID);
+    ++studioGen_;
+
+    if (studioVideoCb_) {
+        studioVideoCb_->Detach();
+        studioVideoCb_->Release();
+        studioVideoCb_ = nullptr;
+    }
+    if (studioPlayer_) {
+        studioPlayer_->Shutdown();
+        studioPlayer_->Release();
+        studioPlayer_ = nullptr;
+    }
+    if (studioAudioCb_) {
+        studioAudioCb_->Detach();
+        studioAudioCb_->Release();
+        studioAudioCb_ = nullptr;
+    }
+    if (studioMusicPlayer_) {
+        studioMusicPlayer_->Shutdown();
+        studioMusicPlayer_->Release();
+        studioMusicPlayer_ = nullptr;
+    }
+    if (studioVideoHwnd_) {
+        DestroyWindow(studioVideoHwnd_);
+        studioVideoHwnd_ = nullptr;
+    }
+
+    studioOpen_ = false;
+    studioPlaying_ = false;
+    studioVideoReady_ = false;
+    studioAudioReady_ = false;
+    studioLoadedClipIdx_ = -1;
+    studioLoadedClipPath_.clear();
+    studioLoadedMusicPath_.clear();
+    studioDragMode_ = 0;
+    // Free cached waveform peaks when leaving studio so idle RAM returns near baseline
+    for (auto& c : studioClips_) { c.waveLoaded = false; std::vector<float>().swap(c.wavePeaks); }
+    for (auto& m : studioMusic_) { m.waveLoaded = false; std::vector<float>().swap(m.wavePeaks); }
+
+    UpdateGalleryControlVisibility();
+    if (hwnd_) InvalidateRect(hwnd_, nullptr, FALSE);
+}
+
+void MainWindow::UpdateStudioLayout(int cw, int ch) {
+    if (!studioOpen_ || !studioVideoHwnd_ || cw <= 0 || ch <= 0) return;
+    if (studioClips_.empty() || trimBusy_) {
+        ShowWindow(studioVideoHwnd_, SW_HIDE);
+        return;
+    }
+    StudioGeometry gm = CalcStudioGeom(cw, ch, static_cast<int>(dpi_));
+    int availW = std::max(S(240), static_cast<int>(gm.stageRc.right - gm.stageRc.left) - S(16));
+    int availH = std::max(S(140), static_cast<int>(gm.stageRc.bottom - gm.stageRc.top) - S(12));
+
+    int vw = availW, vh = availH;
+    if (studioVertical916_) {
+        vh = availH;
+        vw = (vh * 9) / 16;
+        if (vw > availW) { vw = availW; vh = (vw * 16) / 9; }
+    } else {
+        vw = availW;
+        vh = (vw * 9) / 16;
+        if (vh > availH) { vh = availH; vw = (vh * 16) / 9; }
+    }
+    int vx = gm.stageRc.left + (static_cast<int>(gm.stageRc.right - gm.stageRc.left) - vw) / 2;
+    int vy = gm.stageRc.top + (static_cast<int>(gm.stageRc.bottom - gm.stageRc.top) - vh) / 2;
+    ShowWindow(studioVideoHwnd_, SW_SHOW);
+    SetWindowPos(studioVideoHwnd_, nullptr, vx, vy, vw, vh, SWP_NOZORDER | SWP_NOACTIVATE);
+    if (studioPlayer_) studioPlayer_->UpdateVideo();
+}
+
+void MainWindow::StopStudioWaveformWorker() {
+    studioWaveStop_.store(true);
+    if (studioWaveThread_.joinable()) {
+        studioWaveThread_.join();
+    }
+    studioWaveStop_.store(false);
+}
+
+void MainWindow::StartStudioWaveformWorker() {
+    StopStudioWaveformWorker();
+    struct Task { bool isMusic; std::wstring path; };
+    std::vector<Task> jobs;
+    auto pushUnique = [&](bool isMus, const std::wstring& p) {
+        for (const auto& j : jobs) {
+            if (j.isMusic == isMus && _wcsicmp(j.path.c_str(), p.c_str()) == 0) return;
+        }
+        jobs.push_back({ isMus, p });
+    };
+    for (const auto& c : studioClips_) {
+        if (!c.waveLoaded && !c.path.empty()) pushUnique(false, c.path);
+    }
+    for (const auto& m : studioMusic_) {
+        if (!m.waveLoaded && !m.path.empty()) pushUnique(true, m.path);
+    }
+    if (jobs.empty() || !hwnd_) return;
+
+    const uint64_t gen = studioGen_.load();
+    HWND target = hwnd_;
+    studioWaveThread_ = std::thread([this, target, gen, jobs = std::move(jobs)]() {
+        ComScope com(COINIT_MULTITHREADED);
+        for (const auto& job : jobs) {
+            if (studioWaveStop_.load() || studioGen_.load() != gen) break;
+            std::vector<float> peaks;
+            if (ExtractAudioWaveform(job.path, 0, 140, peaks) && !peaks.empty()) {
+                auto* msg = new StudioWaveDoneMsg{ gen, job.isMusic, job.path, std::move(peaks) };
+                if (!PostMessageW(target, ui::WM_MW_STUDIO_WAVE_READY, 0, reinterpret_cast<LPARAM>(msg))) {
+                    delete msg;
+                }
+            }
+        }
+    });
+}
+
+void MainWindow::SyncStudioMediaState(bool forceSeekVideo) {
+    if (!studioOpen_ || trimBusy_ || !studioVideoHwnd_) return;
+    if (studioClips_.empty()) {
+        if (studioPlayer_) studioPlayer_->Pause();
+        if (studioMusicPlayer_) studioMusicPlayer_->Pause();
+        studioPlaying_ = false;
+        ShowWindow(studioVideoHwnd_, SW_HIDE);
+        return;
+    }
+
+    int segIdx = -1;
+    double localSec = 0.0, clipStartOut = 0.0;
+    if (!MapTimelineToClip(studioPlayheadSec_, segIdx, localSec, clipStartOut) || segIdx < 0) return;
+
+    const auto& clip = studioClips_[static_cast<size_t>(segIdx)];
+    ShowWindow(studioVideoHwnd_, SW_SHOW);
+
+    if (!studioPlayer_) {
+        studioVideoCb_ = new StudioMpCallback(hwnd_, studioGen_.load(), false);
+        HRESULT hr = MFPCreateMediaPlayer(nullptr, FALSE, MFP_OPTION_NONE,
+            studioVideoCb_, studioVideoHwnd_, &studioPlayer_);
+        if (FAILED(hr) || !studioPlayer_) return;
+    }
+
+    const bool needNewItem = (_wcsicmp(studioLoadedClipPath_.c_str(), clip.path.c_str()) != 0);
+    float previewVol = std::max(0.0f, std::min(1.0f,
+        static_cast<float>(clip.hasMultiTrack ? std::max(clip.gameVolPct, clip.micVolPct) : clip.gameVolPct) / 100.0f));
+    bool previewMute = (clip.gameVolPct == 0 && (!clip.hasMultiTrack || clip.micVolPct == 0));
+
+    if (needNewItem) {
+        studioVideoReady_ = false;
+        studioLoadedClipIdx_ = segIdx;
+        studioLoadedClipPath_ = clip.path;
+        studioPendingSeekSec_ = localSec;
+        IMFPMediaItem* item = nullptr;
+        if (SUCCEEDED(studioPlayer_->CreateMediaItemFromURL(clip.path.c_str(), TRUE, 0, &item)) && item) {
+            SelectBestPreviewAudioTrack(item, clip.path);
+            studioPlayer_->SetMediaItem(item);
+            item->Release();
+        }
+    } else if (studioVideoReady_) {
+        studioLoadedClipIdx_ = segIdx;
+        studioPlayer_->SetVolume(previewVol);
+        studioPlayer_->SetMute(previewMute ? TRUE : FALSE);
+        studioPlayer_->SetRate(static_cast<float>(clip.speed));
+        if (forceSeekVideo) {
+            PROPVARIANT pos;
+            PropVariantInit(&pos);
+            pos.vt = VT_I8;
+            pos.hVal.QuadPart = static_cast<LONGLONG>(localSec * 1e7);
+            studioPlayer_->SetPosition(MFP_POSITIONTYPE_100NS, &pos);
+            PropVariantClear(&pos);
+        }
+        if (studioPlaying_) studioPlayer_->Play();
+        else studioPlayer_->Pause();
+    }
+
+    // Sync secondary audio-only MP3 preview player (created only when music exists)
+    const StudioMusicItem* activeMus = nullptr;
+    for (const auto& m : studioMusic_) {
+        if (studioPlayheadSec_ >= m.timelineStartSec && studioPlayheadSec_ < m.timelineStartSec + m.durationSec - 0.04) {
+            activeMus = &m;
+            break;
+        }
+    }
+    if (studioPlaying_ && activeMus && activeMus->volPct > 0) {
+        if (!studioMusicPlayer_) {
+            studioAudioCb_ = new StudioMpCallback(hwnd_, studioGen_.load(), true);
+            MFPCreateMediaPlayer(nullptr, FALSE, MFP_OPTION_NONE, studioAudioCb_, nullptr, &studioMusicPlayer_);
+        }
+        if (studioMusicPlayer_) {
+            double targetASec = activeMus->trimStartSec + (studioPlayheadSec_ - activeMus->timelineStartSec);
+            float musVol = std::max(0.0f, std::min(1.0f, static_cast<float>(activeMus->volPct) / 100.0f));
+            if (_wcsicmp(studioLoadedMusicPath_.c_str(), activeMus->path.c_str()) != 0) {
+                studioAudioReady_ = false;
+                studioLoadedMusicPath_ = activeMus->path;
+                studioPendingAudioSeekSec_ = targetASec;
+                IMFPMediaItem* aItem = nullptr;
+                if (SUCCEEDED(studioMusicPlayer_->CreateMediaItemFromURL(activeMus->path.c_str(), TRUE, 0, &aItem)) && aItem) {
+                    studioMusicPlayer_->SetMediaItem(aItem);
+                    aItem->Release();
+                }
+            } else if (studioAudioReady_) {
+                studioMusicPlayer_->SetVolume(musVol);
+                studioMusicPlayer_->SetMute(FALSE);
+                PROPVARIANT aPos;
+                PropVariantInit(&aPos);
+                double curASec = targetASec;
+                if (SUCCEEDED(studioMusicPlayer_->GetPosition(MFP_POSITIONTYPE_100NS, &aPos)) && aPos.vt == VT_I8) {
+                    curASec = static_cast<double>(aPos.hVal.QuadPart) / 1e7;
+                }
+                PropVariantClear(&aPos);
+                if (forceSeekVideo || std::abs(curASec - targetASec) > 0.40) {
+                    PROPVARIANT np;
+                    PropVariantInit(&np);
+                    np.vt = VT_I8;
+                    np.hVal.QuadPart = static_cast<LONGLONG>(targetASec * 1e7);
+                    studioMusicPlayer_->SetPosition(MFP_POSITIONTYPE_100NS, &np);
+                    PropVariantClear(&np);
+                }
+                studioMusicPlayer_->Play();
+            }
+        }
+    } else if (studioMusicPlayer_ && studioAudioReady_) {
+        studioMusicPlayer_->Pause();
+    }
+}
+
+void MainWindow::UpdateStudioMetrics() {
+    if (!studioOpen_ || trimBusy_ || !studioPlaying_) return;
+    if (studioClips_.empty() || !studioPlayer_ || !studioVideoReady_) {
+        studioPlaying_ = false;
+        return;
+    }
+
+    int curIdx = studioLoadedClipIdx_;
+    if (curIdx < 0 || curIdx >= static_cast<int>(studioClips_.size())) {
+        MapTimelineToClip(studioPlayheadSec_, curIdx, studioPendingSeekSec_, studioPendingAudioSeekSec_);
+    }
+    if (curIdx < 0 || curIdx >= static_cast<int>(studioClips_.size())) return;
+
+    const auto& clip = studioClips_[static_cast<size_t>(curIdx)];
+    double localPos = clip.trimStartSec;
+    PROPVARIANT pos;
+    PropVariantInit(&pos);
+    if (SUCCEEDED(studioPlayer_->GetPosition(MFP_POSITIONTYPE_100NS, &pos)) && pos.vt == VT_I8) {
+        localPos = static_cast<double>(pos.hVal.QuadPart) / 1e7;
+    }
+    PropVariantClear(&pos);
+
+    double clipStartOut = 0.0;
+    for (int i = 0; i < curIdx; ++i) {
+        const auto& c = studioClips_[static_cast<size_t>(i)];
+        clipStartOut += std::max(0.1, c.trimEndSec - c.trimStartSec) / std::max(0.5, c.speed);
+    }
+
+    if (localPos >= clip.trimEndSec - 0.04) {
+        double nextTl = clipStartOut + std::max(0.1, clip.trimEndSec - clip.trimStartSec) / std::max(0.5, clip.speed);
+        if (curIdx + 1 < static_cast<int>(studioClips_.size())) {
+            studioPlayheadSec_ = nextTl;
+            SyncStudioMediaState(true);
+        } else {
+            studioPlayheadSec_ = StudioTotalDuration();
+            studioPlaying_ = false;
+            studioPlayer_->Pause();
+            if (studioMusicPlayer_) studioMusicPlayer_->Pause();
+        }
+    } else {
+        double relLocal = std::max(0.0, localPos - clip.trimStartSec);
+        studioPlayheadSec_ = clipStartOut + relLocal / std::max(0.5, clip.speed);
+        SyncStudioMediaState(false);
+    }
+
+    // Auto-scroll timeline to keep playhead visible
+    if (hwnd_) {
+        RECT cli{};
+        GetClientRect(hwnd_, &cli);
+        StudioGeometry gm = CalcStudioGeom(cli.right, cli.bottom, static_cast<int>(dpi_));
+        double visSec = std::max(1.0, static_cast<double>(gm.tlViewRc.right - gm.tlViewRc.left) / studioPxPerSec_);
+        if (studioPlayheadSec_ > studioTimelineScrollSec_ + visSec * 0.92) {
+            studioTimelineScrollSec_ = studioPlayheadSec_ - visSec * 0.25;
+        } else if (studioPlayheadSec_ < studioTimelineScrollSec_) {
+            studioTimelineScrollSec_ = std::max(0.0, studioPlayheadSec_ - 0.5);
+        }
+        InvalidateRect(hwnd_, nullptr, FALSE);
+    }
+}
+
+void MainWindow::StudioAddClipFromLibrary(size_t rawClipIdx) {
+    if (trimBusy_ || rawClipIdx >= clips_.size()) return;
+    const auto& src = clips_[rawClipIdx];
+    StudioClipItem item;
+    item.path = src.filePath;
+    item.name = BaseNameNoExt(src.fileName);
+    item.sourceDurSec = src.durationSeconds;
+    bool multi = false;
+    double probedDur = 0.0;
+    ProbeClipAudioTracks(src.filePath, multi, &probedDur);
+    if (probedDur > 0.2) item.sourceDurSec = probedDur;
+    if (item.sourceDurSec <= 0.2) return;
+    item.hasMultiTrack = multi;
+    item.trimStartSec = 0.0;
+    item.trimEndSec = item.sourceDurSec;
+    item.speed = 1.0;
+    item.gameVolPct = 100;
+    item.micVolPct = 100;
+
+    studioClips_.push_back(std::move(item));
+    studioSelClip_ = static_cast<int>(studioClips_.size()) - 1;
+    studioSelMusic_ = -1;
+
+    RECT cli{};
+    if (hwnd_) GetClientRect(hwnd_, &cli);
+    UpdateStudioLayout(cli.right, cli.bottom);
+    StartStudioWaveformWorker();
+    if (studioClips_.size() == 1) {
+        studioPlayheadSec_ = 0.0;
+        SyncStudioMediaState(true);
+    }
+    if (hwnd_) InvalidateRect(hwnd_, nullptr, FALSE);
+}
+
+void MainWindow::StudioAddMusicFile(const std::wstring& givenPath) {
+    if (trimBusy_) return;
+    std::wstring chosen = givenPath;
+    if (chosen.empty()) {
+        ComPtr<IFileOpenDialog> dlg;
+        if (FAILED(CoCreateInstance(CLSID_FileOpenDialog, nullptr, CLSCTX_ALL, IID_PPV_ARGS(dlg.Put()))) || !dlg) return;
+        COMDLG_FILTERSPEC spec[] = {
+            { L"Ses Dosyaları (*.mp3;*.wav;*.m4a;*.aac;*.flac)", L"*.mp3;*.wav;*.m4a;*.aac;*.flac" },
+            { L"Tüm Dosyalar (*.*)", L"*.*" }
+        };
+        dlg->SetFileTypes(2, spec);
+        dlg->SetTitle(L"Zaman Çizelgesine Müzik / MP3 Ekle");
+        if (SUCCEEDED(dlg->Show(hwnd_))) {
+            ComPtr<IShellItem> item;
+            if (SUCCEEDED(dlg->GetResult(item.Put())) && item) {
+                PWSTR psz = nullptr;
+                if (SUCCEEDED(item->GetDisplayName(SIGDN_FILESYSPATH, &psz)) && psz) {
+                    chosen = psz;
+                    CoTaskMemFree(psz);
+                }
+            }
+        }
+    }
+    if (chosen.empty()) return;
+
+    double dur = 0.0;
+    if (!ProbeAudioFileDuration(chosen, dur) || dur <= 0.2) {
+        SetFooterMessage(L"Seçilen müzik dosyası okunamadı.");
+        if (hwnd_) InvalidateRect(hwnd_, nullptr, FALSE);
+        return;
+    }
+
+    StudioMusicItem mus;
+    mus.path = chosen;
+    mus.name = BaseNameNoExt(chosen);
+    mus.sourceDurSec = dur;
+    mus.timelineStartSec = studioPlayheadSec_;
+    mus.trimStartSec = 0.0;
+    double vidDur = StudioTotalDuration();
+    mus.durationSec = (vidDur > 1.0) ? std::min(dur, std::max(2.0, vidDur - mus.timelineStartSec)) : std::min(dur, 30.0);
+    mus.volPct = 85;
+    mus.fadeIn = true;
+    mus.fadeOut = true;
+
+    studioMusic_.push_back(std::move(mus));
+    studioSelMusic_ = static_cast<int>(studioMusic_.size()) - 1;
+    studioSelClip_ = -1;
+
+    bool seen = false;
+    for (const auto& r : studioRecentAudio_) {
+        if (_wcsicmp(r.c_str(), chosen.c_str()) == 0) { seen = true; break; }
+    }
+    if (!seen) studioRecentAudio_.push_back(chosen);
+
+    StartStudioWaveformWorker();
+    SetFooterMessage(L"Müzik eklendi: Çubuğu sürükleyip istediğiniz saniyeye yerleştirebilirsiniz.");
+    if (hwnd_) InvalidateRect(hwnd_, nullptr, FALSE);
+}
+
+void MainWindow::StudioSplitAtPlayhead() {
+    if (trimBusy_ || studioClips_.empty()) return;
+    int idx = -1;
+    double localSec = 0.0, clipStartOut = 0.0;
+    if (!MapTimelineToClip(studioPlayheadSec_, idx, localSec, clipStartOut) || idx < 0) return;
+
+    StudioClipItem orig = studioClips_[static_cast<size_t>(idx)];
+    if (localSec <= orig.trimStartSec + 0.25 || localSec >= orig.trimEndSec - 0.25) {
+        SetFooterMessage(L"Bölmek için oynatma imlecini klibin ortalarına getirin.");
+        if (hwnd_) InvalidateRect(hwnd_, nullptr, FALSE);
+        return;
+    }
+
+    StudioClipItem rightPart = orig;
+    orig.trimEndSec = localSec;
+    rightPart.trimStartSec = localSec;
+    studioClips_[static_cast<size_t>(idx)] = orig;
+    studioClips_.insert(studioClips_.begin() + idx + 1, std::move(rightPart));
+    studioSelClip_ = idx + 1;
+    studioSelMusic_ = -1;
+    studioLoadedClipIdx_ = -1;
+    if (hwnd_) InvalidateRect(hwnd_, nullptr, FALSE);
+}
+
+void MainWindow::StudioDeleteSelection() {
+    if (trimBusy_) return;
+    if (studioSelMusic_ >= 0 && studioSelMusic_ < static_cast<int>(studioMusic_.size())) {
+        studioMusic_.erase(studioMusic_.begin() + studioSelMusic_);
+        if (studioMusicPlayer_) studioMusicPlayer_->Pause();
+        studioLoadedMusicPath_.clear();
+        studioSelMusic_ = studioMusic_.empty() ? -1 : std::min(studioSelMusic_, static_cast<int>(studioMusic_.size()) - 1);
+        if (studioSelMusic_ < 0 && !studioClips_.empty()) studioSelClip_ = 0;
+    } else if (studioSelClip_ >= 0 && studioSelClip_ < static_cast<int>(studioClips_.size())) {
+        studioClips_.erase(studioClips_.begin() + studioSelClip_);
+        studioLoadedClipIdx_ = -1;
+        studioLoadedClipPath_.clear();
+        double tot = StudioTotalDuration();
+        if (studioPlayheadSec_ > tot) studioPlayheadSec_ = tot;
+        studioSelClip_ = studioClips_.empty() ? -1 : std::min(studioSelClip_, static_cast<int>(studioClips_.size()) - 1);
+        RECT cli{};
+        if (hwnd_) GetClientRect(hwnd_, &cli);
+        UpdateStudioLayout(cli.right, cli.bottom);
+        SyncStudioMediaState(true);
+    }
+    if (hwnd_) InvalidateRect(hwnd_, nullptr, FALSE);
+}
+
+void MainWindow::StudioMoveSelectedClip(int dir) {
+    if (trimBusy_ || studioSelClip_ < 0 || studioSelClip_ >= static_cast<int>(studioClips_.size())) return;
+    int next = studioSelClip_ + dir;
+    if (next < 0 || next >= static_cast<int>(studioClips_.size())) return;
+    std::swap(studioClips_[static_cast<size_t>(studioSelClip_)], studioClips_[static_cast<size_t>(next)]);
+    studioSelClip_ = next;
+    studioLoadedClipIdx_ = -1;
+    SyncStudioMediaState(true);
+    if (hwnd_) InvalidateRect(hwnd_, nullptr, FALSE);
+}
+
+void MainWindow::StudioCycleClipSpeed() {
+    if (trimBusy_ || studioSelClip_ < 0 || studioSelClip_ >= static_cast<int>(studioClips_.size())) return;
+    auto& c = studioClips_[static_cast<size_t>(studioSelClip_)];
+    if (c.speed < 0.75) c.speed = 1.0;
+    else if (c.speed < 1.25) c.speed = 1.5;
+    else if (c.speed < 1.75) c.speed = 2.0;
+    else c.speed = 0.5;
+    studioPlayheadSec_ = std::min(studioPlayheadSec_, StudioTotalDuration());
+    SyncStudioMediaState(false);
+    if (hwnd_) InvalidateRect(hwnd_, nullptr, FALSE);
+}
+
+void MainWindow::StudioTogglePlayPause() {
+    if (!studioOpen_ || trimBusy_ || studioClips_.empty()) return;
+    studioPlaying_ = !studioPlaying_;
+    if (studioPlaying_) {
+        double tot = StudioTotalDuration();
+        if (studioPlayheadSec_ >= tot - 0.08) studioPlayheadSec_ = 0.0;
+        SyncStudioMediaState(true);
+    } else {
+        if (studioPlayer_) studioPlayer_->Pause();
+        if (studioMusicPlayer_) studioMusicPlayer_->Pause();
+    }
+    if (hwnd_) InvalidateRect(hwnd_, nullptr, FALSE);
+}
+
+void MainWindow::StudioSeekTimeline(double targetSec, bool syncAudio) {
+    double tot = StudioTotalDuration();
+    studioPlayheadSec_ = std::max(0.0, std::min(tot, targetSec));
+    if (syncAudio) SyncStudioMediaState(true);
+    if (hwnd_) InvalidateRect(hwnd_, nullptr, FALSE);
+}
+
+void MainWindow::StartStudioRender() {
+    if (trimBusy_ || studioClips_.empty()) return;
+    if (trimThread_.joinable()) trimThread_.join();
+
+    // Release preview players cleanly so source files have zero file lock during encode
+    studioPlaying_ = false;
+    ++studioGen_;
+    if (studioVideoCb_) { studioVideoCb_->Detach(); studioVideoCb_->Release(); studioVideoCb_ = nullptr; }
+    if (studioPlayer_) { studioPlayer_->Shutdown(); studioPlayer_->Release(); studioPlayer_ = nullptr; }
+    if (studioAudioCb_) { studioAudioCb_->Detach(); studioAudioCb_->Release(); studioAudioCb_ = nullptr; }
+    if (studioMusicPlayer_) { studioMusicPlayer_->Shutdown(); studioMusicPlayer_->Release(); studioMusicPlayer_ = nullptr; }
+    studioVideoReady_ = false;
+    studioAudioReady_ = false;
+    studioLoadedClipPath_.clear();
+    studioLoadedMusicPath_.clear();
+    if (studioVideoHwnd_) ShowWindow(studioVideoHwnd_, SW_HIDE);
+
+    trimCancel_.store(false);
+    trimBusy_ = true;
+
+    std::wstring outDir = app_.Config().outputDir;
+    if (outDir.empty()) {
+        size_t sl = studioClips_[0].path.find_last_of(L"\\/");
+        if (sl != std::wstring::npos) outDir = studioClips_[0].path.substr(0, sl);
+    }
+    const std::wstring outPath = BuildMontageOutputPath(outDir);
+
+    ClipEditSpec editSpec;
+    editSpec.dstPath = outPath;
+    editSpec.fadeTransitions = studioFade_;
+    editSpec.vertical916 = studioVertical916_;
+    editSpec.targetSizeMb = studioTargetMb_;
+    for (const auto& c : studioClips_) {
+        MontageSegmentSpec ms;
+        ms.path = c.path;
+        ms.startSec = c.trimStartSec;
+        ms.endSec = c.trimEndSec;
+        ms.speed = c.speed;
+        ms.gameVolPct = c.gameVolPct;
+        ms.micVolPct = c.micVolPct;
+        editSpec.montageSegments.push_back(std::move(ms));
+    }
+    for (const auto& m : studioMusic_) {
+        MontageMusicTrackSpec mt;
+        mt.path = m.path;
+        mt.timelineStartSec = m.timelineStartSec;
+        mt.trimStartSec = m.trimStartSec;
+        mt.durationSec = m.durationSec;
+        mt.volPct = m.volPct;
+        mt.fadeIn = m.fadeIn;
+        mt.fadeOut = m.fadeOut;
+        editSpec.musicTracks.push_back(std::move(mt));
+    }
+
+    SetFooterMessage(L"Montaj render alınıyor, lütfen bekleyin...");
+    HWND target = hwnd_;
+    trimThread_ = std::thread([this, target, outPath, editSpec]() {
+        ComScope com(COINIT_MULTITHREADED);
+        std::string errUtf8;
+        bool ok = EditMp4Clip(editSpec, errUtf8, &trimCancel_);
+        auto* msg = new ui::TrimDoneMsg{};
+        if (trimCancel_.load()) {
+            DeleteFileW(outPath.c_str());
+            msg->ok = false;
+            msg->message = L"Render iptal edildi.";
+        } else {
+            msg->ok = ok;
+            msg->replaceOriginal = false;
+            msg->origPath = editSpec.montageSegments.empty() ? L"" : editSpec.montageSegments[0].path;
+            msg->outPath = outPath;
+            if (!ok) {
+                int wlen = MultiByteToWideChar(CP_UTF8, 0, errUtf8.c_str(), -1, nullptr, 0);
+                std::wstring werr(wlen > 0 ? wlen - 1 : 0, L'\0');
+                if (wlen > 1) MultiByteToWideChar(CP_UTF8, 0, errUtf8.c_str(), -1, &werr[0], wlen);
+                msg->message = L"Render başarısız: " + werr;
+            }
+        }
+        if (!PostMessageW(target, ui::WM_MW_TRIM_DONE, 0, reinterpret_cast<LPARAM>(msg))) {
+            delete msg;
+        }
+    });
+    if (hwnd_) InvalidateRect(hwnd_, nullptr, FALSE);
+}
+
+bool MainWindow::HandleStudioAppMessage(UINT msg, WPARAM /*wParam*/, LPARAM lParam, LRESULT& outRes) {
+    if (msg == ui::WM_MW_STUDIO_VIDEO_EV) {
+        auto* ev = reinterpret_cast<StudioMpEventMsg*>(lParam);
+        if (ev) {
+            if (ev->gen == studioGen_.load() && studioOpen_) {
+                if (!ev->isAudio && studioPlayer_) {
+                    if (ev->type == MFP_EVENT_TYPE_MEDIAITEM_SET) {
+                        studioVideoReady_ = true;
+                        int idx = studioLoadedClipIdx_;
+                        if (idx >= 0 && idx < static_cast<int>(studioClips_.size())) {
+                            const auto& c = studioClips_[static_cast<size_t>(idx)];
+                            float vol = std::max(0.0f, std::min(1.0f,
+                                static_cast<float>(c.hasMultiTrack ? std::max(c.gameVolPct, c.micVolPct) : c.gameVolPct) / 100.0f));
+                            bool mute = (c.gameVolPct == 0 && (!c.hasMultiTrack || c.micVolPct == 0));
+                            studioPlayer_->SetVolume(vol);
+                            studioPlayer_->SetMute(mute ? TRUE : FALSE);
+                            studioPlayer_->SetRate(static_cast<float>(c.speed));
+                        }
+                        if (studioPendingSeekSec_ >= 0.0) {
+                            PROPVARIANT sp;
+                            PropVariantInit(&sp);
+                            sp.vt = VT_I8;
+                            sp.hVal.QuadPart = static_cast<LONGLONG>(studioPendingSeekSec_ * 1e7);
+                            studioPlayer_->SetPosition(MFP_POSITIONTYPE_100NS, &sp);
+                            PropVariantClear(&sp);
+                            studioPendingSeekSec_ = -1.0;
+                        }
+                        studioPlayer_->UpdateVideo();
+                        if (studioPlaying_) studioPlayer_->Play();
+                        else studioPlayer_->Pause();
+                    } else if (ev->type == MFP_EVENT_TYPE_PLAYBACK_ENDED) {
+                        studioPlaying_ = false;
+                        studioPlayheadSec_ = StudioTotalDuration();
+                        if (studioMusicPlayer_) studioMusicPlayer_->Pause();
+                        if (hwnd_) InvalidateRect(hwnd_, nullptr, FALSE);
+                    }
+                } else if (ev->isAudio && studioMusicPlayer_) {
+                    if (ev->type == MFP_EVENT_TYPE_MEDIAITEM_SET) {
+                        studioAudioReady_ = true;
+                        for (const auto& m : studioMusic_) {
+                            if (_wcsicmp(m.path.c_str(), studioLoadedMusicPath_.c_str()) == 0) {
+                                studioMusicPlayer_->SetVolume(std::max(0.0f, std::min(1.0f, static_cast<float>(m.volPct) / 100.0f)));
+                                break;
+                            }
+                        }
+                        if (studioPendingAudioSeekSec_ >= 0.0) {
+                            PROPVARIANT ap;
+                            PropVariantInit(&ap);
+                            ap.vt = VT_I8;
+                            ap.hVal.QuadPart = static_cast<LONGLONG>(studioPendingAudioSeekSec_ * 1e7);
+                            studioMusicPlayer_->SetPosition(MFP_POSITIONTYPE_100NS, &ap);
+                            PropVariantClear(&ap);
+                            studioPendingAudioSeekSec_ = -1.0;
+                        }
+                        if (studioPlaying_) studioMusicPlayer_->Play();
+                        else studioMusicPlayer_->Pause();
+                    }
+                }
+            }
+            delete ev;
+        }
+        outRes = 0;
+        return true;
+    }
+
+    if (msg == ui::WM_MW_STUDIO_WAVE_READY) {
+        auto* wm = reinterpret_cast<StudioWaveDoneMsg*>(lParam);
+        if (wm) {
+            if (wm->gen == studioGen_.load() && studioOpen_) {
+                if (!wm->isMusic) {
+                    for (auto& c : studioClips_) {
+                        if (_wcsicmp(c.path.c_str(), wm->path.c_str()) == 0) {
+                            c.wavePeaks = wm->peaks;
+                            c.waveLoaded = true;
+                        }
+                    }
+                } else {
+                    for (auto& m : studioMusic_) {
+                        if (_wcsicmp(m.path.c_str(), wm->path.c_str()) == 0) {
+                            m.wavePeaks = wm->peaks;
+                            m.waveLoaded = true;
+                        }
+                    }
+                }
+                if (hwnd_) InvalidateRect(hwnd_, nullptr, FALSE);
+            }
+            delete wm;
+        }
+        outRes = 0;
+        return true;
+    }
+    return false;
+}
+
+bool MainWindow::HandleStudioPreTranslate(const MSG& msg) {
+    if (!studioOpen_ || activeTab_ != 1 || msg.message != WM_KEYDOWN) return false;
+    UINT vk = static_cast<UINT>(msg.wParam);
+    if (vk == VK_ESCAPE) {
+        if (!trimBusy_) CloseStudio();
+        return true;
+    }
+    if (trimBusy_) return false;
+    if (vk == VK_SPACE) { StudioTogglePlayPause(); return true; }
+    if (vk == VK_LEFT)  {
+        double step = (GetKeyState(VK_SHIFT) & 0x8000) ? -0.2 : -1.0;
+        StudioSeekTimeline(studioPlayheadSec_ + step);
+        return true;
+    }
+    if (vk == VK_RIGHT) {
+        double step = (GetKeyState(VK_SHIFT) & 0x8000) ? +0.2 : +1.0;
+        StudioSeekTimeline(studioPlayheadSec_ + step);
+        return true;
+    }
+    if (vk == 'S' || (vk == 'B' && (GetKeyState(VK_CONTROL) & 0x8000))) {
+        StudioSplitAtPlayhead();
+        return true;
+    }
+    if (vk == VK_DELETE) {
+        StudioDeleteSelection();
+        return true;
+    }
+    return false;
+}
+
+void MainWindow::PaintMontajLanding(void* gPtr, int cw, int ch) {
+    auto& g = *reinterpret_cast<Gdiplus::Graphics*>(gPtr);
+    Gdiplus::FontFamily ff(L"Segoe UI");
+    Gdiplus::Font fTitle(&ff, 14.5f, Gdiplus::FontStyleBold, Gdiplus::UnitPoint);
+    Gdiplus::Font fSub(&ff, 9.0f, Gdiplus::FontStyleRegular, Gdiplus::UnitPoint);
+    Gdiplus::Font fBold(&ff, 9.8f, Gdiplus::FontStyleBold, Gdiplus::UnitPoint);
+    Gdiplus::Font fSmall(&ff, 8.3f, Gdiplus::FontStyleRegular, Gdiplus::UnitPoint);
+
+    Gdiplus::SolidBrush brText(Gc(238, 242, 248));
+    Gdiplus::SolidBrush brMuted(Gc(148, 160, 180));
+    Gdiplus::SolidBrush brBlueTxt(Gc(147, 197, 253));
+    Gdiplus::SolidBrush brCyanTxt(Gc(103, 232, 249));
+    Gdiplus::StringFormat sfLeft, sfCenter;
+    sfLeft.SetAlignment(Gdiplus::StringAlignmentNear);
+    sfLeft.SetLineAlignment(Gdiplus::StringAlignmentCenter);
+    sfLeft.SetTrimming(Gdiplus::StringTrimmingEllipsisCharacter);
+    sfLeft.SetFormatFlags(Gdiplus::StringFormatFlagsNoWrap);
+    sfCenter.SetAlignment(Gdiplus::StringAlignmentCenter);
+    sfCenter.SetLineAlignment(Gdiplus::StringAlignmentCenter);
+    sfCenter.SetFormatFlags(Gdiplus::StringFormatFlagsNoWrap);
+
+    auto addBtnPx = [&](int id, int px, int py, int pw, int ph, const std::wstring& label,
+                        Gdiplus::Color baseCol, Gdiplus::Color hoverCol, Gdiplus::Color borderCol, bool enabled = true) {
+        RECT rc{ px, py, px + pw, py + ph };
+        customButtons_.push_back({ id, rc, enabled });
+        bool hov = enabled && (hoverBtnId_ == id);
+        bool prs = enabled && (pressedBtnId_ == id);
+        Gdiplus::Color fill = !enabled ? Gc(26, 31, 42) : (prs ? hoverCol : (hov ? hoverCol : baseCol));
+        if (enabled && !prs) {
+            Gdiplus::Color topC(fill.GetA(),
+                static_cast<uint8_t>(std::min(255, fill.GetR() + 14)),
+                static_cast<uint8_t>(std::min(255, fill.GetG() + 14)),
+                static_cast<uint8_t>(std::min(255, fill.GetB() + 16)));
+            FillRoundRectGrad(g, (float)rc.left, (float)rc.top, (float)pw, (float)ph, (float)S(9), topC, fill);
+        } else {
+            FillRoundRect(g, (float)rc.left, (float)rc.top, (float)pw, (float)ph, (float)S(9), fill);
+        }
+        if (borderCol.GetA() > 0) StrokeRoundRect(g, (float)rc.left, (float)rc.top, (float)pw, (float)ph, (float)S(9), borderCol);
+        Gdiplus::SolidBrush tb(!enabled ? Gc(100, 112, 132) : Gc(245, 248, 255));
+        g.DrawString(label.c_str(), -1, &fBold, Gdiplus::RectF((float)rc.left, (float)rc.top, (float)pw, (float)ph), &sfCenter, &tb);
+    };
+
+    const int bodyW = std::max(S(640), cw - S(264));
+    g.DrawString(L"Montaj & Stüdyo", -1, &fTitle,
+        Gdiplus::RectF((float)S(242), (float)S(14), (float)S(320), (float)S(28)), &sfLeft, &brText);
+    g.DrawString(L"Kliplerinizi birleştirin, zaman çizelgesinde MP3 müzik ekleyin, oyun & mikrofon seslerini miksleyin.", -1, &fSmall,
+        Gdiplus::RectF((float)S(242), (float)S(42), (float)bodyW, (float)S(18)), &sfLeft, &brMuted);
+
+    // Hero card to open full Medal-style Studio page
+    const int heroY = S(68), heroH = S(104);
+    FillRoundRectGrad(g, (float)S(242), (float)heroY, (float)bodyW, (float)heroH, (float)S(14),
+        Gc(22, 30, 52), Gc(15, 20, 34));
+    StrokeRoundRect(g, (float)S(242), (float)heroY, (float)bodyW, (float)heroH, (float)S(14), Gc(99, 102, 241, 135), 1.3f);
+    FillRoundRect(g, (float)S(258), (float)(heroY + S(16)), (float)S(66), (float)S(20), (float)S(10), Gc(124, 58, 237, 190));
+    g.DrawString(L"STÜDYO", -1, &fSmall,
+        Gdiplus::RectF((float)S(258), (float)(heroY + S(16)), (float)S(66), (float)S(20)), &sfCenter, &brText);
+    g.DrawString(L"Çok Kanallı Zaman Çizelgesi Düzenleyici", -1, &fTitle,
+        Gdiplus::RectF((float)S(332), (float)(heroY + S(13)), (float)std::max(S(260), bodyW - S(340)), (float)S(26)), &sfLeft, &brText);
+    g.DrawString(L"Soldan klip seçin  •  Alt kanaldan sesleri ayarlayın  •  İstediğiniz saniyeye MP3 müzik koyun", -1, &fSub,
+        Gdiplus::RectF((float)S(258), (float)(heroY + S(46)), (float)std::max(S(300), bodyW - S(270)), (float)S(22)), &sfLeft, &brCyanTxt);
+    g.DrawString(L"Böl / Kes  •  Süre Kırpma  •  Hız (0.5x-2x)  •  Karartma Geçişi  •  9:16 Dikey  •  Discord ≤10/25 MB", -1, &fSmall,
+        Gdiplus::RectF((float)S(258), (float)(heroY + S(70)), (float)std::max(S(300), bodyW - S(270)), (float)S(20)), &sfLeft, &brMuted);
+
+    addBtnPx(ui::BTN_MNT_OPEN_STUDIO, S(242) + bodyW - S(218), heroY + S(29), S(200), S(46),
+        L"Düzenleyiciyi Aç  →", Gc(16, 185, 129), Gc(5, 150, 105), Gc(52, 211, 153), !trimBusy_);
+
+    // Quick clip selector + pre-queue below
+    const int colGap = S(16);
+    const int leftW = (bodyW - colGap) / 2;
+    const int rightX = S(242) + leftW + colGap;
+    const int rightW = bodyW - leftW - colGap;
+    const int listTop = heroY + heroH + S(14);
+    const int listH = std::max(S(180), ch - listTop - S(24));
+
+    FillRoundRect(g, (float)S(242), (float)listTop, (float)leftW, (float)listH, (float)S(12), Gc(16, 21, 33));
+    StrokeRoundRect(g, (float)S(242), (float)listTop, (float)leftW, (float)listH, (float)S(12), Gc(44, 56, 80));
+    g.DrawString(L"Kliplerim (Hızlı Seçim)", -1, &fBold,
+        Gdiplus::RectF((float)S(256), (float)(listTop + S(10)), (float)(leftW - S(28)), (float)S(22)), &sfLeft, &brBlueTxt);
+
+    const int rowH = S(40);
+    const int rowStartY = listTop + S(38);
+    const int maxVisLib = std::max(1, (listH - S(46)) / rowH);
+    const int maxLibSc = std::max(0, static_cast<int>(clips_.size()) - maxVisLib);
+    montageLibScroll_ = std::max(0, std::min(montageLibScroll_, maxLibSc));
+
+    for (int vi = 0; vi < maxVisLib; ++vi) {
+        int ci = montageLibScroll_ + vi;
+        if (ci >= static_cast<int>(clips_.size())) break;
+        const auto& c = clips_[static_cast<size_t>(ci)];
+        int ry = rowStartY + vi * rowH;
+        FillRoundRect(g, (float)S(252), (float)ry, (float)(leftW - S(20)), (float)(rowH - S(5)), (float)S(8), Gc(22, 29, 45));
+        wchar_t meta[64] = {};
+        swprintf(meta, 64, L"%.1f sn • %.1f MB", c.durationSeconds, static_cast<double>(c.fileSizeBytes) / (1024.0 * 1024.0));
+        g.DrawString(c.fileName.c_str(), -1, &fSmall,
+            Gdiplus::RectF((float)S(260), (float)(ry + S(3)), (float)(leftW - S(94)), (float)S(16)), &sfLeft, &brText);
+        g.DrawString(meta, -1, &fSmall,
+            Gdiplus::RectF((float)S(260), (float)(ry + S(18)), (float)(leftW - S(94)), (float)S(14)), &sfLeft, &brMuted);
+        addBtnPx(ui::BTN_MNT_ADD_BASE + ci, S(242) + leftW - S(72), ry + S(5), S(54), S(25), L"+ Ekle",
+            Gc(37, 99, 235), Gc(59, 130, 246), Gc(96, 165, 250), !trimBusy_ && ci < 900);
+    }
+
+    FillRoundRect(g, (float)rightX, (float)listTop, (float)rightW, (float)listH, (float)S(12), Gc(16, 21, 33));
+    StrokeRoundRect(g, (float)rightX, (float)listTop, (float)rightW, (float)listH, (float)S(12), Gc(59, 130, 246, 110));
+    wchar_t qHdr[96] = {};
+    swprintf(qHdr, 96, L"Hazırlanan Sıra (%zu klip)", montagePaths_.size());
+    g.DrawString(qHdr, -1, &fBold,
+        Gdiplus::RectF((float)(rightX + S(14)), (float)(listTop + S(10)), (float)(rightW - S(100)), (float)S(22)), &sfLeft, &brBlueTxt);
+    addBtnPx(ui::BTN_MNT_CLEAR, rightX + rightW - S(78), listTop + S(8), S(64), S(24), L"Temizle",
+        Gc(45, 55, 75), Gc(65, 80, 108), Gc(90, 110, 140), !trimBusy_ && !montagePaths_.empty());
+
+    if (montagePaths_.empty()) {
+        g.DrawString(L"Doğrudan 'Düzenleyiciyi Aç'a basabilir veya soldan klip sırası seçebilirsiniz.", -1, &fSmall,
+            Gdiplus::RectF((float)(rightX + S(16)), (float)(listTop + S(52)), (float)(rightW - S(32)), (float)S(24)), &sfLeft, &brMuted);
+    } else {
+        const int maxVisQ = std::max(1, (listH - S(46)) / rowH);
+        const int maxQSc = std::max(0, static_cast<int>(montagePaths_.size()) - maxVisQ);
+        montageQueueScroll_ = std::max(0, std::min(montageQueueScroll_, maxQSc));
+        for (int vi = 0; vi < maxVisQ; ++vi) {
+            int qi = montageQueueScroll_ + vi;
+            if (qi >= static_cast<int>(montagePaths_.size())) break;
+            const std::wstring& qp = montagePaths_[static_cast<size_t>(qi)];
+            size_t sl = qp.find_last_of(L"\\/");
+            std::wstring qName = (sl != std::wstring::npos) ? qp.substr(sl + 1) : qp;
+            int ry = rowStartY + vi * rowH;
+            FillRoundRect(g, (float)(rightX + S(10)), (float)ry, (float)(rightW - S(20)), (float)(rowH - S(5)), (float)S(8), Gc(22, 29, 45));
+            wchar_t qLine[256] = {};
+            swprintf(qLine, 256, L"#%d  %ls", qi + 1, qName.c_str());
+            g.DrawString(qLine, -1, &fSmall,
+                Gdiplus::RectF((float)(rightX + S(18)), (float)(ry + S(8)), (float)(rightW - S(124)), (float)S(18)), &sfLeft, &brText);
+            int bx = rightX + rightW - S(104);
+            addBtnPx(ui::BTN_MNT_UP_BASE + qi, bx, ry + S(5), S(26), S(25), L"↑",
+                Gc(34, 42, 58), Gc(50, 62, 86), Gc(70, 86, 116), !trimBusy_ && qi > 0);
+            addBtnPx(ui::BTN_MNT_DOWN_BASE + qi, bx + S(30), ry + S(5), S(26), S(25), L"↓",
+                Gc(34, 42, 58), Gc(50, 62, 86), Gc(70, 86, 116), !trimBusy_ && (qi + 1 < static_cast<int>(montagePaths_.size())));
+            addBtnPx(ui::BTN_MNT_DEL_BASE + qi, bx + S(60), ry + S(5), S(26), S(25), L"×",
+                Gc(127, 29, 29), Gc(185, 28, 28), Gc(220, 38, 38), !trimBusy_);
+        }
+    }
+}
+
+void MainWindow::PaintStudio(void* gPtr, int cw, int ch) {
+    auto& g = *reinterpret_cast<Gdiplus::Graphics*>(gPtr);
+    customButtons_.clear();
+
+    Gdiplus::FontFamily ff(L"Segoe UI");
+    Gdiplus::Font fTitle(&ff, 11.5f, Gdiplus::FontStyleBold, Gdiplus::UnitPoint);
+    Gdiplus::Font fBold(&ff, 9.2f, Gdiplus::FontStyleBold, Gdiplus::UnitPoint);
+    Gdiplus::Font fSmall(&ff, 8.2f, Gdiplus::FontStyleRegular, Gdiplus::UnitPoint);
+    Gdiplus::Font fTiny(&ff, 7.6f, Gdiplus::FontStyleBold, Gdiplus::UnitPoint);
+
+    Gdiplus::SolidBrush brText(Gc(238, 242, 248));
+    Gdiplus::SolidBrush brMuted(Gc(148, 160, 180));
+    Gdiplus::SolidBrush brCyan(Gc(103, 232, 249));
+    Gdiplus::SolidBrush brPurple(Gc(216, 180, 254));
+    Gdiplus::StringFormat sfLeft, sfCenter, sfRight;
+    sfLeft.SetAlignment(Gdiplus::StringAlignmentNear);
+    sfLeft.SetLineAlignment(Gdiplus::StringAlignmentCenter);
+    sfLeft.SetTrimming(Gdiplus::StringTrimmingEllipsisCharacter);
+    sfLeft.SetFormatFlags(Gdiplus::StringFormatFlagsNoWrap);
+    sfCenter.SetAlignment(Gdiplus::StringAlignmentCenter);
+    sfCenter.SetLineAlignment(Gdiplus::StringAlignmentCenter);
+    sfCenter.SetFormatFlags(Gdiplus::StringFormatFlagsNoWrap);
+    sfRight.SetAlignment(Gdiplus::StringAlignmentFar);
+    sfRight.SetLineAlignment(Gdiplus::StringAlignmentCenter);
+    sfRight.SetFormatFlags(Gdiplus::StringFormatFlagsNoWrap);
+
+    auto addBtnPx = [&](int id, int px, int py, int pw, int ph, const std::wstring& label,
+                        Gdiplus::Color baseCol, Gdiplus::Color hoverCol, Gdiplus::Color borderCol,
+                        bool enabled = true, bool smallFont = false) {
+        RECT rc{ px, py, px + pw, py + ph };
+        customButtons_.push_back({ id, rc, enabled });
+        bool hov = enabled && (hoverBtnId_ == id);
+        bool prs = enabled && (pressedBtnId_ == id);
+        Gdiplus::Color fill = !enabled ? Gc(24, 29, 40) : (prs ? hoverCol : (hov ? hoverCol : baseCol));
+        FillRoundRect(g, (float)rc.left, (float)rc.top, (float)pw, (float)ph, (float)S(7), fill);
+        if (borderCol.GetA() > 0) StrokeRoundRect(g, (float)rc.left, (float)rc.top, (float)pw, (float)ph, (float)S(7), borderCol);
+        Gdiplus::SolidBrush tb(!enabled ? Gc(96, 108, 128) : Gc(242, 246, 252));
+        g.DrawString(label.c_str(), -1, smallFont ? &fSmall : &fBold,
+            Gdiplus::RectF((float)rc.left, (float)rc.top, (float)pw, (float)ph), &sfCenter, &tb);
+    };
+
+    const StudioGeometry gm = CalcStudioGeom(cw, ch, static_cast<int>(dpi_));
+    const double totalDur = StudioTotalDuration();
+
+    // Base dark canvas
+    g.Clear(Gc(9, 12, 19));
+
+    // ================= 1. TOP BAR =================
+    {
+        Gdiplus::SolidBrush brTop(Gc(14, 18, 28));
+        g.FillRectangle(&brTop, 0, 0, cw, gm.topH);
+        Gdiplus::Pen pSep(Gc(34, 44, 66), 1.0f);
+        g.DrawLine(&pSep, 0, gm.topH, cw, gm.topH);
+
+        FillRoundRectGrad(g, (float)S(12), (float)S(11), (float)S(28), (float)S(28), (float)S(8),
+            Gc(59, 130, 246), Gc(124, 58, 237));
+        g.DrawString(L"Montaj Stüdyosu", -1, &fTitle,
+            Gdiplus::RectF((float)S(48), (float)S(8), (float)S(165), (float)S(34)), &sfLeft, &brText);
+
+        wchar_t statsTxt[64] = {};
+        swprintf(statsTxt, 64, L"%zu klip • %.1f sn", studioClips_.size(), totalDur);
+        FillRoundRect(g, (float)S(212), (float)S(13), (float)S(118), (float)S(24), (float)S(12), Gc(24, 31, 48));
+        g.DrawString(statsTxt, -1, &fSmall,
+            Gdiplus::RectF((float)S(212), (float)S(13), (float)S(118), (float)S(24)), &sfCenter, &brCyan);
+
+        int midX = std::max(S(342), (cw - S(390)) / 2 + S(30));
+        addBtnPx(ui::BTN_STU_ASPECT, midX, S(10), S(104), S(30),
+            studioVertical916_ ? L"9:16 Dikey" : L"16:9 Yatay",
+            studioVertical916_ ? Gc(109, 40, 217) : Gc(26, 33, 50),
+            studioVertical916_ ? Gc(124, 58, 237) : Gc(38, 48, 72),
+            studioVertical916_ ? Gc(167, 139, 250) : Gc(52, 66, 96), !trimBusy_, true);
+        addBtnPx(ui::BTN_STU_FADE, midX + S(110), S(10), S(124), S(30),
+            studioFade_ ? L"Geçiş: Karartma" : L"Geçiş: Keskin",
+            studioFade_ ? Gc(30, 64, 175) : Gc(26, 33, 50),
+            studioFade_ ? Gc(37, 99, 235) : Gc(38, 48, 72),
+            studioFade_ ? Gc(96, 165, 250) : Gc(52, 66, 96), !trimBusy_, true);
+
+        const wchar_t* tgtLbl = (studioTargetMb_ == 10) ? L"Discord ≤10 MB"
+                              : (studioTargetMb_ == 25 ? L"Discord ≤25 MB" : L"Tam Kalite");
+        addBtnPx(ui::BTN_STU_TARGET, midX + S(240), S(10), S(122), S(30), tgtLbl,
+            studioTargetMb_ > 0 ? Gc(79, 70, 229) : Gc(26, 33, 50),
+            studioTargetMb_ > 0 ? Gc(99, 102, 241) : Gc(38, 48, 72),
+            studioTargetMb_ > 0 ? Gc(165, 180, 252) : Gc(52, 66, 96), !trimBusy_, true);
+
+        if (trimBusy_) {
+            addBtnPx(ui::BTN_STU_CANCEL, cw - S(120), S(10), S(104), S(30), L"İptali Seç",
+                Gc(153, 27, 27), Gc(185, 28, 28), Gc(248, 113, 113), true);
+        } else {
+            addBtnPx(ui::BTN_STU_EXIT, cw - S(236), S(10), S(84), S(30), L"← Çıkış",
+                Gc(28, 35, 52), Gc(44, 54, 78), Gc(64, 78, 108), true, true);
+            addBtnPx(ui::BTN_STU_RENDER, cw - S(144), S(10), S(130), S(30), L"Montajı Oluştur",
+                Gc(16, 185, 129), Gc(5, 150, 105), Gc(52, 211, 153), !studioClips_.empty(), true);
+        }
+    }
+
+    // ================= 2. FAR-LEFT LIBRARY & MUSIC DRAWER =================
+    {
+        Gdiplus::SolidBrush brLeft(Gc(13, 17, 27));
+        g.FillRectangle(&brLeft, 0, gm.topH + 1, gm.leftW, gm.timelineTop - gm.topH - 1);
+        Gdiplus::Pen pSep(Gc(34, 44, 66), 1.0f);
+        g.DrawLine(&pSep, gm.leftW, gm.topH, gm.leftW, gm.timelineTop);
+
+        int halfTabW = (gm.leftW - S(26)) / 2;
+        addBtnPx(ui::BTN_STU_LEFT_CLIPS, S(10), gm.topH + S(10), halfTabW, S(30), L"Kliplerim",
+            studioLeftTab_ == 0 ? Gc(37, 99, 235) : Gc(24, 30, 44),
+            studioLeftTab_ == 0 ? Gc(59, 130, 246) : Gc(36, 45, 66),
+            studioLeftTab_ == 0 ? Gc(96, 165, 250) : Gc(48, 60, 86), true, true);
+        addBtnPx(ui::BTN_STU_LEFT_MUSIC, S(16) + halfTabW, gm.topH + S(10), halfTabW, S(30), L"Müzik / MP3",
+            studioLeftTab_ == 1 ? Gc(124, 58, 237) : Gc(24, 30, 44),
+            studioLeftTab_ == 1 ? Gc(139, 92, 246) : Gc(36, 45, 66),
+            studioLeftTab_ == 1 ? Gc(167, 139, 250) : Gc(48, 60, 86), true, true);
+
+        int bodyTop = gm.topH + S(48);
+        int bodyH = std::max(S(80), gm.timelineTop - bodyTop - S(6));
+
+        if (studioLeftTab_ == 0) {
+            const int rowH = S(52);
+            int maxVis = std::max(1, bodyH / rowH);
+            int maxSc = std::max(0, static_cast<int>(clips_.size()) - maxVis);
+            studioLibScroll_ = std::max(0, std::min(studioLibScroll_, maxSc));
+
+            for (int vi = 0; vi < maxVis; ++vi) {
+                int ci = studioLibScroll_ + vi;
+                if (ci >= static_cast<int>(clips_.size())) break;
+                const auto& c = clips_[static_cast<size_t>(ci)];
+                int ry = bodyTop + vi * rowH;
+                FillRoundRect(g, (float)S(10), (float)ry, (float)(gm.leftW - S(20)), (float)(rowH - S(6)), (float)S(8), Gc(22, 28, 42));
+                StrokeRoundRect(g, (float)S(10), (float)ry, (float)(gm.leftW - S(20)), (float)(rowH - S(6)), (float)S(8), Gc(40, 52, 76));
+
+                // Draw cached miniature thumbnail on far left of clip card
+                RECT thRc{ S(15), ry + S(6), S(75), ry + rowH - S(12) };
+                auto it = thumbBmps_.find(c.filePath);
+                if (it != thumbBmps_.end() && it->second) {
+                    Gdiplus::Bitmap bmp(it->second, nullptr);
+                    g.DrawImage(&bmp, static_cast<INT>(thRc.left), static_cast<INT>(thRc.top),
+                        static_cast<INT>(thRc.right - thRc.left), static_cast<INT>(thRc.bottom - thRc.top));
+                } else {
+                    FillRoundRect(g, (float)thRc.left, (float)thRc.top, (float)(thRc.right - thRc.left), (float)(thRc.bottom - thRc.top), (float)S(4), Gc(12, 16, 26));
+                }
+
+                std::wstring stem = BaseNameNoExt(c.fileName);
+                g.DrawString(stem.c_str(), -1, &fSmall,
+                    Gdiplus::RectF((float)S(80), (float)(ry + S(5)), (float)(gm.leftW - S(148)), (float)S(16)), &sfLeft, &brText);
+                wchar_t sub[48] = {};
+                swprintf(sub, 48, L"%.1f sn • %.0f MB", c.durationSeconds, static_cast<double>(c.fileSizeBytes) / (1024.0 * 1024.0));
+                g.DrawString(sub, -1, &fTiny,
+                    Gdiplus::RectF((float)S(80), (float)(ry + S(22)), (float)(gm.leftW - S(148)), (float)S(16)), &sfLeft, &brMuted);
+
+                addBtnPx(ui::BTN_STU_ADD_CLIP_BASE + ci, gm.leftW - S(62), ry + S(10), S(46), S(26), L"+ Ekle",
+                    Gc(37, 99, 235), Gc(59, 130, 246), Gc(96, 165, 250), !trimBusy_ && ci < 900, true);
+            }
+        } else {
+            addBtnPx(ui::BTN_STU_PICK_MP3, S(12), bodyTop + S(2), gm.leftW - S(24), S(36), L"+ PC'den MP3 / Ses Ekle",
+                Gc(124, 58, 237), Gc(139, 92, 246), Gc(196, 181, 253), !trimBusy_, true);
+            g.DrawString(L"Eklediğiniz müziği alttaki M1\nşeridinde istediğiniz saniyeye\nsürükleyebilirsiniz.", -1, &fTiny,
+                Gdiplus::RectF((float)S(12), (float)(bodyTop + S(44)), (float)(gm.leftW - S(24)), (float)S(44)), &sfLeft, &brMuted);
+
+            int recTop = bodyTop + S(96);
+            int recH = S(40);
+            int maxRec = std::max(0, (bodyH - S(98)) / recH);
+            for (int ri = 0; ri < maxRec && ri < static_cast<int>(studioRecentAudio_.size()); ++ri) {
+                int ry = recTop + ri * recH;
+                std::wstring name = BaseNameNoExt(studioRecentAudio_[static_cast<size_t>(ri)]);
+                FillRoundRect(g, (float)S(10), (float)ry, (float)(gm.leftW - S(20)), (float)(recH - S(6)), (float)S(8), Gc(26, 22, 46));
+                g.DrawString(name.c_str(), -1, &fSmall,
+                    Gdiplus::RectF((float)S(18), (float)ry, (float)(gm.leftW - S(90)), (float)(recH - S(6))), &sfLeft, &brPurple);
+                addBtnPx(ui::BTN_STU_ADD_MUSIC_BASE + ri, gm.leftW - S(64), ry + S(4), S(48), S(26), L"+ Koy",
+                    Gc(124, 58, 237), Gc(139, 92, 246), Gc(196, 181, 253), !trimBusy_ && ri < 500, true);
+            }
+        }
+    }
+
+    // ================= 3. PREVIEW STAGE BACKGROUND =================
+    {
+        Gdiplus::SolidBrush brStage(Gc(6, 8, 14));
+        g.FillRectangle(&brStage, gm.leftW + 1, gm.topH + 1, cw - gm.leftW - 1, gm.toolY - gm.topH - 1);
+
+        if (trimBusy_) {
+            int pw = S(360), ph = S(78);
+            int px = gm.stageRc.left + (static_cast<int>(gm.stageRc.right - gm.stageRc.left) - pw) / 2;
+            int py = gm.stageRc.top + (static_cast<int>(gm.stageRc.bottom - gm.stageRc.top) - ph) / 2;
+            FillRoundRect(g, (float)px, (float)py, (float)pw, (float)ph, (float)S(12), Gc(16, 22, 36));
+            StrokeRoundRect(g, (float)px, (float)py, (float)pw, (float)ph, (float)S(12), Gc(52, 211, 153));
+            g.DrawString(L"Montaj render ediliyor, lütfen bekleyin...", -1, &fBold,
+                Gdiplus::RectF((float)px, (float)py, (float)pw, (float)ph), &sfCenter, &brCyan);
+        } else if (studioClips_.empty()) {
+            int availW = std::max(S(240), static_cast<int>(gm.stageRc.right - gm.stageRc.left) - S(24));
+            int availH = std::max(S(140), static_cast<int>(gm.stageRc.bottom - gm.stageRc.top) - S(16));
+            int vw = studioVertical916_ ? (availH * 9) / 16 : availW;
+            int vh = studioVertical916_ ? availH : (vw * 9) / 16;
+            if (!studioVertical916_ && vh > availH) { vh = availH; vw = (vh * 16) / 9; }
+            if (studioVertical916_ && vw > availW) { vw = availW; vh = (vw * 16) / 9; }
+            int vx = gm.stageRc.left + (static_cast<int>(gm.stageRc.right - gm.stageRc.left) - vw) / 2;
+            int vy = gm.stageRc.top + (static_cast<int>(gm.stageRc.bottom - gm.stageRc.top) - vh) / 2;
+            FillRoundRect(g, (float)vx, (float)vy, (float)vw, (float)vh, (float)S(10), Gc(14, 18, 28));
+            StrokeRoundRect(g, (float)vx, (float)vy, (float)vw, (float)vh, (float)S(10), Gc(44, 56, 82));
+            g.DrawString(L"Sol taraftan klip seçip '+ Ekle'ye basın\nÖnizleme burada canlı olarak oynatılacak.", -1, &fBold,
+                Gdiplus::RectF((float)vx, (float)vy, (float)vw, (float)vh), &sfCenter, &brMuted);
+        }
+    }
+
+    // ================= 4. TOOL BAR & DEDICATED AUDIO MIXER STRIP =================
+    {
+        Gdiplus::SolidBrush brBar(Gc(14, 18, 28));
+        g.FillRectangle(&brBar, gm.leftW + 1, gm.toolY, cw - gm.leftW - 1, gm.toolH);
+        Gdiplus::SolidBrush brMixBar(Gc(12, 16, 25));
+        g.FillRectangle(&brMixBar, gm.leftW + 1, gm.toolRow2Y, cw - gm.leftW - 1, gm.toolRow2H);
+        Gdiplus::Pen pLine(Gc(34, 44, 66), 1.0f);
+        g.DrawLine(&pLine, gm.leftW, gm.toolY, cw, gm.toolY);
+        g.DrawLine(&pLine, gm.leftW, gm.toolRow2Y, cw, gm.toolRow2Y);
+        g.DrawLine(&pLine, 0, gm.timelineTop, cw, gm.timelineTop);
+
+        int bx = gm.leftW + S(10);
+        int by = gm.toolY + S(5);
+        bool hasClipSel = (studioSelClip_ >= 0 && studioSelClip_ < static_cast<int>(studioClips_.size()));
+        bool hasMusSel = (studioSelMusic_ >= 0 && studioSelMusic_ < static_cast<int>(studioMusic_.size()));
+        bool canSplit = false;
+        if (!studioClips_.empty() && !trimBusy_) {
+            int si = -1; double lSec = 0, cStart = 0;
+            if (MapTimelineToClip(studioPlayheadSec_, si, lSec, cStart) && si >= 0) {
+                const auto& sc = studioClips_[static_cast<size_t>(si)];
+                canSplit = (lSec > sc.trimStartSec + 0.25 && lSec < sc.trimEndSec - 0.25);
+            }
+        }
+
+        // Row 1: Edit Tools (left) + Transport (center) + Timeline Zoom (right)
+        addBtnPx(ui::BTN_STU_SPLIT, bx, by, S(60), S(26), L"✂ Böl",
+            Gc(30, 41, 66), Gc(48, 64, 102), Gc(71, 85, 118), canSplit, true);
+        addBtnPx(ui::BTN_STU_DELETE, bx + S(64), by, S(44), S(26), L"Sil",
+            Gc(127, 29, 29), Gc(185, 28, 28), Gc(248, 113, 113), !trimBusy_ && (hasClipSel || hasMusSel), true);
+        addBtnPx(ui::BTN_STU_MOVE_LEFT, bx + S(112), by, S(26), S(26), L"◀",
+            Gc(26, 33, 50), Gc(40, 50, 76), Gc(56, 70, 104), !trimBusy_ && hasClipSel && studioSelClip_ > 0, true);
+        addBtnPx(ui::BTN_STU_MOVE_RIGHT, bx + S(140), by, S(26), S(26), L"▶",
+            Gc(26, 33, 50), Gdiplus::Color(40, 50, 76), Gc(56, 70, 104),
+            !trimBusy_ && hasClipSel && (studioSelClip_ + 1 < static_cast<int>(studioClips_.size())), true);
+
+        wchar_t spdLbl[24] = L"Hız: 1.0x";
+        if (hasClipSel) swprintf(spdLbl, 24, L"Hız: %.1fx", studioClips_[static_cast<size_t>(studioSelClip_)].speed);
+        addBtnPx(ui::BTN_STU_SPEED, bx + S(170), by, S(68), S(26), spdLbl,
+            Gc(26, 33, 50), Gc(40, 50, 76), Gc(56, 70, 104), !trimBusy_ && hasClipSel, true);
+
+        int tx = std::max(bx + S(248), (gm.leftW + cw) / 2 - S(92));
+        addBtnPx(ui::BTN_STU_TO_START, tx, by, S(28), S(26), L"⏮",
+            Gc(26, 33, 50), Gc(40, 50, 76), Gc(56, 70, 104), !trimBusy_ && !studioClips_.empty(), true);
+        addBtnPx(ui::BTN_STU_PLAYPAUSE, tx + S(32), by, S(34), S(26), studioPlaying_ ? L"⏸" : L"▶",
+            Gc(37, 99, 235), Gc(59, 130, 246), Gc(96, 165, 250), !trimBusy_ && !studioClips_.empty(), true);
+        std::wstring timeDisp = FormatSecTenths(studioPlayheadSec_) + L" / " + FormatSecTenths(totalDur);
+        g.DrawString(timeDisp.c_str(), -1, &fSmall,
+            Gdiplus::RectF((float)(tx + S(72)), (float)by, (float)S(102), (float)S(26)), &sfLeft, &brText);
+
+        addBtnPx(ui::BTN_STU_ZOOM_OUT, cw - S(100), by + 1, S(26), S(24), L"-",
+            Gc(26, 33, 50), Gc(40, 50, 76), Gc(56, 70, 104), true, true);
+        addBtnPx(ui::BTN_STU_ZOOM_IN, cw - S(70), by + 1, S(26), S(24), L"+",
+            Gc(26, 33, 50), Gc(40, 50, 76), Gc(56, 70, 104), true, true);
+        addBtnPx(ui::BTN_STU_ZOOM_FIT, cw - S(40), by + 1, S(30), S(24), L"Fit",
+            Gc(26, 33, 50), Gc(40, 50, 76), Gc(56, 70, 104), true, true);
+
+        // Row 2: Selected Clip / Music Audio Mixer Sliders
+        auto drawMiniSlider = [&](RECT sr, int pct, Gdiplus::Color fillCol) {
+            FillRoundRect(g, (float)sr.left, (float)(sr.top + S(6)), (float)(sr.right - sr.left), (float)S(5), 2.5f, Gc(34, 42, 62));
+            float r = std::max(0.0f, std::min(1.0f, static_cast<float>(pct) / 200.0f));
+            float fw = (sr.right - sr.left) * r;
+            if (fw >= 2.0f) FillRoundRect(g, (float)sr.left, (float)(sr.top + S(6)), fw, (float)S(5), 2.5f, fillCol);
+            float kx = sr.left + fw - S(5);
+            FillRoundRect(g, kx, (float)(sr.top + S(2)), (float)S(10), (float)S(13), 5.0f, Gc(242, 246, 255));
+        };
+
+        int mby = gm.toolRow2Y + S(5);
+        if (hasMusSel) {
+            const auto& m = studioMusic_[static_cast<size_t>(studioSelMusic_)];
+            wchar_t selTag[64] = {};
+            swprintf(selTag, 64, L"♪ Müzik @%.1fs", m.timelineStartSec);
+            g.DrawString(selTag, -1, &fTiny,
+                Gdiplus::RectF((float)bx, (float)mby, (float)S(118), (float)S(24)), &sfLeft, &brPurple);
+            drawMiniSlider(gm.musSlRc, m.volPct, Gc(168, 85, 247));
+            wchar_t ml[24] = {};
+            swprintf(ml, 24, L"%%%d", m.volPct);
+            g.DrawString(ml, -1, &fTiny,
+                Gdiplus::RectF((float)(gm.musSlRc.right + S(6)), (float)mby, (float)S(38), (float)S(24)), &sfLeft, &brPurple);
+            addBtnPx(ui::BTN_STU_MUS_FADEIN, gm.musSlRc.right + S(48), mby, S(76), S(24),
+                m.fadeIn ? L"Giriş Fade ✓" : L"Giriş Fade",
+                m.fadeIn ? Gc(109, 40, 217) : Gc(26, 33, 50), Gc(124, 58, 237), Gc(167, 139, 250), !trimBusy_, true);
+            addBtnPx(ui::BTN_STU_MUS_FADEOUT, gm.musSlRc.right + S(130), mby, S(76), S(24),
+                m.fadeOut ? L"Çıkış Fade ✓" : L"Çıkış Fade",
+                m.fadeOut ? Gc(109, 40, 217) : Gc(26, 33, 50), Gc(124, 58, 237), Gc(167, 139, 250), !trimBusy_, true);
+        } else if (hasClipSel || !studioClips_.empty()) {
+            int ci = hasClipSel ? studioSelClip_ : 0;
+            const auto& c = studioClips_[static_cast<size_t>(ci)];
+            wchar_t clbl[32] = {};
+            swprintf(clbl, 32, L"Klip #%d Ses:", ci + 1);
+            g.DrawString(clbl, -1, &fTiny,
+                Gdiplus::RectF((float)bx, (float)mby, (float)S(72), (float)S(24)), &sfLeft, &brCyan);
+
+            addBtnPx(ui::BTN_STU_GAME_MUTE, bx + S(74), mby, S(86), S(24),
+                c.gameVolPct == 0 ? L"Oyun: Sustu" : L"Oyun Sesi",
+                c.gameVolPct == 0 ? Gc(153, 27, 27) : Gc(24, 34, 54), Gc(44, 62, 92), Gc(56, 189, 248, 120), !trimBusy_, true);
+            drawMiniSlider(gm.gameSlRc, c.gameVolPct, Gc(56, 189, 248));
+            wchar_t gl[24] = {};
+            swprintf(gl, 24, L"%%%d", c.gameVolPct);
+            g.DrawString(gl, -1, &fTiny,
+                Gdiplus::RectF((float)(gm.gameSlRc.right + S(6)), (float)mby, (float)S(38), (float)S(24)), &sfLeft, &brCyan);
+
+            if (c.hasMultiTrack) {
+                addBtnPx(ui::BTN_STU_MIC_MUTE, gm.gameSlRc.right + S(48), mby, S(56), S(24),
+                    c.micVolPct == 0 ? L"Mic×" : L"Mikrofon",
+                    c.micVolPct == 0 ? Gc(153, 27, 27) : Gc(24, 34, 54), Gc(44, 62, 92), Gc(52, 211, 153, 120), !trimBusy_, true);
+                drawMiniSlider(gm.micSlRc, c.micVolPct, Gc(52, 211, 153));
+                wchar_t ml[24] = {};
+                swprintf(ml, 24, L"%%%d", c.micVolPct);
+                g.DrawString(ml, -1, &fTiny,
+                    Gdiplus::RectF((float)(gm.micSlRc.right + S(6)), (float)mby, (float)S(38), (float)S(24)), &sfLeft, &brText);
+            }
+        } else {
+            g.DrawString(L"Klip veya MP3 seçtiğinizde ses ayarları burada görünür.", -1, &fTiny,
+                Gdiplus::RectF((float)bx, (float)mby, (float)S(380), (float)S(24)), &sfLeft, &brMuted);
+        }
+    }
+
+    // ================= 5. BOTTOM MULTI-TRACK TIMELINE =================
+    {
+        Gdiplus::SolidBrush brTlBg(Gc(11, 14, 22));
+        g.FillRectangle(&brTlBg, 0, gm.timelineTop + 1, cw, ch - gm.timelineTop);
+
+        // Track headers column (sticky left)
+        Gdiplus::SolidBrush brHdrBg(Gc(15, 19, 30));
+        g.FillRectangle(&brHdrBg, 0, gm.timelineTop + 1, gm.hdrW, ch - gm.timelineTop);
+        Gdiplus::Pen pGrid(Gc(30, 38, 56), 1.0f);
+        g.DrawLine(&pGrid, gm.hdrW, gm.timelineTop, gm.hdrW, ch);
+        g.DrawLine(&pGrid, 0, gm.timelineTop + gm.rulerH, cw, gm.timelineTop + gm.rulerH);
+
+        g.DrawString(L"Zaman Çizelgesi", -1, &fTiny,
+            Gdiplus::RectF((float)S(8), (float)gm.timelineTop, (float)(gm.hdrW - S(14)), (float)gm.rulerH), &sfLeft, &brMuted);
+
+        auto drawTrackHdr = [&](int top, int h, const wchar_t* tag, const wchar_t* sub, Gdiplus::Color pillCol) {
+            FillRoundRect(g, (float)S(8), (float)(top + S(6)), (float)S(26), (float)S(18), (float)S(5), pillCol);
+            g.DrawString(tag, -1, &fTiny, Gdiplus::RectF((float)S(8), (float)(top + S(6)), (float)S(26), (float)S(18)), &sfCenter, &brText);
+            g.DrawString(sub, -1, &fSmall,
+                Gdiplus::RectF((float)S(38), (float)(top + S(5)), (float)(gm.hdrW - S(44)), (float)S(20)), &sfLeft, &brText);
+            g.DrawLine(&pGrid, 0, top + h + S(2), cw, top + h + S(2));
+        };
+        drawTrackHdr(gm.v1Top, gm.v1H, L"V1", L"Video", Gc(37, 99, 235));
+        drawTrackHdr(gm.a1Top, gm.a1H, L"A1", L"Klip Sesi", Gc(14, 116, 144));
+        drawTrackHdr(gm.m1Top, gm.m1H, L"M1", L"MP3 / Müzik", Gc(124, 58, 237));
+        addBtnPx(ui::BTN_STU_PICK_MP3, S(10), gm.m1Top + S(26), gm.hdrW - S(20), S(20), L"+ MP3 Ekle",
+            Gc(91, 33, 182), Gc(124, 58, 237), Gc(167, 139, 250), !trimBusy_, true);
+
+        // Clip drawing strictly inside scrollable track viewport
+        g.SetClip(Gdiplus::Rect(gm.tlViewRc.left, gm.timelineTop,
+            gm.tlViewRc.right - gm.tlViewRc.left, ch - gm.timelineTop));
+
+        const double maxScroll = std::max(0.0, totalDur + 4.0 - (gm.tlViewRc.right - gm.tlViewRc.left) / studioPxPerSec_);
+        studioTimelineScrollSec_ = std::max(0.0, std::min(studioTimelineScrollSec_, maxScroll));
+        auto secToX = [&](double s) -> float {
+            return static_cast<float>(gm.tlViewRc.left + (s - studioTimelineScrollSec_) * studioPxPerSec_);
+        };
+
+        // Time Ruler ticks
+        int stepSec = (studioPxPerSec_ >= 100.0) ? 1 : (studioPxPerSec_ >= 48.0 ? 2 : 5);
+        int maxSecTick = static_cast<int>(std::ceil(studioTimelineScrollSec_ + (gm.tlViewRc.right - gm.tlViewRc.left) / studioPxPerSec_)) + 2;
+        Gdiplus::Pen pTick(Gc(58, 70, 96), 1.0f);
+        for (int s = 0; s <= maxSecTick; ++s) {
+            float x = secToX(static_cast<double>(s));
+            if (x < gm.tlViewRc.left - 20) continue;
+            bool major = (s % stepSec == 0);
+            g.DrawLine(&pTick, x, (float)(gm.timelineTop + (major ? S(14) : S(20))), x, (float)(gm.timelineTop + gm.rulerH));
+            if (major) {
+                wchar_t tb[16] = {};
+                swprintf(tb, 16, L"%d:%02d", s / 60, s % 60);
+                g.DrawString(tb, -1, &fTiny, Gdiplus::RectF(x + 2, (float)(gm.timelineTop + 1), 40.0f, (float)S(14)), &sfLeft, &brMuted);
+            }
+        }
+
+        // Video (V1) and Audio (A1) clip blocks
+        double curOut = 0.0;
+        for (size_t i = 0; i < studioClips_.size(); ++i) {
+            const auto& c = studioClips_[i];
+            double outDur = std::max(0.1, c.trimEndSec - c.trimStartSec) / std::max(0.5, c.speed);
+            float bx = secToX(curOut);
+            float bw = std::max<float>((float)S(16), static_cast<float>(outDur * studioPxPerSec_));
+            bool sel = (studioSelClip_ == static_cast<int>(i));
+
+            // V1 block
+            FillRoundRectGrad(g, bx + 1.0f, (float)gm.v1Top, bw - 2.0f, (float)gm.v1H, (float)S(6),
+                sel ? Gc(37, 68, 128) : Gc(24, 34, 58),
+                sel ? Gc(25, 44, 88) : Gc(18, 25, 42));
+            if (bw >= S(46)) {
+                auto it = thumbBmps_.find(c.path);
+                if (it != thumbBmps_.end() && it->second) {
+                    Gdiplus::Bitmap bmp(it->second, nullptr);
+                    g.DrawImage(&bmp, bx + 3.0f, static_cast<Gdiplus::REAL>(gm.v1Top + 3),
+                        static_cast<Gdiplus::REAL>(S(44)), static_cast<Gdiplus::REAL>(gm.v1H - 6));
+                }
+            }
+            StrokeRoundRect(g, bx + 1.0f, (float)gm.v1Top, bw - 2.0f, (float)gm.v1H, (float)S(6),
+                sel ? Gc(56, 189, 248) : Gc(54, 72, 112), sel ? 1.8f : 1.0f);
+
+            float textLeft = bx + (bw >= S(62) ? (float)S(52) : 6.0f);
+            g.DrawString(c.name.c_str(), -1, &fTiny,
+                Gdiplus::RectF(textLeft, (float)(gm.v1Top + S(5)), std::max(8.0f, bw - (textLeft - bx) - S(10)), (float)S(16)), &sfLeft, &brText);
+            wchar_t meta[48] = {};
+            swprintf(meta, 48, L"%.1fs • %.1fx", outDur, c.speed);
+            g.DrawString(meta, -1, &fTiny,
+                Gdiplus::RectF(textLeft, (float)(gm.v1Top + S(23)), std::max(8.0f, bw - (textLeft - bx) - S(10)), (float)S(16)), &sfLeft, &brCyan);
+
+            // Draggable L/R trim grip bars on V1 block
+            if (sel && bw >= S(24)) {
+                FillRoundRect(g, bx + 2.0f, (float)(gm.v1Top + S(6)), (float)S(6), (float)(gm.v1H - S(12)), 2.5f, Gc(56, 189, 248));
+                FillRoundRect(g, bx + bw - S(8), (float)(gm.v1Top + S(6)), (float)S(6), (float)(gm.v1H - S(12)), 2.5f, Gc(56, 189, 248));
+            }
+            if (studioFade_ && i > 0) {
+                FillRoundRect(g, bx - S(6), (float)(gm.v1Top + gm.v1H / 2 - S(7)), (float)S(12), (float)S(14), 3.0f, Gc(59, 130, 246));
+            }
+
+            // A1 Clip Audio Waveform block directly underneath V1
+            const bool aMuted = (c.gameVolPct == 0 && (!c.hasMultiTrack || c.micVolPct == 0));
+            FillRoundRect(g, bx + 1.0f, (float)gm.a1Top, bw - 2.0f, (float)gm.a1H, (float)S(6),
+                aMuted ? Gc(38, 18, 24) : (sel ? Gc(14, 52, 66) : Gc(14, 38, 50)));
+            StrokeRoundRect(g, bx + 1.0f, (float)gm.a1Top, bw - 2.0f, (float)gm.a1H, (float)S(6),
+                aMuted ? Gc(185, 28, 28) : (sel ? Gc(45, 212, 191) : Gc(28, 86, 104)), sel ? 1.4f : 1.0f);
+
+            if (!aMuted && !c.wavePeaks.empty() && c.sourceDurSec > 0.1 && bw > S(14)) {
+                int bars = std::max(2, static_cast<int>((bw - 6.0f) / 3.0f));
+                double u0 = std::max(0.0, std::min(1.0, c.trimStartSec / c.sourceDurSec));
+                double u1 = std::max(u0, std::min(1.0, c.trimEndSec / c.sourceDurSec));
+                float gainScale = std::max(0.15f, std::min(1.8f,
+                    static_cast<float>(c.hasMultiTrack ? std::max(c.gameVolPct, c.micVolPct) : c.gameVolPct) / 100.0f));
+                Gdiplus::SolidBrush brWave(Gc(45, 212, 191, 200));
+                for (int b = 0; b < bars; ++b) {
+                    double frac = u0 + (u1 - u0) * (static_cast<double>(b) / bars);
+                    size_t pidx = std::min(c.wavePeaks.size() - 1, static_cast<size_t>(frac * c.wavePeaks.size()));
+                    float amp = std::min(1.0f, c.wavePeaks[pidx] * gainScale);
+                    float bh = std::max(2.0f, amp * (gm.a1H - S(14)));
+                    float barY = gm.a1Top + gm.a1H - 3.0f - bh;
+                    g.FillRectangle(&brWave, bx + 4.0f + b * 3.0f, barY, 2.0f, bh);
+                }
+            }
+            wchar_t albl[32] = {};
+            if (aMuted) swprintf(albl, 32, L"Ses Kapalı");
+            else if (c.hasMultiTrack) swprintf(albl, 32, L"Oyun %%%d • Mic %%%d", c.gameVolPct, c.micVolPct);
+            else swprintf(albl, 32, L"Klip Sesi %%%d", c.gameVolPct);
+            g.DrawString(albl, -1, &fTiny,
+                Gdiplus::RectF(bx + 6.0f, (float)(gm.a1Top + 2), std::max(8.0f, bw - 12.0f), (float)S(15)), &sfLeft, &brText);
+
+            curOut += outDur;
+        }
+
+        // M1 Music / MP3 blocks placed anywhere along timeline
+        if (studioMusic_.empty()) {
+            g.DrawString(L"Müzik yok — Soldaki '+ MP3 Ekle'ye basın, ekledikten sonra müzik şeridini istediğiniz yere sürükleyin",
+                -1, &fTiny,
+                Gdiplus::RectF((float)(gm.tlViewRc.left + S(12)), (float)gm.m1Top,
+                    (float)std::max(S(200), static_cast<int>(gm.tlViewRc.right - gm.tlViewRc.left) - S(24)), (float)gm.m1H),
+                &sfLeft, &brMuted);
+        } else {
+            for (size_t i = 0; i < studioMusic_.size(); ++i) {
+                const auto& m = studioMusic_[i];
+                float bx = secToX(m.timelineStartSec);
+                float bw = std::max<float>((float)S(20), static_cast<float>(m.durationSec * studioPxPerSec_));
+                bool sel = (studioSelMusic_ == static_cast<int>(i));
+
+                FillRoundRectGrad(g, bx + 1.0f, (float)gm.m1Top, bw - 2.0f, (float)gm.m1H, (float)S(6),
+                    sel ? Gc(109, 40, 217) : Gc(68, 28, 134),
+                    sel ? Gc(76, 29, 149) : Gc(46, 20, 92));
+                StrokeRoundRect(g, bx + 1.0f, (float)gm.m1Top, bw - 2.0f, (float)gm.m1H, (float)S(6),
+                    sel ? Gc(216, 180, 254) : Gc(139, 92, 246), sel ? 1.8f : 1.0f);
+
+                if (!m.wavePeaks.empty() && m.sourceDurSec > 0.1 && bw > S(14) && m.volPct > 0) {
+                    int bars = std::max(2, static_cast<int>((bw - 8.0f) / 3.0f));
+                    double u0 = std::max(0.0, std::min(1.0, m.trimStartSec / m.sourceDurSec));
+                    double u1 = std::max(u0, std::min(1.0, (m.trimStartSec + m.durationSec) / m.sourceDurSec));
+                    float gScale = std::max(0.15f, std::min(1.8f, static_cast<float>(m.volPct) / 100.0f));
+                    Gdiplus::SolidBrush brMw(Gc(216, 180, 254, 190));
+                    for (int b = 0; b < bars; ++b) {
+                        double frac = u0 + (u1 - u0) * (static_cast<double>(b) / bars);
+                        size_t pidx = std::min(m.wavePeaks.size() - 1, static_cast<size_t>(frac * m.wavePeaks.size()));
+                        float amp = std::min(1.0f, m.wavePeaks[pidx] * gScale);
+                        float bh = std::max(2.0f, amp * (gm.m1H - S(16)));
+                        g.FillRectangle(&brMw, bx + 4.0f + b * 3.0f, gm.m1Top + gm.m1H - 3.0f - bh, 2.0f, bh);
+                    }
+                }
+                if (sel && bw >= S(24)) {
+                    FillRoundRect(g, bx + 2.0f, (float)(gm.m1Top + S(6)), (float)S(6), (float)(gm.m1H - S(12)), 2.5f, Gc(233, 213, 255));
+                    FillRoundRect(g, bx + bw - S(8), (float)(gm.m1Top + S(6)), (float)S(6), (float)(gm.m1H - S(12)), 2.5f, Gc(233, 213, 255));
+                }
+                wchar_t mlbl[160] = {};
+                swprintf(mlbl, 160, L"♪ %ls (@%.1fs • %%%d)", m.name.c_str(), m.timelineStartSec, m.volPct);
+                g.DrawString(mlbl, -1, &fTiny,
+                    Gdiplus::RectF(bx + S(8), (float)(gm.m1Top + 2), std::max(8.0f, bw - S(14)), (float)S(16)), &sfLeft, &brText);
+            }
+        }
+
+        // Playhead Needle + Scrubber Head
+        float pxHead = secToX(studioPlayheadSec_);
+        if (pxHead >= gm.tlViewRc.left - 8 && pxHead <= gm.tlViewRc.right + 8) {
+            Gdiplus::Pen pPlay(Gc(248, 113, 113), 2.0f);
+            g.DrawLine(&pPlay, pxHead, (float)(gm.timelineTop + S(12)), pxHead, (float)ch);
+            FillRoundRect(g, pxHead - S(6), (float)(gm.timelineTop + S(2)), (float)S(12), (float)S(14), 4.0f, Gc(248, 113, 113));
+        }
+        g.ResetClip();
+    }
+}
+
+bool MainWindow::OnStudioLButtonDown(int mx, int my) {
+    if (!studioOpen_ || activeTab_ != 1) return false;
+    RECT cli{}; GetClientRect(hwnd_, &cli);
+    const StudioGeometry gm = CalcStudioGeom(cli.right, cli.bottom, static_cast<int>(dpi_));
+
+    int bid = HitTestCustomButton(mx, my);
+    if (bid != 0) {
+        pressedBtnId_ = bid;
+        SetCapture(hwnd_);
+        InvalidateRect(hwnd_, nullptr, FALSE);
+        return true;
+    }
+
+    if (trimBusy_) return true;
+
+    // 1. Tool bar volume sliders
+    bool hasMusSel = (studioSelMusic_ >= 0 && studioSelMusic_ < static_cast<int>(studioMusic_.size()));
+    bool hasClipSel = (studioSelClip_ >= 0 && studioSelClip_ < static_cast<int>(studioClips_.size()));
+    if (hasMusSel && mx >= gm.musSlRc.left - S(4) && mx <= gm.musSlRc.right + S(4) && my >= gm.musSlRc.top - S(4) && my <= gm.musSlRc.bottom + S(4)) {
+        studioDragMode_ = 9;
+        SetCapture(hwnd_);
+        double r = std::max(0.0, std::min(1.0, static_cast<double>(mx - gm.musSlRc.left) / std::max(1L, gm.musSlRc.right - gm.musSlRc.left)));
+        studioMusic_[static_cast<size_t>(studioSelMusic_)].volPct = static_cast<int>(std::lround(r * 200.0));
+        SyncStudioMediaState(false);
+        InvalidateRect(hwnd_, nullptr, FALSE);
+        return true;
+    }
+    if (!hasMusSel && (hasClipSel || !studioClips_.empty())) {
+        int ci = hasClipSel ? studioSelClip_ : 0;
+        studioSelClip_ = ci;
+        if (mx >= gm.gameSlRc.left - S(4) && mx <= gm.gameSlRc.right + S(4) && my >= gm.gameSlRc.top - S(4) && my <= gm.gameSlRc.bottom + S(4)) {
+            studioDragMode_ = 7;
+            studioDragIdx_ = ci;
+            SetCapture(hwnd_);
+            double r = std::max(0.0, std::min(1.0, static_cast<double>(mx - gm.gameSlRc.left) / std::max(1L, gm.gameSlRc.right - gm.gameSlRc.left)));
+            studioClips_[static_cast<size_t>(ci)].gameVolPct = static_cast<int>(std::lround(r * 200.0));
+            SyncStudioMediaState(false);
+            InvalidateRect(hwnd_, nullptr, FALSE);
+            return true;
+        }
+        if (studioClips_[static_cast<size_t>(ci)].hasMultiTrack &&
+            mx >= gm.micSlRc.left - S(4) && mx <= gm.micSlRc.right + S(4) && my >= gm.micSlRc.top - S(4) && my <= gm.micSlRc.bottom + S(4)) {
+            studioDragMode_ = 8;
+            studioDragIdx_ = ci;
+            SetCapture(hwnd_);
+            double r = std::max(0.0, std::min(1.0, static_cast<double>(mx - gm.micSlRc.left) / std::max(1L, gm.micSlRc.right - gm.micSlRc.left)));
+            studioClips_[static_cast<size_t>(ci)].micVolPct = static_cast<int>(std::lround(r * 200.0));
+            SyncStudioMediaState(false);
+            InvalidateRect(hwnd_, nullptr, FALSE);
+            return true;
+        }
+    }
+
+    // 2. Timeline tracks & ruler hit-testing
+    if (mx >= gm.tlViewRc.left && my >= gm.timelineTop) {
+        auto xToSec = [&](int x) {
+            return std::max(0.0, studioTimelineScrollSec_ + static_cast<double>(x - gm.tlViewRc.left) / studioPxPerSec_);
+        };
+        auto secToX = [&](double s) {
+            return static_cast<int>(std::lround(gm.tlViewRc.left + (s - studioTimelineScrollSec_) * studioPxPerSec_));
+        };
+
+        if (my <= gm.timelineTop + gm.rulerH) {
+            studioDragMode_ = 1;
+            studioDragWasPlaying_ = studioPlaying_;
+            studioPlaying_ = false;
+            SetCapture(hwnd_);
+            StudioSeekTimeline(xToSec(mx), false);
+            return true;
+        }
+
+        // Check V1 & A1 clips
+        if (my >= gm.v1Top && my <= gm.a1Top + gm.a1H) {
+            double acc = 0.0;
+            for (size_t i = 0; i < studioClips_.size(); ++i) {
+                const auto& c = studioClips_[i];
+                double outDur = std::max(0.1, c.trimEndSec - c.trimStartSec) / std::max(0.5, c.speed);
+                int x0 = secToX(acc);
+                int x1 = secToX(acc + outDur);
+                if (mx >= x0 - S(4) && mx <= x1 + S(4)) {
+                    studioSelClip_ = static_cast<int>(i);
+                    studioSelMusic_ = -1;
+                    if (my <= gm.v1Top + gm.v1H && mx <= x0 + S(10)) {
+                        studioDragMode_ = 2; // Trim Left
+                        studioDragIdx_ = static_cast<int>(i);
+                        studioDragStartX_ = mx;
+                        studioDragOrigA_ = c.trimStartSec;
+                        studioDragOrigB_ = acc;
+                        studioPlaying_ = false;
+                        SetCapture(hwnd_);
+                    } else if (my <= gm.v1Top + gm.v1H && mx >= x1 - S(10)) {
+                        studioDragMode_ = 3; // Trim Right
+                        studioDragIdx_ = static_cast<int>(i);
+                        studioDragStartX_ = mx;
+                        studioDragOrigA_ = c.trimEndSec;
+                        studioDragOrigB_ = acc;
+                        studioPlaying_ = false;
+                        SetCapture(hwnd_);
+                    } else {
+                        StudioSeekTimeline(xToSec(mx), true);
+                    }
+                    InvalidateRect(hwnd_, nullptr, FALSE);
+                    return true;
+                }
+                acc += outDur;
+            }
+        }
+
+        // Check M1 music tracks
+        if (my >= gm.m1Top && my <= gm.m1Top + gm.m1H) {
+            for (size_t i = 0; i < studioMusic_.size(); ++i) {
+                const auto& m = studioMusic_[i];
+                int x0 = secToX(m.timelineStartSec);
+                int x1 = secToX(m.timelineStartSec + m.durationSec);
+                if (mx >= x0 - S(4) && mx <= x1 + S(4)) {
+                    studioSelMusic_ = static_cast<int>(i);
+                    studioSelClip_ = -1;
+                    studioDragIdx_ = static_cast<int>(i);
+                    studioDragStartX_ = mx;
+                    studioDragOrigA_ = m.timelineStartSec;
+                    studioDragOrigB_ = m.durationSec;
+                    studioDragOrigC_ = m.trimStartSec;
+                    if (mx <= x0 + S(10)) studioDragMode_ = 5;      // trim L
+                    else if (mx >= x1 - S(10)) studioDragMode_ = 6; // trim R
+                    else studioDragMode_ = 4;                       // drag entire MP3 horizontally!
+                    SetCapture(hwnd_);
+                    InvalidateRect(hwnd_, nullptr, FALSE);
+                    return true;
+                }
+            }
+        }
+
+        // Clicking empty timeline moves playhead
+        studioDragMode_ = 1;
+        SetCapture(hwnd_);
+        StudioSeekTimeline(xToSec(mx), false);
+        return true;
+    }
+
+    // 3. Clicking a clip row in left panel also appends it cleanly
+    if (mx >= S(10) && mx <= gm.leftW - S(10) && my >= gm.topH + S(48) && my < gm.timelineTop && studioLeftTab_ == 0) {
+        int vi = (my - (gm.topH + S(48))) / S(52);
+        int ci = studioLibScroll_ + vi;
+        if (ci >= 0 && ci < static_cast<int>(clips_.size())) {
+            StudioAddClipFromLibrary(static_cast<size_t>(ci));
+            return true;
+        }
+    }
+    return true;
+}
+
+bool MainWindow::OnStudioMouseMove(int mx, int my) {
+    if (!studioOpen_ || activeTab_ != 1) return false;
+    if (studioDragMode_ == 0) {
+        UpdateHover(mx, my);
+        return true;
+    }
+    RECT cli{}; GetClientRect(hwnd_, &cli);
+    const StudioGeometry gm = CalcStudioGeom(cli.right, cli.bottom, static_cast<int>(dpi_));
+
+    if (studioDragMode_ == 1) {
+        double target = std::max(0.0, studioTimelineScrollSec_ + static_cast<double>(mx - gm.tlViewRc.left) / studioPxPerSec_);
+        ULONGLONG now = GetTickCount64();
+        bool doScrub = (now - studioLastScrubMs_ >= 85);
+        if (doScrub) studioLastScrubMs_ = now;
+        StudioSeekTimeline(target, doScrub);
+        return true;
+    }
+    if (studioDragMode_ == 2 && studioDragIdx_ >= 0 && studioDragIdx_ < static_cast<int>(studioClips_.size())) {
+        auto& c = studioClips_[static_cast<size_t>(studioDragIdx_)];
+        double dt = (static_cast<double>(mx - studioDragStartX_) / studioPxPerSec_) * c.speed;
+        c.trimStartSec = std::max(0.0, std::min(c.trimEndSec - 0.25, studioDragOrigA_ + dt));
+        studioPlayheadSec_ = studioDragOrigB_;
+        ULONGLONG now = GetTickCount64();
+        if (now - studioLastScrubMs_ >= 90) { studioLastScrubMs_ = now; SyncStudioMediaState(true); }
+        InvalidateRect(hwnd_, nullptr, FALSE);
+        return true;
+    }
+    if (studioDragMode_ == 3 && studioDragIdx_ >= 0 && studioDragIdx_ < static_cast<int>(studioClips_.size())) {
+        auto& c = studioClips_[static_cast<size_t>(studioDragIdx_)];
+        double dt = (static_cast<double>(mx - studioDragStartX_) / studioPxPerSec_) * c.speed;
+        c.trimEndSec = std::min(c.sourceDurSec, std::max(c.trimStartSec + 0.25, studioDragOrigA_ + dt));
+        double outDur = (c.trimEndSec - c.trimStartSec) / c.speed;
+        studioPlayheadSec_ = studioDragOrigB_ + outDur;
+        ULONGLONG now = GetTickCount64();
+        if (now - studioLastScrubMs_ >= 90) { studioLastScrubMs_ = now; SyncStudioMediaState(true); }
+        InvalidateRect(hwnd_, nullptr, FALSE);
+        return true;
+    }
+    if (studioDragMode_ == 4 && studioDragIdx_ >= 0 && studioDragIdx_ < static_cast<int>(studioMusic_.size())) {
+        auto& m = studioMusic_[static_cast<size_t>(studioDragIdx_)];
+        double dt = static_cast<double>(mx - studioDragStartX_) / studioPxPerSec_;
+        double cand = std::max(0.0, studioDragOrigA_ + dt);
+        double snapThresh = 8.0 / studioPxPerSec_;
+        if (std::abs(cand - 0.0) < snapThresh) cand = 0.0;
+        if (std::abs(cand - studioPlayheadSec_) < snapThresh) cand = studioPlayheadSec_;
+        double acc = 0.0;
+        for (const auto& c : studioClips_) {
+            acc += std::max(0.1, c.trimEndSec - c.trimStartSec) / std::max(0.5, c.speed);
+            if (std::abs(cand - acc) < snapThresh) { cand = acc; break; }
+        }
+        m.timelineStartSec = cand;
+        InvalidateRect(hwnd_, nullptr, FALSE);
+        return true;
+    }
+    if (studioDragMode_ == 5 && studioDragIdx_ >= 0 && studioDragIdx_ < static_cast<int>(studioMusic_.size())) {
+        auto& m = studioMusic_[static_cast<size_t>(studioDragIdx_)];
+        double dt = static_cast<double>(mx - studioDragStartX_) / studioPxPerSec_;
+        double minDt = std::max(-studioDragOrigA_, -studioDragOrigC_);
+        double maxDt = studioDragOrigB_ - 0.3;
+        dt = std::max(minDt, std::min(maxDt, dt));
+        m.timelineStartSec = studioDragOrigA_ + dt;
+        m.trimStartSec = studioDragOrigC_ + dt;
+        m.durationSec = studioDragOrigB_ - dt;
+        InvalidateRect(hwnd_, nullptr, FALSE);
+        return true;
+    }
+    if (studioDragMode_ == 6 && studioDragIdx_ >= 0 && studioDragIdx_ < static_cast<int>(studioMusic_.size())) {
+        auto& m = studioMusic_[static_cast<size_t>(studioDragIdx_)];
+        double dt = static_cast<double>(mx - studioDragStartX_) / studioPxPerSec_;
+        m.durationSec = std::max(0.3, std::min(m.sourceDurSec - m.trimStartSec, studioDragOrigB_ + dt));
+        InvalidateRect(hwnd_, nullptr, FALSE);
+        return true;
+    }
+    if (studioDragMode_ == 7 && studioDragIdx_ >= 0 && studioDragIdx_ < static_cast<int>(studioClips_.size())) {
+        double r = std::max(0.0, std::min(1.0, static_cast<double>(mx - gm.gameSlRc.left) / std::max(1L, gm.gameSlRc.right - gm.gameSlRc.left)));
+        studioClips_[static_cast<size_t>(studioDragIdx_)].gameVolPct = static_cast<int>(std::lround(r * 200.0));
+        SyncStudioMediaState(false);
+        InvalidateRect(hwnd_, nullptr, FALSE);
+        return true;
+    }
+    if (studioDragMode_ == 8 && studioDragIdx_ >= 0 && studioDragIdx_ < static_cast<int>(studioClips_.size())) {
+        double r = std::max(0.0, std::min(1.0, static_cast<double>(mx - gm.micSlRc.left) / std::max(1L, gm.micSlRc.right - gm.micSlRc.left)));
+        studioClips_[static_cast<size_t>(studioDragIdx_)].micVolPct = static_cast<int>(std::lround(r * 200.0));
+        SyncStudioMediaState(false);
+        InvalidateRect(hwnd_, nullptr, FALSE);
+        return true;
+    }
+    if (studioDragMode_ == 9 && studioSelMusic_ >= 0 && studioSelMusic_ < static_cast<int>(studioMusic_.size())) {
+        double r = std::max(0.0, std::min(1.0, static_cast<double>(mx - gm.musSlRc.left) / std::max(1L, gm.musSlRc.right - gm.musSlRc.left)));
+        studioMusic_[static_cast<size_t>(studioSelMusic_)].volPct = static_cast<int>(std::lround(r * 200.0));
+        SyncStudioMediaState(false);
+        InvalidateRect(hwnd_, nullptr, FALSE);
+        return true;
+    }
+    return true;
+}
+
+bool MainWindow::OnStudioLButtonUp(int mx, int my) {
+    if (!studioOpen_ || activeTab_ != 1) return false;
+    if (studioDragMode_ != 0) {
+        int m = studioDragMode_;
+        studioDragMode_ = 0;
+        ReleaseCapture();
+        if (m == 1 || m == 2 || m == 3) SyncStudioMediaState(true);
+        else if (m == 4 || m == 5 || m == 6) SyncStudioMediaState(false);
+        InvalidateRect(hwnd_, nullptr, FALSE);
+        return true;
+    }
+    if (pressedBtnId_ != 0) {
+        int target = pressedBtnId_;
+        pressedBtnId_ = 0;
+        ReleaseCapture();
+        InvalidateRect(hwnd_, nullptr, FALSE);
+        if (HitTestCustomButton(mx, my) == target) OnStudioButtonClick(target);
+        return true;
+    }
+    return true;
+}
+
+bool MainWindow::OnStudioMouseWheel(int mx, int my, int delta, bool ctrl) {
+    if (!studioOpen_ || activeTab_ != 1) return false;
+    RECT cli{}; GetClientRect(hwnd_, &cli);
+    const StudioGeometry gm = CalcStudioGeom(cli.right, cli.bottom, static_cast<int>(dpi_));
+    if (my >= gm.timelineTop && mx >= gm.tlViewRc.left) {
+        if (ctrl) {
+            double factor = (delta > 0) ? 1.18 : (1.0 / 1.18);
+            studioPxPerSec_ = std::max(24.0, std::min(220.0, studioPxPerSec_ * factor));
+        } else {
+            double shift = ((delta > 0) ? -1.0 : 1.0) * (120.0 / studioPxPerSec_);
+            studioTimelineScrollSec_ = std::max(0.0, studioTimelineScrollSec_ + shift);
+        }
+        InvalidateRect(hwnd_, nullptr, FALSE);
+        return true;
+    }
+    if (mx < gm.leftW && studioLeftTab_ == 0) {
+        studioLibScroll_ = std::max(0, studioLibScroll_ + ((delta > 0) ? -1 : 1));
+        InvalidateRect(hwnd_, nullptr, FALSE);
+        return true;
+    }
+    return true;
+}
+
+bool MainWindow::OnStudioButtonClick(int target) {
+    if (target >= ui::BTN_STU_ADD_CLIP_BASE && target < ui::BTN_STU_ADD_MUSIC_BASE) {
+        int ci = target - ui::BTN_STU_ADD_CLIP_BASE;
+        if (ci >= 0 && ci < static_cast<int>(clips_.size())) StudioAddClipFromLibrary(static_cast<size_t>(ci));
+        return true;
+    }
+    if (target >= ui::BTN_STU_ADD_MUSIC_BASE && target < ui::BTN_STU_ADD_MUSIC_BASE + 500) {
+        int ri = target - ui::BTN_STU_ADD_MUSIC_BASE;
+        if (ri >= 0 && ri < static_cast<int>(studioRecentAudio_.size())) {
+            StudioAddMusicFile(studioRecentAudio_[static_cast<size_t>(ri)]);
+        }
+        return true;
+    }
+
+    switch (target) {
+        case ui::BTN_STU_EXIT: CloseStudio(); return true;
+        case ui::BTN_STU_RENDER: StartStudioRender(); return true;
+        case ui::BTN_STU_CANCEL:
+            trimCancel_.store(true);
+            SetFooterMessage(L"Render iptal ediliyor...");
+            return true;
+        case ui::BTN_STU_ASPECT:
+            if (!trimBusy_) {
+                studioVertical916_ = !studioVertical916_;
+                RECT cli{}; GetClientRect(hwnd_, &cli);
+                UpdateStudioLayout(cli.right, cli.bottom);
+                InvalidateRect(hwnd_, nullptr, FALSE);
+            }
+            return true;
+        case ui::BTN_STU_FADE:
+            if (!trimBusy_) { studioFade_ = !studioFade_; InvalidateRect(hwnd_, nullptr, FALSE); }
+            return true;
+        case ui::BTN_STU_TARGET:
+            if (!trimBusy_) {
+                if (studioTargetMb_ == 0) studioTargetMb_ = 10;
+                else if (studioTargetMb_ == 10) studioTargetMb_ = 25;
+                else studioTargetMb_ = 0;
+                InvalidateRect(hwnd_, nullptr, FALSE);
+            }
+            return true;
+        case ui::BTN_STU_LEFT_CLIPS:
+            studioLeftTab_ = 0; InvalidateRect(hwnd_, nullptr, FALSE); return true;
+        case ui::BTN_STU_LEFT_MUSIC:
+            studioLeftTab_ = 1; InvalidateRect(hwnd_, nullptr, FALSE); return true;
+        case ui::BTN_STU_PICK_MP3:
+            StudioAddMusicFile(L""); return true;
+        case ui::BTN_STU_PLAYPAUSE:
+            StudioTogglePlayPause(); return true;
+        case ui::BTN_STU_TO_START:
+            StudioSeekTimeline(0.0, true); return true;
+        case ui::BTN_STU_SPLIT:
+            StudioSplitAtPlayhead(); return true;
+        case ui::BTN_STU_DELETE:
+            StudioDeleteSelection(); return true;
+        case ui::BTN_STU_MOVE_LEFT:
+            StudioMoveSelectedClip(-1); return true;
+        case ui::BTN_STU_MOVE_RIGHT:
+            StudioMoveSelectedClip(+1); return true;
+        case ui::BTN_STU_SPEED:
+            StudioCycleClipSpeed(); return true;
+        case ui::BTN_STU_GAME_MUTE:
+            if (studioSelClip_ >= 0 && studioSelClip_ < static_cast<int>(studioClips_.size())) {
+                auto& c = studioClips_[static_cast<size_t>(studioSelClip_)];
+                c.gameVolPct = (c.gameVolPct > 0) ? 0 : 100;
+                SyncStudioMediaState(false);
+                InvalidateRect(hwnd_, nullptr, FALSE);
+            }
+            return true;
+        case ui::BTN_STU_MIC_MUTE:
+            if (studioSelClip_ >= 0 && studioSelClip_ < static_cast<int>(studioClips_.size())) {
+                auto& c = studioClips_[static_cast<size_t>(studioSelClip_)];
+                c.micVolPct = (c.micVolPct > 0) ? 0 : 100;
+                SyncStudioMediaState(false);
+                InvalidateRect(hwnd_, nullptr, FALSE);
+            }
+            return true;
+        case ui::BTN_STU_MUS_FADEIN:
+            if (studioSelMusic_ >= 0 && studioSelMusic_ < static_cast<int>(studioMusic_.size())) {
+                studioMusic_[static_cast<size_t>(studioSelMusic_)].fadeIn = !studioMusic_[static_cast<size_t>(studioSelMusic_)].fadeIn;
+                InvalidateRect(hwnd_, nullptr, FALSE);
+            }
+            return true;
+        case ui::BTN_STU_MUS_FADEOUT:
+            if (studioSelMusic_ >= 0 && studioSelMusic_ < static_cast<int>(studioMusic_.size())) {
+                studioMusic_[static_cast<size_t>(studioSelMusic_)].fadeOut = !studioMusic_[static_cast<size_t>(studioSelMusic_)].fadeOut;
+                InvalidateRect(hwnd_, nullptr, FALSE);
+            }
+            return true;
+        case ui::BTN_STU_ZOOM_IN:
+            studioPxPerSec_ = std::min(220.0, studioPxPerSec_ * 1.25);
+            InvalidateRect(hwnd_, nullptr, FALSE);
+            return true;
+        case ui::BTN_STU_ZOOM_OUT:
+            studioPxPerSec_ = std::max(24.0, studioPxPerSec_ / 1.25);
+            InvalidateRect(hwnd_, nullptr, FALSE);
+            return true;
+        case ui::BTN_STU_ZOOM_FIT: {
+            RECT cli{}; GetClientRect(hwnd_, &cli);
+            const StudioGeometry gm = CalcStudioGeom(cli.right, cli.bottom, static_cast<int>(dpi_));
+            double dur = std::max(4.0, StudioTotalDuration());
+            studioPxPerSec_ = std::max(24.0, std::min(160.0, static_cast<double>(gm.tlViewRc.right - gm.tlViewRc.left - S(20)) / dur));
+            studioTimelineScrollSec_ = 0.0;
+            InvalidateRect(hwnd_, nullptr, FALSE);
+            return true;
+        }
+    }
+    return false;
+}
