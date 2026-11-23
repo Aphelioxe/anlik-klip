@@ -3366,9 +3366,13 @@ void MainWindow::PaintWindow(HDC targetDc) {
             if (trimBusy_) {
                 addBtnPx(BTN_MNT_CANCEL, S(700), r2Y, S(96), S(32), L"İptal",
                     Gc(153, 27, 27), Gc(185, 28, 28), Gc(248, 113, 113), true);
+                Gdiplus::SolidBrush brBusy(Gc(110, 231, 183));
+                g.DrawString(L"Montaj işleniyor, lütfen bekleyin...", -1, &fBold,
+                    Gdiplus::RectF((float)S(256), (float)(optY + S(114)), (float)(bodyW - S(28)), (float)S(20)), &sfLeft, &brBusy);
+            } else {
+                g.DrawString(footerMsg_.c_str(), -1, &fSmall,
+                    Gdiplus::RectF((float)S(256), (float)(optY + S(116)), (float)(bodyW - S(28)), (float)S(18)), &sfLeft, &brMuted);
             }
-            g.DrawString(footerMsg_.c_str(), -1, &fSmall,
-                Gdiplus::RectF((float)S(256), (float)(optY + S(116)), (float)(bodyW - S(28)), (float)S(18)), &sfLeft, &brMuted);
         } else {
             // ================= TAB 2: AYARLAR =================
             const int sox = settingsOffsetX_;
@@ -3637,7 +3641,10 @@ LRESULT MainWindow::OnMessage(UINT msg, WPARAM wParam, LPARAM lParam) {
                         if (selectedIdx_ >= 0) OpenEmbeddedPlayer(selectedIdx_);
                         SetFooterMessage(L"Klip kırpıldı ve ana klip güncellendi (eski kopya çöp kutusunda).");
                     } else {
-                        if (activeTab_ == 1) SwitchTab(0);
+                        if (activeTab_ == 1) {
+                            montagePaths_.clear();
+                            SwitchTab(0);
+                        }
                         trimMode_ = false;
                         favOnly_ = false;
                         if (edtSearch_ && !searchQuery_.empty()) {
@@ -3651,14 +3658,18 @@ LRESULT MainWindow::OnMessage(UINT msg, WPARAM wParam, LPARAM lParam) {
                 } else {
                     if (tm->replaceOriginal) DeleteFileW(tm->outPath.c_str());
                     std::wstring msg = tm->message;
-                    double savedStart = trimStartSec_, savedEnd = trimEndSec_;
-                    bool keepTrim = trimMode_;
-                    RefreshClips(tm->origPath);
-                    if (selectedIdx_ >= 0) OpenEmbeddedPlayer(selectedIdx_);
-                    trimMode_ = keepTrim;
-                    trimStartSec_ = savedStart;
-                    trimEndSec_ = savedEnd;
-                    SetFooterMessage(msg);
+                    if (activeTab_ == 1) {
+                        SetFooterMessage(msg);
+                    } else {
+                        double savedStart = trimStartSec_, savedEnd = trimEndSec_;
+                        bool keepTrim = trimMode_;
+                        RefreshClips(tm->origPath);
+                        if (selectedIdx_ >= 0) OpenEmbeddedPlayer(selectedIdx_);
+                        trimMode_ = keepTrim;
+                        trimStartSec_ = savedStart;
+                        trimEndSec_ = savedEnd;
+                        SetFooterMessage(msg);
+                    }
                 }
                 delete tm;
             }
