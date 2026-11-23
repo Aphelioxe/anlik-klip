@@ -246,7 +246,7 @@ void MainWindow::StudioFitZoomToView(int cw, int ch) {
     if (cw <= 0 || ch <= 0) return;
     const StudioGeometry gm = CalcStudioGeom(cw, ch, static_cast<int>(dpi_));
     double dur = std::max(4.0, StudioTotalDuration());
-    double availW = std::max(120.0, static_cast<double>(gm.tlViewRc.right - gm.tlViewRc.left - S(24)));
+    double availW = std::max(120.0, static_cast<double>(gm.tlViewRc.right - gm.tlViewRc.left - S(44)));
     studioPxPerSec_ = std::max(8.0, std::min(160.0, availW / dur));
     studioTimelineScrollSec_ = 0.0;
 }
@@ -260,7 +260,7 @@ bool MainWindow::StudioHitTestTrimEdge(int mx, int my, int cw, int ch,
     if (!studioOpen_ || trimBusy_ || cw <= 0 || ch <= 0) return false;
     const StudioGeometry gm = CalcStudioGeom(cw, ch, static_cast<int>(dpi_));
     auto S = [&](int px) { return MulDiv(px, static_cast<int>(dpi_), 96); };
-    if (mx < gm.tlViewRc.left - S(10) || mx > gm.tlViewRc.right + S(10)) return false;
+    if (mx < gm.tlViewRc.left - S(10) || mx > gm.tlViewRc.right + S(14)) return false;
 
     auto secToX = [&](double s) {
         return static_cast<int>(std::lround(gm.tlViewRc.left + (s - studioTimelineScrollSec_) * studioPxPerSec_));
@@ -273,29 +273,28 @@ bool MainWindow::StudioHitTestTrimEdge(int mx, int my, int cw, int ch,
             double outDur = std::max(0.1, c.trimEndSec - c.trimStartSec) / std::max(0.5, c.speed);
             int x0 = secToX(acc);
             int x1 = secToX(acc + outDur);
-            int w = x1 - x0;
-            int handleW = (w >= S(16)) ? std::min<int>(S(11), std::max<int>(S(6), w / 3)) : 0;
-            if (handleW > 0) {
-                int leftMin = (i == 0) ? (x0 - S(9)) : x0;
-                int leftMax = std::min(x0 + handleW, (x0 + x1) / 2);
-                int rightMin = std::max(x1 - handleW, (x0 + x1) / 2 + 1);
-                int rightMax = (i + 1 == studioClips_.size()) ? (x1 + S(9)) : (x1 - 1);
-                if (x0 >= gm.tlViewRc.left - S(10) && x0 <= gm.tlViewRc.right + S(8) &&
-                    mx >= leftMin && mx <= leftMax) {
-                    outKind = 1;
-                    outIdx = static_cast<int>(i);
-                    outSide = -1;
-                    outAccSec = acc;
-                    return true;
-                }
-                if (x1 >= gm.tlViewRc.left - S(8) && x1 <= gm.tlViewRc.right + S(10) &&
-                    mx >= rightMin && mx <= rightMax) {
-                    outKind = 1;
-                    outIdx = static_cast<int>(i);
-                    outSide = +1;
-                    outAccSec = acc;
-                    return true;
-                }
+            int visX1 = std::max(x0 + S(16), x1);
+            int w = visX1 - x0;
+            int handleW = std::min<int>(S(11), std::max<int>(S(6), w / 3));
+            int leftMin = (i == 0) ? (x0 - S(9)) : x0;
+            int leftMax = std::min(x0 + handleW, (x0 + visX1) / 2);
+            int rightMin = std::max(visX1 - handleW, (x0 + visX1) / 2 + 1);
+            int rightMax = (i + 1 == studioClips_.size()) ? (visX1 + S(12)) : (visX1 - 1);
+            if (x0 >= gm.tlViewRc.left - S(10) && x0 <= gm.tlViewRc.right + S(10) &&
+                mx >= leftMin && mx <= leftMax) {
+                outKind = 1;
+                outIdx = static_cast<int>(i);
+                outSide = -1;
+                outAccSec = acc;
+                return true;
+            }
+            if (visX1 >= gm.tlViewRc.left - S(8) && visX1 <= gm.tlViewRc.right + S(14) &&
+                mx >= rightMin && mx <= rightMax) {
+                outKind = 1;
+                outIdx = static_cast<int>(i);
+                outSide = +1;
+                outAccSec = acc;
+                return true;
             }
             acc += outDur;
         }
@@ -795,8 +794,14 @@ void MainWindow::StudioAddClipFromLibrary(size_t rawClipIdx) {
     if (hwnd_) GetClientRect(hwnd_, &cli);
     UpdateStudioLayout(cli.right, cli.bottom);
     StartStudioWaveformWorker();
+    if (cli.right > 0 && cli.bottom > 0) {
+        const StudioGeometry gm = CalcStudioGeom(cli.right, cli.bottom, static_cast<int>(dpi_));
+        double visSec = std::max(1.0, static_cast<double>(gm.tlViewRc.right - gm.tlViewRc.left - S(44)) / studioPxPerSec_);
+        if (studioClips_.size() == 1 || StudioTotalDuration() > studioTimelineScrollSec_ + visSec) {
+            StudioFitZoomToView(cli.right, cli.bottom);
+        }
+    }
     if (studioClips_.size() == 1) {
-        StudioFitZoomToView(cli.right, cli.bottom);
         studioPlayheadSec_ = 0.0;
         SyncStudioMediaState(true);
     }
@@ -1846,7 +1851,11 @@ void MainWindow::PaintStudio(void* gPtr, int cw, int ch) {
                     trimBadgeX = secToX(drawEndSec);
                     trimBadgeTrackY = gm.v1Top;
                     wchar_t btxt[64] = {};
-                    swprintf(btxt, 64, L"Son: %ls  (Süre %.1fs)", FormatSecTenths(c.trimEndSec).c_str(), outDur);
+                    if (c.trimEndSec >= c.sourceDurSec - 0.01) {
+                        swprintf(btxt, 64, L"Son: %ls (Tam Süre)", FormatSecTenths(c.trimEndSec).c_str());
+                    } else {
+                        swprintf(btxt, 64, L"Son: %ls  (Süre %.1fs)", FormatSecTenths(c.trimEndSec).c_str(), outDur);
+                    }
                     trimBadgeText = btxt;
                 }
                 curOut = std::max(origEnd, drawEndSec);
@@ -2049,6 +2058,16 @@ void MainWindow::PaintStudio(void* gPtr, int cw, int ch) {
             FillRoundRectGrad(g, pxHead - S(6), (float)(gm.timelineTop + S(2)), (float)S(12), (float)S(14), 4.0f,
                 Gc(125, 211, 252), Gc(37, 99, 235));
             StrokeRoundRect(g, pxHead - S(6), (float)(gm.timelineTop + S(2)), (float)S(12), (float)S(14), 4.0f, Gc(224, 242, 254));
+        }
+        if (maxScroll > 0.05) {
+            double visSecView = std::max(1.0, static_cast<double>(gm.tlViewRc.right - gm.tlViewRc.left) / studioPxPerSec_);
+            double totalTrackSec = std::max(totalDur + 4.0, studioTimelineScrollSec_ + visSecView);
+            float trackW = static_cast<float>(gm.tlViewRc.right - gm.tlViewRc.left);
+            float thumbW = std::max<float>((float)S(28), trackW * static_cast<float>(visSecView / totalTrackSec));
+            float thumbX = static_cast<float>(gm.tlViewRc.left) +
+                (trackW - thumbW) * static_cast<float>(studioTimelineScrollSec_ / maxScroll);
+            FillRoundRect(g, (float)gm.tlViewRc.left, (float)(ch - S(5)), trackW, (float)S(3), 1.5f, Gc(30, 38, 56, 150));
+            FillRoundRect(g, thumbX, (float)(ch - S(5)), thumbW, (float)S(3), 1.5f, Gc(56, 189, 248, 190));
         }
         if (hasTrimBadge && !trimBadgeText.empty()) {
             float pillW = (float)S(144);
@@ -2280,8 +2299,19 @@ bool MainWindow::OnStudioMouseMove(int mx, int my) {
     if (studioDragMode_ == 3 && studioDragIdx_ >= 0 && studioDragIdx_ < static_cast<int>(studioClips_.size())) {
         auto& c = studioClips_[static_cast<size_t>(studioDragIdx_)];
         double dt = (static_cast<double>(mx - studioDragStartX_) / studioPxPerSec_) * c.speed;
-        c.trimEndSec = std::min(c.sourceDurSec, std::max(c.trimStartSec + 0.25, studioDragOrigA_ + dt));
+        double rawEnd = studioDragOrigA_ + dt;
+        c.trimEndSec = std::min(c.sourceDurSec, std::max(c.trimStartSec + 0.25, rawEnd));
         double outDur = (c.trimEndSec - c.trimStartSec) / std::max(0.5, c.speed);
+        double rightEdgeSec = studioDragOrigB_ + outDur;
+        double visSec = std::max(1.0, static_cast<double>(gm.tlViewRc.right - gm.tlViewRc.left - S(36)) / studioPxPerSec_);
+        if (rightEdgeSec > studioTimelineScrollSec_ + visSec) {
+            double shiftSec = rightEdgeSec - (studioTimelineScrollSec_ + visSec);
+            studioTimelineScrollSec_ += shiftSec;
+            studioDragStartX_ -= static_cast<int>(std::lround(shiftSec * studioPxPerSec_));
+        }
+        if (rawEnd > c.sourceDurSec + 0.10) {
+            SetFooterMessage(L"Klip zaten maksimum süresinde — daha uzun yapmak için 'Hız' butonundan hızı düşürebilirsiniz.");
+        }
         studioPlayheadSec_ = studioDragOrigB_ + std::max(0.02, outDur - 0.04);
         ULONGLONG now = GetTickCount64();
         if (now - studioLastScrubMs_ >= 75) { studioLastScrubMs_ = now; SyncStudioMediaState(true); }
