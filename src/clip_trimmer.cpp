@@ -738,10 +738,7 @@ bool EditMp4Clip(const ClipEditSpec& spec, std::string& outError,
     MFCreateAttributes(wAttr.Put(), 4);
     if (wAttr) {
         wAttr->SetUINT32(MF_SINK_WRITER_DISABLE_THROTTLING, TRUE);
-        if (dm) {
-            wAttr->SetUINT32(MF_READWRITE_ENABLE_HARDWARE_TRANSFORMS, TRUE);
-            wAttr->SetUnknown(MF_SINK_WRITER_D3D_MANAGER, dm.Get());
-        }
+        wAttr->SetUINT32(MF_READWRITE_ENABLE_HARDWARE_TRANSFORMS, TRUE);
     }
 
     ComPtr<IMFSinkWriter> sw;
@@ -837,24 +834,9 @@ bool EditMp4Clip(const ClipEditSpec& spec, std::string& outError,
         sd.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
         dev->CreateTexture2D(&sd, nullptr, stgTex.Put());
 
-        if (dm && ctx) {
-            D3D11_TEXTURE2D_DESC gd{};
-            gd.Width = outW;
-            gd.Height = outH;
-            gd.MipLevels = 1;
-            gd.ArraySize = 1;
-            gd.Format = DXGI_FORMAT_NV12;
-            gd.SampleDesc.Count = 1;
-            gd.Usage = D3D11_USAGE_DEFAULT;
-            gd.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
-            hasGpuPool = true;
-            for (int pi = 0; pi < 16; ++pi) {
-                if (FAILED(dev->CreateTexture2D(&gd, nullptr, gpuOutPool[pi].Put()))) {
-                    hasGpuPool = false;
-                    break;
-                }
-            }
-        }
+        // Always use per-frame IMFMediaBuffer via staging readback rather than a shared DXGI ring pool:
+        // prevents shared decoder/encoder DXGI_ERROR_DEVICE_HUNG and 16-frame ring-buffer freeze loops.
+        hasGpuPool = false;
 
         if (needVp && SUCCEEDED(dev->QueryInterface(__uuidof(ID3D11VideoDevice), vdev.PutVoid())) &&
             ctx && SUCCEEDED(ctx->QueryInterface(__uuidof(ID3D11VideoContext), vctx.PutVoid()))) {
