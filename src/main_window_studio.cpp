@@ -726,6 +726,10 @@ void MainWindow::UpdateStudioMetrics() {
     if (GetTickCount64() >= studioIgnoreEndUntilMs_ && localPos >= clip.trimEndSec - 0.04) {
         double nextTl = clipStartOut + std::max(0.1, clip.trimEndSec - clip.trimStartSec) / std::max(0.5, clip.speed);
         if (curIdx + 1 < static_cast<int>(studioClips_.size())) {
+            // If current clip finished near container EOF, force fresh MediaItem so same-file next clips start cleanly at 0s
+            if (clip.trimEndSec >= clip.sourceDurSec - 0.15) {
+                studioLoadedClipPath_.clear();
+            }
             studioPlayheadSec_ = nextTl + 0.001;
             SyncStudioMediaState(true);
         } else {
@@ -1092,6 +1096,7 @@ bool MainWindow::HandleStudioAppMessage(UINT msg, WPARAM /*wParam*/, LPARAM lPar
                                     const auto& c = studioClips_[static_cast<size_t>(i)];
                                     nextTl += std::max(0.1, c.trimEndSec - c.trimStartSec) / std::max(0.5, c.speed);
                                 }
+                                studioLoadedClipPath_.clear();
                                 studioPlayheadSec_ = nextTl + 0.001;
                                 SyncStudioMediaState(true);
                             } else {
