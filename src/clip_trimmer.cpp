@@ -84,6 +84,9 @@ bool AddAacOutputStream(IMFSinkWriter* sw, DWORD& outStreamIdx) {
 bool FastPassthroughTrimMp4(const std::wstring& srcPath, const std::wstring& dstPath,
                             double startSec, double endSec,
                             std::atomic<bool>* cancelFlag) {
+    ClipAudioTrackLayout audioLayout;
+    DetectClipAudioLayout(srcPath, audioLayout);
+
     ComPtr<IMFAttributes> rAttr;
     MFCreateAttributes(rAttr.Put(), 1);
     if (rAttr) rAttr->SetUINT32(MF_READWRITE_DISABLE_CONVERTERS, TRUE);
@@ -107,7 +110,17 @@ bool FastPassthroughTrimMp4(const std::wstring& srcPath, const std::wstring& dst
         return false;
     }
 
+    sr->SetStreamSelection(static_cast<DWORD>(MF_SOURCE_READER_ALL_STREAMS), FALSE);
+
     DWORD vIn = DWORD(-1);
+    DWORD targetAudioIn = DWORD(-1);
+    if (!audioLayout.streamIndices.empty()) {
+        int pos = (audioLayout.mixStreamPos >= 0 &&
+                   static_cast<size_t>(audioLayout.mixStreamPos) < audioLayout.streamIndices.size())
+            ? audioLayout.mixStreamPos : 0;
+        targetAudioIn = static_cast<DWORD>(audioLayout.streamIndices[static_cast<size_t>(pos)]);
+    }
+
     bool addedA = false;
     std::vector<DWORD> outMap(16, DWORD(-1));
     std::vector<bool> isStreamDone(16, true);
@@ -119,8 +132,9 @@ bool FastPassthroughTrimMp4(const std::wstring& srcPath, const std::wstring& dst
         GUID maj{};
         mt->GetGUID(MF_MT_MAJOR_TYPE, &maj);
         const bool takeVideo = (maj == MFMediaType_Video && vIn == DWORD(-1));
-        const bool takeAudio = (maj == MFMediaType_Audio && !addedA); // Stream 0 is Mix; avoids reversed Game/Mic tracks becoming track 0
-        if (takeVideo || takeAudio) {
+        const bool wantThisAudio = (maj == MFMediaType_Audio && !addedA &&
+                                    (targetAudioIn == DWORD(-1) || si == targetAudioIn));
+        if (takeVideo || wantThisAudio) {
             DWORD outIdx = 0;
             if (FAILED(sw->AddStream(mt.Get(), &outIdx)) ||
                 FAILED(sw->SetInputMediaType(outIdx, mt.Get(), nullptr))) {
@@ -132,7 +146,7 @@ bool FastPassthroughTrimMp4(const std::wstring& srcPath, const std::wstring& dst
             outMap[si] = outIdx;
             isStreamDone[si] = false;
             if (takeVideo) vIn = si;
-            if (takeAudio) addedA = true;
+            if (wantThisAudio) addedA = true;
             streamCount = std::max(streamCount, si + 1);
         }
     }
@@ -161,6 +175,7 @@ bool FastPassthroughTrimMp4(const std::wstring& srcPath, const std::wstring& dst
     bool gotFirstKey = false;
     LONGLONG basePts = 0;
     int vWritten = 0;
+    int aWritten = 0;
 
     while (true) {
         if (cancelFlag && cancelFlag->load()) {
@@ -220,12 +235,13 @@ bool FastPassthroughTrimMp4(const std::wstring& srcPath, const std::wstring& dst
 
         smp->SetSampleTime(ts - basePts);
         smp->DeleteItem(MFSampleExtension_DecodeTimestamp);
-        if (SUCCEEDED(sw->WriteSample(outMap[si], smp.Get())) && si == vIn) {
-            ++vWritten;
+        if (SUCCEEDED(sw->WriteSample(outMap[si], smp.Get()))) {
+            if (si == vIn) ++vWritten;
+            else ++aWritten;
         }
     }
 
-    if (!gotFirstKey || vWritten < 2 || FAILED(sw->Finalize())) {
+    if (!gotFirstKey || vWritten < 2 || (addedA && aWritten == 0) || FAILED(sw->Finalize())) {
         sw.Reset();
         DeleteFileW(tmpPath.c_str());
         return false;
@@ -548,7 +564,7 @@ std::wstring BuildMontageOutputPath(const std::wstring& dir) {
     return base + stem + L"_x.mp4";
 }
 
-bool FixMp4AudioTrackFlags(const std::wstring& mp4Path) {
+bool FixMp4AudioTrackFlags(const std::wstring& mp4Path, int enabledAudioIndex) {
     HANDLE hF = CreateFileW(mp4Path.c_str(), GENERIC_READ | GENERIC_WRITE,
                             FILE_SHARE_READ, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
     if (hF == INVALID_HANDLE_VALUE) return false;
@@ -639,7 +655,8 @@ bool FixMp4AudioTrackFlags(const std::wstring& mp4Path) {
                 uint8_t ver = moov[tkhdPos + 8];
                 size_t altOff = (ver == 0) ? (tkhdPos + 40) : (tkhdPos + 52);
                 if (altOff + 2 <= tkhdEnd) {
-                    uint8_t wantFlag = (audioTrackCount == 0) ? 0x01 : 0x00;
+                    const int targetTrack = (enabledAudioIndex >= 0) ? enabledAudioIndex : 0;
+                    uint8_t wantFlag = (audioTrackCount == targetTrack) ? 0x01 : 0x00;
                     if (moov[tkhdPos + 9] != 0 || moov[tkhdPos + 10] != 0 || moov[tkhdPos + 11] != wantFlag) {
                         moov[tkhdPos + 9] = 0;
                         moov[tkhdPos + 10] = 0;
@@ -711,9 +728,226 @@ bool ProbeAudioFileDuration(const std::wstring& path, double& outDurSec) {
     return outDurSec > 0.05;
 }
 
+bool DetectClipAudioLayout(const std::wstring& path, ClipAudioTrackLayout& outLayout) {
+    outLayout = {};
+    if (path.empty()) return false;
+
+    ComPtr<IMFSourceReader> sr;
+    if (FAILED(MFCreateSourceReaderFromURL(path.c_str(), nullptr, sr.Put())) || !sr) {
+        return false;
+    }
+
+    sr->SetStreamSelection(static_cast<DWORD>(MF_SOURCE_READER_ALL_STREAMS), FALSE);
+    for (DWORD i = 0; i < 16; ++i) {
+        ComPtr<IMFMediaType> mt;
+        if (FAILED(sr->GetNativeMediaType(i, 0, mt.Put())) || !mt) break;
+        GUID maj{};
+        mt->GetGUID(MF_MT_MAJOR_TYPE, &maj);
+        if (maj == MFMediaType_Audio) {
+            outLayout.streamIndices.push_back(static_cast<unsigned long>(i));
+        }
+    }
+    if (outLayout.streamIndices.empty()) return false;
+
+    const size_t nA = outLayout.streamIndices.size();
+    outLayout.mixStreamPos = 0;
+    outLayout.hasSeparateGameMic = (nA >= 3);
+    if (nA == 1) {
+        return true;
+    }
+
+    double durSec = 0.0;
+    PROPVARIANT pv;
+    PropVariantInit(&pv);
+    if (SUCCEEDED(sr->GetPresentationAttribute(MF_SOURCE_READER_MEDIASOURCE, MF_PD_DURATION, &pv))) {
+        if (pv.vt == VT_UI8) durSec = static_cast<double>(pv.uhVal.QuadPart) / 1e7;
+        else if (pv.vt == VT_I8) durSec = static_cast<double>(pv.hVal.QuadPart) / 1e7;
+    }
+    PropVariantClear(&pv);
+
+    const size_t analyzeCount = std::min<size_t>(nA, 3);
+    for (size_t k = 0; k < analyzeCount; ++k) {
+        DWORD si = static_cast<DWORD>(outLayout.streamIndices[k]);
+        sr->SetStreamSelection(si, TRUE);
+        ComPtr<IMFMediaType> pcm;
+        MFCreateMediaType(pcm.Put());
+        pcm->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Audio);
+        pcm->SetGUID(MF_MT_SUBTYPE, MFAudioFormat_PCM);
+        pcm->SetUINT32(MF_MT_AUDIO_BITS_PER_SAMPLE, 16);
+        pcm->SetUINT32(MF_MT_AUDIO_SAMPLES_PER_SECOND, 48000);
+        pcm->SetUINT32(MF_MT_AUDIO_NUM_CHANNELS, 2);
+        sr->SetCurrentMediaType(si, nullptr, pcm.Get());
+    }
+
+    struct PcmChunk {
+        LONGLONG ts = 0;
+        std::vector<float> s;
+    };
+
+    double sumSq[3] = { 0.0, 0.0, 0.0 };
+    uint64_t sampleCnt[3] = { 0, 0, 0 };
+    double sumErr[3] = { 0.0, 0.0, 0.0 };
+    double refAbs = 0.0;
+    uint64_t matchedSamples = 0;
+
+    std::vector<double> probeTimes;
+    if (durSec > 1.5) {
+        probeTimes = { durSec * 0.08, durSec * 0.35, durSec * 0.65, durSec * 0.88 };
+    } else {
+        probeTimes = { 0.0 };
+    }
+
+    for (double tSec : probeTimes) {
+        PROPVARIANT pos;
+        PropVariantInit(&pos);
+        pos.vt = VT_I8;
+        pos.hVal.QuadPart = static_cast<LONGLONG>(std::max(0.0, tSec) * 1e7);
+        sr->SetCurrentPosition(GUID_NULL, pos);
+        PropVariantClear(&pos);
+
+        std::vector<PcmChunk> chunks[3];
+        size_t readsPerTrack[3] = { 0, 0, 0 };
+        bool ended[3] = { false, false, false };
+        constexpr int kMaxPackets = 60;
+        for (int pIdx = 0; pIdx < kMaxPackets; ++pIdx) {
+            bool allDone = true;
+            for (size_t k = 0; k < analyzeCount; ++k) {
+                if (readsPerTrack[k] < 10 && !ended[k]) { allDone = false; break; }
+            }
+            if (allDone) break;
+
+            DWORD si = 0, fl = 0;
+            LONGLONG ts = 0;
+            ComPtr<IMFSample> smp;
+            if (FAILED(sr->ReadSample(static_cast<DWORD>(MF_SOURCE_READER_ANY_STREAM), 0, &si, &fl, &ts, smp.Put()))) break;
+
+            int kMatch = -1;
+            for (size_t k = 0; k < analyzeCount; ++k) {
+                if (outLayout.streamIndices[k] == si) { kMatch = static_cast<int>(k); break; }
+            }
+            if (fl & MF_SOURCE_READERF_ENDOFSTREAM) {
+                if (kMatch >= 0) ended[kMatch] = true;
+                if (!smp) continue;
+            }
+            if (!smp || kMatch < 0 || readsPerTrack[kMatch] >= 12) continue;
+
+            ComPtr<IMFMediaBuffer> buf;
+            if (SUCCEEDED(smp->ConvertToContiguousBuffer(buf.Put())) && buf) {
+                BYTE* p = nullptr;
+                DWORD len = 0;
+                if (SUCCEEDED(buf->Lock(&p, nullptr, &len)) && len >= 4) {
+                    const int16_t* s16 = reinterpret_cast<const int16_t*>(p);
+                    const size_t nPairs = len / 4;
+                    PcmChunk ch;
+                    ch.ts = ts;
+                    ch.s.resize(nPairs);
+                    for (size_t i = 0; i < nPairs; ++i) {
+                        float v = (static_cast<float>(s16[i * 2]) + static_cast<float>(s16[i * 2 + 1])) * (0.5f / 32768.0f);
+                        ch.s[i] = v;
+                        sumSq[kMatch] += static_cast<double>(v) * static_cast<double>(v);
+                    }
+                    sampleCnt[kMatch] += nPairs;
+                    chunks[kMatch].push_back(std::move(ch));
+                    ++readsPerTrack[kMatch];
+                    buf->Unlock();
+                }
+            }
+        }
+
+        if (analyzeCount >= 3) {
+            for (const auto& c0 : chunks[0]) {
+                const PcmChunk* c1 = nullptr;
+                const PcmChunk* c2 = nullptr;
+                LONGLONG bestD1 = 120000;
+                LONGLONG bestD2 = 120000;
+                for (const auto& cand : chunks[1]) {
+                    LONGLONG d = (cand.ts >= c0.ts) ? (cand.ts - c0.ts) : (c0.ts - cand.ts);
+                    if (d <= bestD1) { bestD1 = d; c1 = &cand; }
+                }
+                for (const auto& cand : chunks[2]) {
+                    LONGLONG d = (cand.ts >= c0.ts) ? (cand.ts - c0.ts) : (c0.ts - cand.ts);
+                    if (d <= bestD2) { bestD2 = d; c2 = &cand; }
+                }
+                if (!c1 || !c2) continue;
+                const size_t n = std::min(c0.s.size(), std::min(c1->s.size(), c2->s.size()));
+                for (size_t i = 0; i < n; i += 2) {
+                    float a = c0.s[i];
+                    float b = c1->s[i];
+                    float c = c2->s[i];
+                    float ab = std::clamp(a + b, -1.0f, 1.0f);
+                    float ac = std::clamp(a + c, -1.0f, 1.0f);
+                    float bc = std::clamp(b + c, -1.0f, 1.0f);
+                    sumErr[0] += std::fabs(a - bc);
+                    sumErr[1] += std::fabs(b - ac);
+                    sumErr[2] += std::fabs(c - ab);
+                    refAbs += std::fabs(a) + std::fabs(b) + std::fabs(c);
+                    ++matchedSamples;
+                }
+            }
+        }
+    }
+
+    double rms[3] = { 0.0, 0.0, 0.0 };
+    for (size_t k = 0; k < analyzeCount; ++k) {
+        rms[k] = (sampleCnt[k] > 0) ? std::sqrt(sumSq[k] / static_cast<double>(sampleCnt[k])) : 0.0;
+    }
+
+    if (analyzeCount == 2) {
+        outLayout.mixStreamPos = (rms[1] > rms[0] * 1.05) ? 1 : 0;
+        outLayout.gameStreamPos = -1;
+        outLayout.micStreamPos = -1;
+        outLayout.hasSeparateGameMic = false;
+        return true;
+    }
+
+    int mixPos = 0;
+    if (matchedSamples > 500 && refAbs > 1e-3) {
+        const double tieTol = 0.025 * refAbs;
+        double minErr = std::min(sumErr[0], std::min(sumErr[1], sumErr[2]));
+        const bool ok0 = (sumErr[0] <= minErr + tieTol);
+        const bool ok1 = (sumErr[1] <= minErr + tieTol);
+        const bool ok2 = (sumErr[2] <= minErr + tieTol);
+        if (ok0 && !ok2) {
+            mixPos = 0;
+        } else if (ok2 && !ok0) {
+            mixPos = 2;
+        } else {
+            int bestIdx = 0;
+            for (int k = 1; k < 3; ++k) {
+                if (sumErr[k] < sumErr[bestIdx]) bestIdx = k;
+            }
+            if (ok0 && ok2 && !ok1) {
+                mixPos = (rms[2] > rms[0] * 1.08) ? 2 : 0;
+            } else {
+                mixPos = bestIdx;
+            }
+        }
+    } else {
+        mixPos = (rms[2] > rms[0] * 1.08 && rms[2] >= rms[1]) ? 2
+               : (rms[1] > rms[0] * 1.08 && rms[1] > rms[2]) ? 1
+               : 0;
+    }
+
+    outLayout.mixStreamPos = mixPos;
+    if (mixPos == 0) {
+        outLayout.gameStreamPos = 1;
+        outLayout.micStreamPos = 2;
+    } else if (mixPos == 2) {
+        outLayout.gameStreamPos = 1;
+        outLayout.micStreamPos = 0;
+    } else {
+        outLayout.gameStreamPos = (rms[0] >= rms[2]) ? 0 : 2;
+        outLayout.micStreamPos = (outLayout.gameStreamPos == 0) ? 2 : 0;
+    }
+    return true;
+}
+
 bool ExtractAudioWaveform(const std::wstring& path, int trackChoice, int numBuckets, std::vector<float>& outPeaks) {
     outPeaks.clear();
     if (numBuckets <= 0) return false;
+    ClipAudioTrackLayout audioLayout;
+    DetectClipAudioLayout(path, audioLayout);
+
     ComPtr<IMFSourceReader> sr;
     if (FAILED(MFCreateSourceReaderFromURL(path.c_str(), nullptr, sr.Put())) || !sr) return false;
 
@@ -737,7 +971,18 @@ bool ExtractAudioWaveform(const std::wstring& path, int trackChoice, int numBuck
     PropVariantClear(&pv);
     if (durSec <= 0.05) return false;
 
-    size_t idx = (trackChoice >= 0 && static_cast<size_t>(trackChoice) < aStreams.size()) ? static_cast<size_t>(trackChoice) : 0;
+    int mappedPos = trackChoice;
+    if (audioLayout.streamIndices.size() == aStreams.size()) {
+        if (trackChoice <= 0) {
+            mappedPos = audioLayout.mixStreamPos;
+        } else if (audioLayout.hasSeparateGameMic) {
+            if (trackChoice == 1 && audioLayout.gameStreamPos >= 0) mappedPos = audioLayout.gameStreamPos;
+            else if (trackChoice == 2 && audioLayout.micStreamPos >= 0) mappedPos = audioLayout.micStreamPos;
+        } else {
+            mappedPos = audioLayout.mixStreamPos;
+        }
+    }
+    size_t idx = (mappedPos >= 0 && static_cast<size_t>(mappedPos) < aStreams.size()) ? static_cast<size_t>(mappedPos) : 0;
     DWORD si = aStreams[idx];
     sr->SetStreamSelection(si, TRUE);
     ComPtr<IMFMediaType> pcm;
@@ -1221,9 +1466,38 @@ bool EditMp4Clip(const ClipEditSpec& spec, std::string& outError,
             return SUCCEEDED(sr->SetCurrentMediaType(idx, nullptr, decA.Get()));
         };
 
-        const bool segHasMulti = (aIns.size() >= 3);
-        const bool segHasAudio = !aIns.empty() && cfgAudioIn(aIns[0]);
-        const bool segHasGameMic = segHasAudio && segHasMulti && cfgAudioIn(aIns[1]) && cfgAudioIn(aIns[2]);
+        ClipAudioTrackLayout segLayout;
+        const bool hasSegLayout = !aIns.empty() && DetectClipAudioLayout(seg.path, segLayout);
+        DWORD logicalAIns[3] = { DWORD(-1), DWORD(-1), DWORD(-1) };
+        if (hasSegLayout && segLayout.streamIndices.size() == aIns.size()) {
+            const int mixPos = segLayout.mixStreamPos;
+            const int gamePos = segLayout.gameStreamPos;
+            const int micPos = segLayout.micStreamPos;
+            logicalAIns[0] = (mixPos >= 0 && static_cast<size_t>(mixPos) < aIns.size()) ? aIns[static_cast<size_t>(mixPos)] : aIns[0];
+            if (segLayout.hasSeparateGameMic && gamePos >= 0 && micPos >= 0 &&
+                static_cast<size_t>(gamePos) < aIns.size() && static_cast<size_t>(micPos) < aIns.size()) {
+                logicalAIns[1] = aIns[static_cast<size_t>(gamePos)];
+                logicalAIns[2] = aIns[static_cast<size_t>(micPos)];
+            }
+        } else {
+            for (size_t k = 0; k < aIns.size() && k < 3; ++k) logicalAIns[k] = aIns[k];
+        }
+
+        const bool segHasMulti = (logicalAIns[1] != DWORD(-1) && logicalAIns[2] != DWORD(-1));
+        bool segHasAudio = false;
+        bool segHasGameMic = false;
+        if (segHasMulti) {
+            segHasGameMic = cfgAudioIn(logicalAIns[1]) && cfgAudioIn(logicalAIns[2]);
+            if (segHasGameMic) {
+                segHasAudio = true;
+            } else {
+                sr->SetStreamSelection(logicalAIns[1], FALSE);
+                sr->SetStreamSelection(logicalAIns[2], FALSE);
+                segHasAudio = (logicalAIns[0] != DWORD(-1)) && cfgAudioIn(logicalAIns[0]);
+            }
+        } else if (logicalAIns[0] != DWORD(-1)) {
+            segHasAudio = cfgAudioIn(logicalAIns[0]);
+        }
 
         const LONGLONG start100 = static_cast<LONGLONG>(seg.startSec * 1e7);
         const LONGLONG end100 = static_cast<LONGLONG>(seg.endSec * 1e7);
@@ -1238,7 +1512,7 @@ bool EditMp4Clip(const ClipEditSpec& spec, std::string& outError,
         PropVariantClear(&pv);
 
         bool vDone = false;
-        bool aDone[3] = { !segHasAudio, !segHasGameMic, !segHasGameMic };
+        bool aDone[3] = { !(segHasAudio && !segHasGameMic), !segHasGameMic, !segHasGameMic };
         std::vector<int16_t> segPcm[3];
         const size_t targetOutPairs = static_cast<size_t>((outSpan100 * 48000LL) / 10000000LL);
         size_t segOutFlushed = 0;
@@ -1257,8 +1531,8 @@ bool EditMp4Clip(const ClipEditSpec& spec, std::string& outError,
                 sr->SetStreamSelection(si, FALSE);
                 if (si == vIn) vDone = true;
                 else {
-                    for (size_t k = 0; k < aIns.size() && k < 3; ++k) {
-                        if (aIns[k] == si) aDone[k] = true;
+                    for (size_t k = 0; k < 3; ++k) {
+                        if (logicalAIns[k] == si) aDone[k] = true;
                     }
                 }
             };
@@ -1536,8 +1810,8 @@ bool EditMp4Clip(const ClipEditSpec& spec, std::string& outError,
                 }
             } else {
                 int trackIdx = -1;
-                for (size_t k = 0; k < aIns.size() && k < 3; ++k) {
-                    if (aIns[k] == streamIdx && !aDone[k]) { trackIdx = static_cast<int>(k); break; }
+                for (size_t k = 0; k < 3; ++k) {
+                    if (logicalAIns[k] == streamIdx && !aDone[k]) { trackIdx = static_cast<int>(k); break; }
                 }
                 if (trackIdx >= 0) {
                     ComPtr<IMFMediaBuffer> abuf;
@@ -1657,7 +1931,7 @@ bool EditMp4Clip(const ClipEditSpec& spec, std::string& outError,
         return false;
     }
 
-    FixMp4AudioTrackFlags(tmpPath);
+    FixMp4AudioTrackFlags(tmpPath, 0);
     if (!MoveFileExW(tmpPath.c_str(), spec.dstPath.c_str(), MOVEFILE_REPLACE_EXISTING)) {
         DeleteFileW(tmpPath.c_str());
         outError = "Düzenlenen dosya hedef konuma kaydedilemedi.";

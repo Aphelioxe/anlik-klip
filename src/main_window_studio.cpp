@@ -71,55 +71,10 @@ void SelectBestPreviewAudioTrack(IMFPMediaItem* item, const std::wstring& path) 
     if (audioStreams.size() <= 1) return;
 
     DWORD chosenAudio = audioStreams.front();
-    double bestEnergy = -1.0;
-    IMFSourceReader* sr = nullptr;
-    if (SUCCEEDED(MFCreateSourceReaderFromURL(path.c_str(), nullptr, &sr)) && sr) {
-        sr->SetStreamSelection(MF_SOURCE_READER_ALL_STREAMS, FALSE);
-        std::vector<double> energy(nStreams, 0.0);
-        for (DWORD asi : audioStreams) {
-            sr->SetStreamSelection(asi, TRUE);
-            IMFMediaType* pcm = nullptr;
-            if (SUCCEEDED(MFCreateMediaType(&pcm)) && pcm) {
-                pcm->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Audio);
-                pcm->SetGUID(MF_MT_SUBTYPE, MFAudioFormat_PCM);
-                sr->SetCurrentMediaType(asi, nullptr, pcm);
-                pcm->Release();
-            }
-        }
-        for (int iter = 0; iter < 600; ++iter) {
-            DWORD si = 0, fl = 0;
-            LONGLONG ts = 0;
-            IMFSample* smp = nullptr;
-            if (FAILED(sr->ReadSample(MF_SOURCE_READER_ANY_STREAM, 0, &si, &fl, &ts, &smp))) break;
-            if (!smp) {
-                if (fl & MF_SOURCE_READERF_ENDOFSTREAM) break;
-                continue;
-            }
-            if (si < nStreams) {
-                IMFMediaBuffer* buf = nullptr;
-                if (SUCCEEDED(smp->ConvertToContiguousBuffer(&buf)) && buf) {
-                    BYTE* p = nullptr;
-                    DWORD len = 0;
-                    if (SUCCEEDED(buf->Lock(&p, nullptr, &len)) && len >= 4) {
-                        const int16_t* s16 = reinterpret_cast<const int16_t*>(p);
-                        DWORD n = len / 2;
-                        double sum = 0.0;
-                        for (DWORD k = 0; k < n; k += 4) sum += std::abs(static_cast<double>(s16[k]));
-                        energy[si] += sum;
-                        buf->Unlock();
-                    }
-                    buf->Release();
-                }
-            }
-            smp->Release();
-        }
-        sr->Release();
-        for (DWORD asi : audioStreams) {
-            if (energy[asi] > bestEnergy) {
-                bestEnergy = energy[asi];
-                chosenAudio = asi;
-            }
-        }
+    ClipAudioTrackLayout layout;
+    if (DetectClipAudioLayout(path, layout) && layout.mixStreamPos >= 0 &&
+        static_cast<size_t>(layout.mixStreamPos) < audioStreams.size()) {
+        chosenAudio = audioStreams[static_cast<size_t>(layout.mixStreamPos)];
     }
     for (DWORD asi : audioStreams) {
         item->SetStreamSelection(asi, asi == chosenAudio ? TRUE : FALSE);

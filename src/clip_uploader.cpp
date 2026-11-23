@@ -248,7 +248,7 @@ ClipUploadResult UploadClipToShareLink(
         if (ProbeClipAudioTracks(filePath, hasMulti, nullptr) && hasMulti) {
             tempFixed = filePath + L".upload.tmp.mp4";
             if (CopyFileW(filePath.c_str(), tempFixed.c_str(), FALSE)) {
-                FixMp4AudioTrackFlags(tempFixed);
+                FixMp4AudioTrackFlags(tempFixed, 0);
                 uploadPath = tempFixed;
             } else {
                 tempFixed.clear();

@@ -1116,54 +1116,12 @@ void MainWindow::OpenEmbeddedPlayer(int viewIdx) {
                     PropVariantClear(&vt);
                 }
                 if (audioStreams.size() > 1) {
-                    // Pick the audio stream with highest energy across the clip (handles both Mix-first and Mix-last MP4s)
+                    // Pick the detected Mix stream (handles [Mix,Game,Mic] and [Mic,Game,Mix])
                     DWORD chosenAudio = audioStreams.front();
-                    double bestEnergy = -1.0;
-                    IMFSourceReader* sr = nullptr;
-                    if (SUCCEEDED(MFCreateSourceReaderFromURL(playerClipPath_.c_str(), nullptr, &sr)) && sr) {
-                        sr->SetStreamSelection(MF_SOURCE_READER_ALL_STREAMS, FALSE);
-                        std::vector<double> energy(nStreams, 0.0);
-                        for (DWORD asi : audioStreams) {
-                            sr->SetStreamSelection(asi, TRUE);
-                            IMFMediaType* pcm = nullptr;
-                            if (SUCCEEDED(MFCreateMediaType(&pcm)) && pcm) {
-                                pcm->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Audio);
-                                pcm->SetGUID(MF_MT_SUBTYPE, MFAudioFormat_PCM);
-                                sr->SetCurrentMediaType(asi, nullptr, pcm);
-                                pcm->Release();
-                            }
-                        }
-                        for (int iter = 0; iter < 1500; ++iter) {
-                            DWORD si = 0, fl = 0; LONGLONG ts = 0; IMFSample* smp = nullptr;
-                            if (FAILED(sr->ReadSample(MF_SOURCE_READER_ANY_STREAM, 0, &si, &fl, &ts, &smp))) break;
-                            if (fl & MF_SOURCE_READERF_ENDOFSTREAM) { if (smp) smp->Release(); break; }
-                            if (smp && si < nStreams) {
-                                IMFMediaBuffer* b = nullptr;
-                                if (SUCCEEDED(smp->ConvertToContiguousBuffer(&b)) && b) {
-                                    BYTE* p = nullptr; DWORD len = 0;
-                                    if (SUCCEEDED(b->Lock(&p, nullptr, &len))) {
-                                        const short* s = reinterpret_cast<const short*>(p);
-                                        DWORD n = len / 2;
-                                        double sum = 0.0;
-                                        for (DWORD k = 0; k < n; k += 4) {
-                                            double v = static_cast<double>(s[k]);
-                                            sum += v * v;
-                                        }
-                                        energy[si] += sum;
-                                        b->Unlock();
-                                    }
-                                    b->Release();
-                                }
-                            }
-                            if (smp) smp->Release();
-                        }
-                        sr->Release();
-                        for (DWORD asi : audioStreams) {
-                            if (energy[asi] > bestEnergy) {
-                                bestEnergy = energy[asi];
-                                chosenAudio = asi;
-                            }
-                        }
+                    ClipAudioTrackLayout layout;
+                    if (DetectClipAudioLayout(playerClipPath_, layout) && layout.mixStreamPos >= 0 &&
+                        static_cast<size_t>(layout.mixStreamPos) < audioStreams.size()) {
+                        chosenAudio = audioStreams[static_cast<size_t>(layout.mixStreamPos)];
                     }
                     for (DWORD asi : audioStreams) {
                         item->SetStreamSelection(asi, (asi == chosenAudio) ? TRUE : FALSE);
@@ -1282,8 +1240,18 @@ void MainWindow::StartWaveformWorker() {
         }
         if (durSec <= 0.1) { sr->Release(); return; }
 
-        DWORD gameStream = (aStreams.size() >= 3) ? aStreams[1] : aStreams[0];
-        DWORD micStream  = (aStreams.size() >= 3) ? aStreams[2] : DWORD(-1);
+        ClipAudioTrackLayout layout;
+        const bool hasLayout = DetectClipAudioLayout(path, layout);
+        DWORD gameStream = (hasLayout && layout.hasSeparateGameMic && layout.gameStreamPos >= 0 &&
+                            static_cast<size_t>(layout.gameStreamPos) < aStreams.size())
+            ? aStreams[static_cast<size_t>(layout.gameStreamPos)]
+            : ((aStreams.size() >= 3) ? aStreams[1]
+               : aStreams[(hasLayout && layout.mixStreamPos >= 0 && static_cast<size_t>(layout.mixStreamPos) < aStreams.size())
+                          ? static_cast<size_t>(layout.mixStreamPos) : 0]);
+        DWORD micStream = (hasLayout && layout.hasSeparateGameMic && layout.micStreamPos >= 0 &&
+                           static_cast<size_t>(layout.micStreamPos) < aStreams.size())
+            ? aStreams[static_cast<size_t>(layout.micStreamPos)]
+            : ((aStreams.size() >= 3) ? aStreams[2] : DWORD(-1));
         auto cfgPcm = [&](DWORD si) {
             sr->SetStreamSelection(si, TRUE);
             IMFMediaType* pcm = nullptr;
