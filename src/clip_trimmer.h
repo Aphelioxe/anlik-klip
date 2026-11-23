@@ -41,6 +41,14 @@ struct MontageTransitionSpec {
     double durationSec = 0.50; // Total transition duration in seconds
 };
 
+struct MontageFrameSpec {
+    double startSec = 0.0;
+    double endSec = 0.0;
+    double centerX = 0.5; // Normalized [0..1] X center inside output canvas
+    double centerY = 0.5; // Normalized [0..1] Y center inside output canvas
+    double scale = 1.0;   // [0.20..1.0] scale factor preserving canvas aspect ratio
+};
+
 struct ClipEditSpec {
     std::wstring srcPath;
     std::wstring dstPath;
@@ -76,6 +84,9 @@ struct ClipEditSpec {
 
     // Optional placed transition/impact effects along the timeline
     std::vector<MontageTransitionSpec> transitions;
+
+    // Optional timed PiP / shrunk frame rectangles [startSec..endSec]
+    std::vector<MontageFrameSpec> frameTransforms;
 };
 
 /** Probes audio/media file duration in seconds. */

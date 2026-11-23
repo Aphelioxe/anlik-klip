@@ -42,6 +42,7 @@ public:
     bool IsPlayerOpen() const { return playerOpen_; }
     bool IsPlayerReady() const { return playerReady_; }
     bool IsStudioOpen() const { return studioOpen_; }
+    int StudioHitTestStageHandle(int mx, int my, int cw, int ch) const;
 
 private:
     static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam);
@@ -285,10 +286,12 @@ private:
     std::vector<StudioClipItem> studioClips_;
     std::vector<StudioMusicItem> studioMusic_;
     std::vector<StudioTransitionItem> studioTransitions_;
+    std::vector<MontageFrameSpec> studioFrames_;
     std::vector<std::wstring> studioRecentAudio_;
     int studioSelClip_ = -1;
     int studioSelMusic_ = -1;
     int studioSelFx_ = -1;
+    int studioSelFrame_ = -1;
 
     double studioPlayheadSec_ = 0.0;
     double studioTimelineScrollSec_ = 0.0;
@@ -315,11 +318,14 @@ private:
     int studioDragMode_ = 0;
     int studioDragIdx_ = -1;
     int studioDragStartX_ = 0;
+    int studioDragStartY_ = 0;
     double studioDragOrigA_ = 0.0;
     double studioDragOrigB_ = 0.0;
     double studioDragOrigC_ = 0.0;
+    double studioDragOrigD_ = 0.0;
     bool studioDragWasPlaying_ = false;
     bool studioClipDragged_ = false;
+    bool studioStageBodyDragged_ = false;
     std::vector<double> studioDragOrigStarts_;
     ULONGLONG studioGapLastTickMs_ = 0;
     ULONGLONG studioLastScrubMs_ = 0;
@@ -330,14 +336,20 @@ private:
     int studioHoverMusicIdx_ = -1;
     int studioHoverMusicSide_ = 0; // -1=left, +1=right, 0=none
     int studioHoverFxIdx_ = -1;
+    int studioHoverFrameIdx_ = -1;
+    int studioHoverFrameSide_ = 0; // -1=left, +1=right, 0=none
+    int studioHoverStageCorner_ = 0; // 0=none, 1=TL, 2=TR, 3=BL, 4=BR, 5=body
+    RECT studioLastVideoRc_{};
 
     void OpenStudio(bool loadQueued = true);
     void CloseStudio();
     void UpdateStudioLayout(int cw, int ch);
+    void SyncStudioVideoFrameRect();
     void UpdateStudioMetrics();
     double StudioTotalDuration() const;
     bool MapTimelineToClip(double tlSec, int& outIdx, double& outLocalSec, double& outClipStartSec) const;
     int StudioHitTestTransition(int mx, int my, int cw, int ch) const;
+    bool StudioHitTestFrameBar(int mx, int my, int cw, int ch, int& outIdx, int& outSide) const;
     bool StudioHitTestTrimEdge(int mx, int my, int cw, int ch, int& outKind, int& outIdx, int& outSide, double& outAccSec) const;
     int StudioHitTestClipBody(int mx, int my, int cw, int ch) const;
     void StudioFitZoomToView(int cw, int ch);

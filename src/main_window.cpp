@@ -3683,19 +3683,39 @@ LRESULT MainWindow::OnMessage(UINT msg, WPARAM wParam, LPARAM lParam) {
             if (LOWORD(lParam) == HTCLIENT) {
                 bool wantSizeWE = false;
                 bool wantSizeAll = false;
+                bool wantSizeNWSE = false;
+                bool wantSizeNESW = false;
                 if (studioOpen_ && activeTab_ == 1) {
-                    if (studioDragMode_ == 2 || studioDragMode_ == 3 || studioDragMode_ == 5 || studioDragMode_ == 6) {
+                    if (studioDragMode_ == 2 || studioDragMode_ == 3 || studioDragMode_ == 5 || studioDragMode_ == 6 ||
+                        studioDragMode_ == 13 || studioDragMode_ == 14) {
                         wantSizeWE = true;
-                    } else if ((studioDragMode_ == 10 && studioClipDragged_) || studioDragMode_ == 4 || studioDragMode_ == 11) {
+                    } else if ((studioDragMode_ == 10 && studioClipDragged_) || studioDragMode_ == 4 ||
+                               studioDragMode_ == 11 || studioDragMode_ == 15) {
                         wantSizeAll = true;
+                    } else if (studioDragMode_ == 12) {
+                        int sh = static_cast<int>(std::lround(studioDragOrigD_));
+                        if (sh == 1 || sh == 4) wantSizeNWSE = true;
+                        else if (sh == 2 || sh == 3) wantSizeNESW = true;
+                        else if (sh == 5) wantSizeAll = true;
                     } else if (studioDragMode_ == 0 && !trimBusy_) {
                         POINT pt{};
                         GetCursorPos(&pt);
                         ScreenToClient(hwnd_, &pt);
                         RECT cli{};
                         GetClientRect(hwnd_, &cli);
-                        if (StudioHitTestTransition(pt.x, pt.y, cli.right, cli.bottom) >= 0) {
+                        int stageH = StudioHitTestStageHandle(pt.x, pt.y, cli.right, cli.bottom);
+                        int fIdx = -1, fSide = 0;
+                        if (stageH == 1 || stageH == 4) {
+                            wantSizeNWSE = true;
+                        } else if (stageH == 2 || stageH == 3) {
+                            wantSizeNESW = true;
+                        } else if (stageH == 5) {
                             wantSizeAll = true;
+                        } else if (StudioHitTestTransition(pt.x, pt.y, cli.right, cli.bottom) >= 0) {
+                            wantSizeAll = true;
+                        } else if (StudioHitTestFrameBar(pt.x, pt.y, cli.right, cli.bottom, fIdx, fSide)) {
+                            if (fSide != 0) wantSizeWE = true;
+                            else wantSizeAll = true;
                         } else {
                             int k = 0, idx = -1, side = 0;
                             double acc = 0.0;
@@ -3714,6 +3734,14 @@ LRESULT MainWindow::OnMessage(UINT msg, WPARAM wParam, LPARAM lParam) {
                         ScreenToClient(hwnd_, &pt);
                         wantSizeWE = (HitTestTrimHandle(pt.x, pt.y) != 0);
                     }
+                }
+                if (wantSizeNWSE) {
+                    SetCursor(LoadCursorW(nullptr, IDC_SIZENWSE));
+                    return TRUE;
+                }
+                if (wantSizeNESW) {
+                    SetCursor(LoadCursorW(nullptr, IDC_SIZENESW));
+                    return TRUE;
                 }
                 if (wantSizeWE) {
                     SetCursor(LoadCursorW(nullptr, IDC_SIZEWE));
@@ -3821,6 +3849,9 @@ LRESULT MainWindow::OnMessage(UINT msg, WPARAM wParam, LPARAM lParam) {
             studioHoverMusicIdx_ = -1;
             studioHoverMusicSide_ = 0;
             studioHoverFxIdx_ = -1;
+            studioHoverFrameIdx_ = -1;
+            studioHoverFrameSide_ = 0;
+            studioHoverStageCorner_ = 0;
             if (!draggingSeek_ && !draggingVol_ && draggingTrim_ == 0) pressedBtnId_ = 0;
             InvalidateRect(hwnd_, nullptr, FALSE);
             return 0;
@@ -4375,9 +4406,13 @@ LRESULT MainWindow::OnMessage(UINT msg, WPARAM wParam, LPARAM lParam) {
         case WM_CAPTURECHANGED:
             studioDragMode_ = 0;
             studioClipDragged_ = false;
+            studioStageBodyDragged_ = false;
             studioDragOrigStarts_.clear();
             studioGapLastTickMs_ = 0;
             studioHoverFxIdx_ = -1;
+            studioHoverFrameIdx_ = -1;
+            studioHoverFrameSide_ = 0;
+            studioHoverStageCorner_ = 0;
             pressedBtnId_ = 0;
             draggingSeek_ = false;
             draggingVol_ = false;

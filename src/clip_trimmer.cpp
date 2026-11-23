@@ -735,6 +735,81 @@ bool ApplyNv12TransitionEffects(IMFSample* smp, uint32_t w, uint32_t h, BYTE bla
     return anyApplied;
 }
 
+bool ApplyNv12FrameTransform(IMFSample* smp, uint32_t w, uint32_t h, BYTE blackY,
+                             double tSec, const std::vector<MontageFrameSpec>& frames,
+                             std::vector<BYTE>& scratch) {
+    if (!smp || frames.empty() || w < 16 || h < 16) return false;
+    const MontageFrameSpec* active = nullptr;
+    for (int i = static_cast<int>(frames.size()) - 1; i >= 0; --i) {
+        const auto& f = frames[static_cast<size_t>(i)];
+        if (tSec >= f.startSec - 1e-6 && tSec <= f.endSec + 1e-6) {
+            active = &f;
+            break;
+        }
+    }
+    if (!active || active->scale >= 0.995) return false;
+
+    const double sc = std::max(0.20, std::min(1.0, active->scale));
+    const uint32_t dstW = std::max<uint32_t>(16u, std::min<uint32_t>(w, static_cast<uint32_t>(std::lround(w * sc)) & ~1u));
+    const uint32_t dstH = std::max<uint32_t>(16u, std::min<uint32_t>(h, static_cast<uint32_t>(std::lround(h * sc)) & ~1u));
+    const uint32_t dstX = static_cast<uint32_t>(std::max<int32_t>(0,
+        std::min<int32_t>(static_cast<int32_t>(w - dstW),
+            static_cast<int32_t>(std::lround(static_cast<double>(w) * active->centerX - static_cast<double>(dstW) * 0.5)) & ~1)));
+    const uint32_t dstY = static_cast<uint32_t>(std::max<int32_t>(0,
+        std::min<int32_t>(static_cast<int32_t>(h - dstH),
+            static_cast<int32_t>(std::lround(static_cast<double>(h) * active->centerY - static_cast<double>(dstH) * 0.5)) & ~1)));
+
+    const uint32_t hw = w / 2, hh = h / 2;
+    const uint32_t dhw = dstW / 2, dhh = dstH / 2;
+    const uint32_t dhx = dstX / 2, dhy = dstY / 2;
+    const size_t yBytes = static_cast<size_t>(w) * h;
+    const size_t uvBytes = static_cast<size_t>(hw) * hh * 2;
+    const size_t totalBytes = yBytes + uvBytes;
+
+    ComPtr<IMFMediaBuffer> buf;
+    if (FAILED(smp->ConvertToContiguousBuffer(buf.Put())) || !buf) return false;
+    BYTE* p = nullptr; DWORD len = 0;
+    if (FAILED(buf->Lock(&p, nullptr, &len)) || !p || len < totalBytes) return false;
+
+    scratch.resize(totalBytes);
+    memcpy(scratch.data(), p, totalBytes);
+    memset(p, blackY, yBytes);
+    memset(p + yBytes, 128, uvBytes);
+
+    const BYTE* srcY = scratch.data();
+    const BYTE* srcUV = scratch.data() + yBytes;
+    BYTE* dstUV = p + yBytes;
+
+    std::vector<uint32_t> lutX(dstW);
+    for (uint32_t dx = 0; dx < dstW; ++dx) {
+        lutX[dx] = std::min<uint32_t>(w - 1, (dx * w) / dstW);
+    }
+    for (uint32_t dy = 0; dy < dstH; ++dy) {
+        uint32_t sy = std::min<uint32_t>(h - 1, (dy * h) / dstH);
+        const BYTE* sRow = srcY + static_cast<size_t>(sy) * w;
+        BYTE* dRow = p + static_cast<size_t>(dstY + dy) * w + dstX;
+        for (uint32_t dx = 0; dx < dstW; ++dx) dRow[dx] = sRow[lutX[dx]];
+    }
+
+    std::vector<uint32_t> lutUvX(dhw);
+    for (uint32_t dux = 0; dux < dhw; ++dux) {
+        lutUvX[dux] = std::min<uint32_t>(hw - 1, (dux * hw) / dhw);
+    }
+    for (uint32_t duy = 0; duy < dhh; ++duy) {
+        uint32_t suy = std::min<uint32_t>(hh - 1, (duy * hh) / dhh);
+        const BYTE* sUvRow = srcUV + static_cast<size_t>(suy) * hw * 2;
+        BYTE* dUvRow = dstUV + (static_cast<size_t>(dhy + duy) * hw + dhx) * 2;
+        for (uint32_t dux = 0; dux < dhw; ++dux) {
+            const uint32_t sux = lutUvX[dux] * 2;
+            dUvRow[dux * 2] = sUvRow[sux];
+            dUvRow[dux * 2 + 1] = sUvRow[sux + 1];
+        }
+    }
+
+    buf->Unlock();
+    return true;
+}
+
 bool CreateBlackNv12Sample(const std::vector<BYTE>& blackNv12, LONGLONG ts100, LONGLONG dur100,
                            ComPtr<IMFSample>& outSmp) {
     outSmp.Reset();
@@ -1340,7 +1415,7 @@ bool EditMp4Clip(const ClipEditSpec& spec, std::string& outError,
 
     // Fast lossless passthrough trim (<0.3s, minimal RAM) when only start/end changed
     if (!isMontage && !hasCut && !hasInsert && !spec.fadeTransitions &&
-        spec.musicTracks.empty() && spec.transitions.empty() &&
+        spec.musicTracks.empty() && spec.transitions.empty() && spec.frameTransforms.empty() &&
         spec.targetSizeMb == 0 && !spec.vertical916 &&
         std::abs(defaultSpeed - 1.0) < 0.01 &&
         spec.gameVolPct == 100 && spec.micVolPct == 100) {
@@ -2051,7 +2126,7 @@ bool EditMp4Clip(const ClipEditSpec& spec, std::string& outError,
                 if (segFadeAlpha < 0.999f) {
                     ApplyNv12FadeInSample(outSmp.Get(), outW, outH, segFadeAlpha);
                 }
-                const bool needDupBackup = !spec.transitions.empty();
+                const bool needDupBackup = !spec.transitions.empty() || !spec.frameTransforms.empty();
                 fxRawCopy.clear();
                 if (needDupBackup) {
                     ComPtr<IMFMediaBuffer> rb;
@@ -2062,8 +2137,11 @@ bool EditMp4Clip(const ClipEditSpec& spec, std::string& outError,
                             rb->Unlock();
                         }
                     }
+                    const double frameSec = static_cast<double>(gridTs) / 1e7;
+                    ApplyNv12FrameTransform(outSmp.Get(), outW, outH, blackY,
+                        frameSec, spec.frameTransforms, fxScratch);
                     ApplyNv12TransitionEffects(outSmp.Get(), outW, outH, blackY,
-                        static_cast<double>(gridTs) / 1e7, spec.transitions, fxScratch);
+                        frameSec, spec.transitions, fxScratch);
                 }
                 if (SUCCEEDED(sw->WriteSample(vOutIdx, outSmp.Get()))) {
                     ++outFrameIdx;
@@ -2098,8 +2176,11 @@ bool EditMp4Clip(const ClipEditSpec& spec, std::string& outError,
                                 }
                             }
                             if (dupOk) {
+                                const double dupSec = static_cast<double>(gTs) / 1e7;
+                                ApplyNv12FrameTransform(dupSmp.Get(), outW, outH, blackY,
+                                    dupSec, spec.frameTransforms, fxScratch);
                                 ApplyNv12TransitionEffects(dupSmp.Get(), outW, outH, blackY,
-                                    static_cast<double>(gTs) / 1e7, spec.transitions, fxScratch);
+                                    dupSec, spec.transitions, fxScratch);
                             }
                         }
                         if (!dupOk && hasGpuPool && ctx) {
