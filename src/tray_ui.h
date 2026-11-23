@@ -46,9 +46,8 @@ private:
     std::unique_ptr<MainWindow> mainWin_;
 
     HWND trayHwnd_ = nullptr;
-    HICON iconActive_ = nullptr;
-    HICON iconPaused_ = nullptr;
-    HICON iconSaving_ = nullptr;
+    HICON iconTray_ = nullptr;
+    HICON iconWindowBig_ = nullptr;
     bool trayAdded_ = false;
     bool shownHideBalloon_ = false;
     UINT wmTaskbarCreated_ = 0;

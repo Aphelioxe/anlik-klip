@@ -411,6 +411,10 @@ bool MainWindow::Create(int initialTab) {
         wc.lpfnWndProc = MainWindow::WndProc;
         wc.hInstance = hInst_;
         wc.lpszClassName = cls;
+        wc.hIcon = reinterpret_cast<HICON>(LoadImageW(hInst_, MAKEINTRESOURCEW(1), IMAGE_ICON,
+            GetSystemMetrics(SM_CXICON), GetSystemMetrics(SM_CYICON), LR_DEFAULTCOLOR));
+        wc.hIconSm = reinterpret_cast<HICON>(LoadImageW(hInst_, MAKEINTRESOURCEW(1), IMAGE_ICON,
+            GetSystemMetrics(SM_CXSMICON), GetSystemMetrics(SM_CYSMICON), LR_DEFAULTCOLOR));
         wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
         wc.hbrBackground = brBg_;
         RegisterClassExW(&wc);

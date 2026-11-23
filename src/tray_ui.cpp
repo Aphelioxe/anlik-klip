@@ -311,9 +311,14 @@ bool TrayUI::Create(bool showWindow) {
 
     wmTaskbarCreated_ = RegisterWindowMessageW(L"TaskbarCreated");
 
-    iconActive_ = CreateStatusIcon(RGB(34, 197, 94));
-    iconPaused_ = CreateStatusIcon(RGB(148, 163, 184));
-    iconSaving_ = CreateStatusIcon(RGB(239, 68, 68));
+    // Use the exact embedded desktop/exe icon (resource ID 1 = assets/app.ico) for system tray & window
+    iconTray_ = reinterpret_cast<HICON>(LoadImageW(hInst_, MAKEINTRESOURCEW(1), IMAGE_ICON,
+        GetSystemMetrics(SM_CXSMICON), GetSystemMetrics(SM_CYSMICON), LR_DEFAULTCOLOR));
+    if (!iconTray_) iconTray_ = CreateStatusIcon(RGB(59, 130, 246));
+
+    iconWindowBig_ = reinterpret_cast<HICON>(LoadImageW(hInst_, MAKEINTRESOURCEW(1), IMAGE_ICON,
+        GetSystemMetrics(SM_CXICON), GetSystemMetrics(SM_CYICON), LR_DEFAULTCOLOR));
+    if (!iconWindowBig_) iconWindowBig_ = iconTray_;
 
     // Tiny hidden top-level host window (~0 KB UI footprint when MainWindow is closed)
     trayHwnd_ = CreateWindowExW(0, kTrayWndClass, L"AnlikKlipHost", WS_POPUP,
@@ -351,9 +356,9 @@ void TrayUI::Destroy() {
         trayHwnd_ = nullptr;
     }
 
-    if (iconActive_) { DestroyIcon(iconActive_); iconActive_ = nullptr; }
-    if (iconPaused_) { DestroyIcon(iconPaused_); iconPaused_ = nullptr; }
-    if (iconSaving_) { DestroyIcon(iconSaving_); iconSaving_ = nullptr; }
+    if (iconWindowBig_ && iconWindowBig_ != iconTray_) { DestroyIcon(iconWindowBig_); }
+    iconWindowBig_ = nullptr;
+    if (iconTray_) { DestroyIcon(iconTray_); iconTray_ = nullptr; }
 }
 
 void TrayUI::ShowSettingsWindow(int tabIndex) {
@@ -391,9 +396,9 @@ void TrayUI::ShowSettingsWindow(int tabIndex) {
         mainWin_.reset();
         return;
     }
-    if (mainWin_->Hwnd() && iconActive_) {
-        SendMessageW(mainWin_->Hwnd(), WM_SETICON, ICON_BIG, reinterpret_cast<LPARAM>(iconActive_));
-        SendMessageW(mainWin_->Hwnd(), WM_SETICON, ICON_SMALL, reinterpret_cast<LPARAM>(iconActive_));
+    if (mainWin_->Hwnd()) {
+        if (iconWindowBig_) SendMessageW(mainWin_->Hwnd(), WM_SETICON, ICON_BIG, reinterpret_cast<LPARAM>(iconWindowBig_));
+        if (iconTray_) SendMessageW(mainWin_->Hwnd(), WM_SETICON, ICON_SMALL, reinterpret_cast<LPARAM>(iconTray_));
     }
 }
 
@@ -437,7 +442,7 @@ void TrayUI::UpdateTrayIcon() {
     nid.uID = 1;
     nid.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;
     nid.uCallbackMessage = WM_APP_TRAY;
-    nid.hIcon = st.saving ? iconSaving_ : (st.running ? iconActive_ : iconPaused_);
+    nid.hIcon = iconTray_;
 
     std::wstring hk = FormatHotkey(app_.Config().hotkeyMods, app_.Config().hotkeyVk);
     swprintf(nid.szTip, 128, L"Anlık Klip — %ls (%ls)",
