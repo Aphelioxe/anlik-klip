@@ -169,6 +169,9 @@ StudioGeometry CalcStudioGeom(int cw, int ch, int dpi) {
     return gm;
 }
 
+constexpr double kStudioMinPxPerSec = 0.25; // allows ~65+ minutes visible at once when zoomed out
+constexpr double kStudioMaxPxPerSec = 220.0;
+
 template <typename T>
 inline double ClipOutDur(const T& c) {
     return std::max(0.1, c.trimEndSec - c.trimStartSec) / std::max(0.5, c.speed);
@@ -279,7 +282,7 @@ void MainWindow::StudioFitZoomToView(int cw, int ch) {
     const StudioGeometry gm = CalcStudioGeom(cw, ch, static_cast<int>(dpi_));
     double dur = std::max(4.0, StudioTotalDuration());
     double availW = std::max(120.0, static_cast<double>(gm.tlViewRc.right - gm.tlViewRc.left - S(44)));
-    studioPxPerSec_ = std::max(8.0, std::min(160.0, availW / dur));
+    studioPxPerSec_ = std::max(kStudioMinPxPerSec, std::min(160.0, availW / dur));
     studioTimelineScrollSec_ = 0.0;
 }
 
@@ -2084,20 +2087,37 @@ void MainWindow::PaintStudio(void* gPtr, int cw, int ch) {
             return static_cast<float>(gm.tlViewRc.left + (s - studioTimelineScrollSec_) * studioPxPerSec_);
         };
 
-        // Time Ruler ticks
-        int stepSec = (studioPxPerSec_ >= 100.0) ? 1
-                    : (studioPxPerSec_ >= 48.0 ? 2 : (studioPxPerSec_ >= 20.0 ? 5 : 10));
-        int maxSecTick = static_cast<int>(std::ceil(studioTimelineScrollSec_ + (gm.tlViewRc.right - gm.tlViewRc.left) / studioPxPerSec_)) + 2;
+        // Adaptive Time Ruler ticks (stays legible from sub-second zoom out to ~60+ minutes)
+        static constexpr int kMajorSteps[] = { 1, 2, 5, 10, 15, 30, 60, 120, 300, 600, 900, 1800 };
+        int majorStep = 1800;
+        for (int cand : kMajorSteps) {
+            if (static_cast<double>(cand) * studioPxPerSec_ >= S(56)) {
+                majorStep = cand;
+                break;
+            }
+        }
+        int minorStep = (majorStep >= 300) ? (majorStep / 5)
+                      : (majorStep >= 120) ? 30
+                      : (majorStep >= 60)  ? 15
+                      : (majorStep >= 30)  ? 10
+                      : (majorStep >= 15)  ? 5
+                      : (majorStep >= 10)  ? 2
+                      : 1;
+        if (static_cast<double>(minorStep) * studioPxPerSec_ < S(8)) {
+            minorStep = majorStep;
+        }
+        int firstTick = std::max(0, (static_cast<int>(std::floor(studioTimelineScrollSec_)) / minorStep) * minorStep - minorStep);
+        int maxSecTick = static_cast<int>(std::ceil(studioTimelineScrollSec_ + (gm.tlViewRc.right - gm.tlViewRc.left) / studioPxPerSec_)) + majorStep;
         Gdiplus::Pen pTick(Gc(58, 70, 96), 1.0f);
-        for (int s = 0; s <= maxSecTick; ++s) {
+        for (int s = firstTick; s <= maxSecTick; s += minorStep) {
             float x = secToX(static_cast<double>(s));
-            if (x < gm.tlViewRc.left - 20) continue;
-            bool major = (s % stepSec == 0);
+            if (x < gm.tlViewRc.left - S(24)) continue;
+            bool major = (s % majorStep == 0);
             g.DrawLine(&pTick, x, (float)(gm.timelineTop + (major ? S(14) : S(20))), x, (float)(gm.timelineTop + gm.rulerH));
             if (major) {
                 wchar_t tb[16] = {};
                 swprintf(tb, 16, L"%d:%02d", s / 60, s % 60);
-                g.DrawString(tb, -1, &fTiny, Gdiplus::RectF(x + 2, (float)(gm.timelineTop + 1), 40.0f, (float)S(14)), &sfLeft, &brMuted);
+                g.DrawString(tb, -1, &fTiny, Gdiplus::RectF(x + 2, (float)(gm.timelineTop + 1), (float)S(48), (float)S(14)), &sfLeft, &brMuted);
             }
         }
 
@@ -2797,7 +2817,7 @@ bool MainWindow::OnStudioMouseMove(int mx, int my) {
         double dt = static_cast<double>(mx - studioDragStartX_) / studioPxPerSec_;
         double cand = std::max(minStart, studioDragOrigA_ + dt);
 
-        const double snapThresh = 8.0 / studioPxPerSec_;
+        const double snapThresh = std::min(1.5, 8.0 / studioPxPerSec_);
         if (std::abs(cand - minStart) < snapThresh) cand = minStart;
         else if (idx == 0 && std::abs(cand - 0.0) < snapThresh) cand = 0.0;
         else if (std::abs(cand - studioPlayheadSec_) < snapThresh) cand = studioPlayheadSec_;
@@ -2820,7 +2840,7 @@ bool MainWindow::OnStudioMouseMove(int mx, int my) {
         double dt = static_cast<double>(mx - studioDragStartX_) / studioPxPerSec_;
         double maxTl = std::max(2.0, StudioTotalDuration() + 2.0);
         double cand = std::max(0.0, std::min(maxTl, studioDragOrigA_ + dt));
-        double snapThresh = 8.0 / studioPxPerSec_;
+        double snapThresh = std::min(1.5, 8.0 / studioPxPerSec_);
         if (std::abs(cand - 0.0) < snapThresh) cand = 0.0;
         else if (std::abs(cand - studioPlayheadSec_) < snapThresh) cand = studioPlayheadSec_;
         else {
@@ -2841,7 +2861,7 @@ bool MainWindow::OnStudioMouseMove(int mx, int my) {
         auto& m = studioMusic_[static_cast<size_t>(studioDragIdx_)];
         double dt = static_cast<double>(mx - studioDragStartX_) / studioPxPerSec_;
         double cand = std::max(0.0, studioDragOrigA_ + dt);
-        double snapThresh = 8.0 / studioPxPerSec_;
+        double snapThresh = std::min(1.5, 8.0 / studioPxPerSec_);
         if (std::abs(cand - 0.0) < snapThresh) cand = 0.0;
         if (std::abs(cand - studioPlayheadSec_) < snapThresh) cand = studioPlayheadSec_;
         for (const auto& c : studioClips_) {
@@ -2957,8 +2977,8 @@ bool MainWindow::OnStudioMouseWheel(int mx, int my, int delta, bool ctrl) {
     const StudioGeometry gm = CalcStudioGeom(cli.right, cli.bottom, static_cast<int>(dpi_));
     if (my >= gm.timelineTop && mx >= gm.tlViewRc.left - S(10)) {
         if (ctrl) {
-            double factor = (delta > 0) ? 1.18 : (1.0 / 1.18);
-            studioPxPerSec_ = std::max(8.0, std::min(220.0, studioPxPerSec_ * factor));
+            double factor = (delta > 0) ? 1.22 : (1.0 / 1.22);
+            studioPxPerSec_ = std::max(kStudioMinPxPerSec, std::min(kStudioMaxPxPerSec, studioPxPerSec_ * factor));
         } else {
             double shift = ((delta > 0) ? -1.0 : 1.0) * (120.0 / studioPxPerSec_);
             studioTimelineScrollSec_ = std::max(0.0, studioTimelineScrollSec_ + shift);
@@ -3098,11 +3118,11 @@ bool MainWindow::OnStudioButtonClick(int target) {
             }
             return true;
         case ui::BTN_STU_ZOOM_IN:
-            studioPxPerSec_ = std::min(220.0, studioPxPerSec_ * 1.25);
+            studioPxPerSec_ = std::min(kStudioMaxPxPerSec, studioPxPerSec_ * 1.30);
             InvalidateRect(hwnd_, nullptr, FALSE);
             return true;
         case ui::BTN_STU_ZOOM_OUT:
-            studioPxPerSec_ = std::max(8.0, studioPxPerSec_ / 1.25);
+            studioPxPerSec_ = std::max(kStudioMinPxPerSec, studioPxPerSec_ / 1.30);
             InvalidateRect(hwnd_, nullptr, FALSE);
             return true;
         case ui::BTN_STU_ZOOM_FIT: {
