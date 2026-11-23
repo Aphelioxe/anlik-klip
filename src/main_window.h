@@ -311,6 +311,10 @@ private:
     bool studioDragWasPlaying_ = false;
     ULONGLONG studioLastScrubMs_ = 0;
     ULONGLONG studioIgnoreEndUntilMs_ = 0;
+    int studioHoverClipIdx_ = -1;
+    int studioHoverClipSide_ = 0;  // -1=left, +1=right, 0=none
+    int studioHoverMusicIdx_ = -1;
+    int studioHoverMusicSide_ = 0; // -1=left, +1=right, 0=none
 
     void OpenStudio(bool loadQueued = true);
     void CloseStudio();
@@ -318,6 +322,9 @@ private:
     void UpdateStudioMetrics();
     double StudioTotalDuration() const;
     bool MapTimelineToClip(double tlSec, int& outIdx, double& outLocalSec, double& outClipStartSec) const;
+    bool StudioHitTestTrimEdge(int mx, int my, int cw, int ch, int& outKind, int& outIdx, int& outSide, double& outAccSec) const;
+    void StudioFitZoomToView(int cw, int ch);
+    void StudioTrimClipEdgeToPlayhead(bool leftEdge);
     void StudioAddClipFromLibrary(size_t rawClipIdx);
     void StudioAddMusicFile(const std::wstring& audioPath = L"");
     void StudioSplitAtPlayhead();

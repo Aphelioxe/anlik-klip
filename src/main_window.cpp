@@ -3679,6 +3679,40 @@ LRESULT MainWindow::OnMessage(UINT msg, WPARAM wParam, LPARAM lParam) {
             break;
         }
 
+        case WM_SETCURSOR: {
+            if (LOWORD(lParam) == HTCLIENT) {
+                bool wantSizeWE = false;
+                if (studioOpen_ && activeTab_ == 1) {
+                    if (studioDragMode_ == 2 || studioDragMode_ == 3 || studioDragMode_ == 5 || studioDragMode_ == 6) {
+                        wantSizeWE = true;
+                    } else if (studioDragMode_ == 0 && !trimBusy_) {
+                        POINT pt{};
+                        GetCursorPos(&pt);
+                        ScreenToClient(hwnd_, &pt);
+                        RECT cli{};
+                        GetClientRect(hwnd_, &cli);
+                        int k = 0, idx = -1, side = 0;
+                        double acc = 0.0;
+                        wantSizeWE = StudioHitTestTrimEdge(pt.x, pt.y, cli.right, cli.bottom, k, idx, side, acc);
+                    }
+                } else if (activeTab_ == 0 && playerOpen_ && !playerFullscreen_ && !trimBusy_) {
+                    if (draggingTrim_ != 0) {
+                        wantSizeWE = true;
+                    } else {
+                        POINT pt{};
+                        GetCursorPos(&pt);
+                        ScreenToClient(hwnd_, &pt);
+                        wantSizeWE = (HitTestTrimHandle(pt.x, pt.y) != 0);
+                    }
+                }
+                if (wantSizeWE) {
+                    SetCursor(LoadCursorW(nullptr, IDC_SIZEWE));
+                    return TRUE;
+                }
+            }
+            break;
+        }
+
         case WM_MOUSEMOVE: {
             if (!trackingMouse_) {
                 TRACKMOUSEEVENT tme{ sizeof(tme), TME_LEAVE, hwnd_, 0 };
@@ -3768,6 +3802,10 @@ LRESULT MainWindow::OnMessage(UINT msg, WPARAM wParam, LPARAM lParam) {
             hoverBtnId_ = 0;
             hoverCardIdx_ = -1;
             hoverSeekActive_ = false;
+            studioHoverClipIdx_ = -1;
+            studioHoverClipSide_ = 0;
+            studioHoverMusicIdx_ = -1;
+            studioHoverMusicSide_ = 0;
             if (!draggingSeek_ && !draggingVol_ && draggingTrim_ == 0) pressedBtnId_ = 0;
             InvalidateRect(hwnd_, nullptr, FALSE);
             return 0;
