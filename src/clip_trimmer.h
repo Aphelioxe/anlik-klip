@@ -93,7 +93,8 @@ struct ClipEditSpec {
 bool ProbeAudioFileDuration(const std::wstring& path, double& outDurSec);
 
 /** Extracts normalized [0..1] audio peak/RMS buckets from a video or audio file. */
-bool ExtractAudioWaveform(const std::wstring& path, int trackChoice, int numBuckets, std::vector<float>& outPeaks);
+bool ExtractAudioWaveform(const std::wstring& path, int trackChoice, int numBuckets, std::vector<float>& outPeaks,
+                          const std::atomic<bool>* stopFlag = nullptr);
 
 /** Returns a non-colliding copy path alongside srcPath (e.g. "Clip_kesit.mp4"). */
 std::wstring BuildTrimmedCopyPath(const std::wstring& srcPath);

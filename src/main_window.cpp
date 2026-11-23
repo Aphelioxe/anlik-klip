@@ -1692,6 +1692,7 @@ void MainWindow::StartTrimAsync(bool replaceOriginal, int targetSizeMb) {
 void MainWindow::StartMontageExport(int targetSizeMb) {
     if (trimBusy_ || montagePaths_.empty()) return;
     if (trimThread_.joinable()) trimThread_.join();
+    if (playerOpen_) CloseEmbeddedPlayer();
 
     trimCancel_.store(false);
     trimBusy_ = true;
@@ -1731,6 +1732,7 @@ void MainWindow::StartMontageExport(int targetSizeMb) {
         m->origPath = editSpec.montageSegments.empty() ? L"" : editSpec.montageSegments[0].path;
         m->outPath = outPath;
         if (!ok) {
+            Logger::Log("StartMontageExport failed: %s", errUtf8.c_str());
             int wlen = MultiByteToWideChar(CP_UTF8, 0, errUtf8.c_str(), -1, nullptr, 0);
             std::wstring werr(wlen > 0 ? wlen - 1 : 0, L'\0');
             if (wlen > 1) MultiByteToWideChar(CP_UTF8, 0, errUtf8.c_str(), -1, &werr[0], wlen);
@@ -3344,8 +3346,12 @@ LRESULT MainWindow::OnMessage(UINT msg, WPARAM wParam, LPARAM lParam) {
                             if (studioOpen_) CloseStudio();
                             studioClips_.clear();
                             studioMusic_.clear();
+                            studioTransitions_.clear();
+                            studioFrames_.clear();
                             studioSelClip_ = -1;
                             studioSelMusic_ = -1;
+                            studioSelFx_ = -1;
+                            studioSelFrame_ = -1;
                             montagePaths_.clear();
                             SwitchTab(0);
                         }
@@ -3369,6 +3375,7 @@ LRESULT MainWindow::OnMessage(UINT msg, WPARAM wParam, LPARAM lParam) {
                             SyncStudioMediaState(true);
                         }
                         SetFooterMessage(msg);
+                        if (hwnd_) InvalidateRect(hwnd_, nullptr, FALSE);
                     } else {
                         double savedStart = trimStartSec_, savedEnd = trimEndSec_;
                         bool keepTrim = trimMode_;

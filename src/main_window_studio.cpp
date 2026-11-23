@@ -825,7 +825,7 @@ void MainWindow::StartStudioWaveformWorker() {
         for (const auto& job : jobs) {
             if (studioWaveStop_.load() || studioGen_.load() != gen) break;
             std::vector<float> peaks;
-            if (ExtractAudioWaveform(job.path, 0, 140, peaks) && !peaks.empty()) {
+            if (ExtractAudioWaveform(job.path, 0, 140, peaks, &studioWaveStop_) && !peaks.empty()) {
                 auto* msg = new StudioWaveDoneMsg{ gen, job.isMusic, job.path, std::move(peaks) };
                 if (!PostMessageW(target, ui::WM_MW_STUDIO_WAVE_READY, 0, reinterpret_cast<LPARAM>(msg))) {
                     delete msg;
@@ -1338,7 +1338,8 @@ void MainWindow::StartStudioRender() {
     if (trimBusy_ || studioClips_.empty()) return;
     if (trimThread_.joinable()) trimThread_.join();
 
-    // Release preview players cleanly so source files have zero file lock during encode
+    // Release preview players and waveform readers cleanly so source files have zero contention during encode
+    StopStudioWaveformWorker();
     studioPlaying_ = false;
     ++studioGen_;
     if (studioVideoCb_) { studioVideoCb_->Detach(); studioVideoCb_->Release(); studioVideoCb_ = nullptr; }
@@ -1418,6 +1419,7 @@ void MainWindow::StartStudioRender() {
             msg->origPath = editSpec.montageSegments.empty() ? L"" : editSpec.montageSegments[0].path;
             msg->outPath = outPath;
             if (!ok) {
+                Logger::Log("StartStudioRender failed: %s", errUtf8.c_str());
                 int wlen = MultiByteToWideChar(CP_UTF8, 0, errUtf8.c_str(), -1, nullptr, 0);
                 std::wstring werr(wlen > 0 ? wlen - 1 : 0, L'\0');
                 if (wlen > 1) MultiByteToWideChar(CP_UTF8, 0, errUtf8.c_str(), -1, &werr[0], wlen);
@@ -1722,6 +1724,15 @@ void MainWindow::PaintMontajLanding(void* gPtr, int cw, int ch) {
             addBtnPx(ui::BTN_MNT_DEL_BASE + qi, bx + S(60), ry + S(5), S(26), S(25), L"×",
                 Gc(127, 29, 29), Gc(185, 28, 28), Gc(220, 38, 38), !trimBusy_);
         }
+    }
+    if (!footerMsg_.empty()) {
+        const bool isErr = (footerMsg_.find(L"başarısız") != std::wstring::npos ||
+                            footerMsg_.find(L"Hata") != std::wstring::npos ||
+                            footerMsg_.find(L"olmalı") != std::wstring::npos);
+        Gdiplus::SolidBrush brMsg(isErr ? Gc(252, 165, 165) : Gc(103, 232, 249));
+        g.DrawString(footerMsg_.c_str(), -1, &fSmall,
+            Gdiplus::RectF((float)S(246), (float)(ch - S(22)), (float)std::max(S(160), bodyW - S(8)), (float)S(20)),
+            &sfLeft, &brMsg);
     }
 }
 
@@ -2257,6 +2268,43 @@ void MainWindow::PaintStudio(void* gPtr, int cw, int ch) {
         } else {
             g.DrawString(L"Klip veya MP3 seçtiğinizde ses ayarları burada görünür.", -1, &fTiny,
                 Gdiplus::RectF((float)bx, (float)mby, (float)S(380), (float)S(24)), &sfLeft, &brMuted);
+        }
+
+        if (!footerMsg_.empty() && !trimBusy_) {
+            int usedRight = bx + S(390);
+            if (hasFrmSel) usedRight = bx + S(464);
+            else if (hasFxSel) usedRight = bx + S(450);
+            else if (hasMusSel) usedRight = gm.musSlRc.right + S(214);
+            else if (hasClipSel || !studioClips_.empty()) {
+                int ci = hasClipSel ? studioSelClip_ : 0;
+                usedRight = studioClips_[static_cast<size_t>(ci)].hasMultiTrack
+                    ? (gm.micSlRc.right + S(48)) : (gm.gameSlRc.right + S(48));
+            }
+            int availR = cw - S(10) - usedRight;
+            const bool isErr = (footerMsg_.find(L"başarısız") != std::wstring::npos ||
+                                footerMsg_.find(L"Hata") != std::wstring::npos ||
+                                footerMsg_.find(L"okunamadı") != std::wstring::npos ||
+                                footerMsg_.find(L"bulunamadı") != std::wstring::npos ||
+                                footerMsg_.find(L"olmalı") != std::wstring::npos);
+            if (availR >= S(150)) {
+                int pw = std::min(availR, S(420));
+                int px = cw - S(10) - pw;
+                FillRoundRect(g, (float)px, (float)mby, (float)pw, (float)S(24), (float)S(6),
+                    isErr ? Gc(68, 20, 26) : Gc(18, 28, 46));
+                StrokeRoundRect(g, (float)px, (float)mby, (float)pw, (float)S(24), (float)S(6),
+                    isErr ? Gc(248, 113, 113) : Gc(56, 189, 248, 130));
+                Gdiplus::SolidBrush brSt(isErr ? Gc(254, 202, 202) : Gc(165, 243, 252));
+                g.DrawString(footerMsg_.c_str(), -1, &fTiny,
+                    Gdiplus::RectF((float)(px + S(8)), (float)mby, (float)(pw - S(16)), (float)S(24)), &sfLeft, &brSt);
+            } else if (isErr) {
+                FillRoundRect(g, (float)S(8), (float)(gm.timelineTop - S(28)), (float)(gm.leftW - S(16)), (float)S(24), (float)S(6),
+                    Gc(68, 20, 26, 235));
+                StrokeRoundRect(g, (float)S(8), (float)(gm.timelineTop - S(28)), (float)(gm.leftW - S(16)), (float)S(24), (float)S(6),
+                    Gc(248, 113, 113));
+                Gdiplus::SolidBrush brSt(Gc(254, 202, 202));
+                g.DrawString(footerMsg_.c_str(), -1, &fTiny,
+                    Gdiplus::RectF((float)S(14), (float)(gm.timelineTop - S(28)), (float)(gm.leftW - S(28)), (float)S(24)), &sfLeft, &brSt);
+            }
         }
     }
 
