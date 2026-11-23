@@ -376,6 +376,7 @@ void MainWindow::OpenStudio(bool loadQueued) {
     studioPlaying_ = false;
     studioVideoReady_ = false;
     studioAudioReady_ = false;
+    studioSeekPending_ = false;
     studioLoadedClipIdx_ = -1;
     studioLoadedClipPath_.clear();
     studioLoadedMusicPath_.clear();
@@ -481,6 +482,7 @@ void MainWindow::CloseStudio() {
     studioPlaying_ = false;
     studioVideoReady_ = false;
     studioAudioReady_ = false;
+    studioSeekPending_ = false;
     studioLoadedClipIdx_ = -1;
     studioLoadedClipPath_.clear();
     studioLoadedMusicPath_.clear();
@@ -598,6 +600,8 @@ void MainWindow::SyncStudioMediaState(bool forceSeekVideo) {
 
     if (needNewItem) {
         studioVideoReady_ = false;
+        studioSeekPending_ = true;
+        studioIgnoreEndUntilMs_ = GetTickCount64() + 700;
         studioLoadedClipIdx_ = segIdx;
         studioLoadedClipPath_ = clip.path;
         studioPendingSeekSec_ = localSec;
@@ -606,6 +610,8 @@ void MainWindow::SyncStudioMediaState(bool forceSeekVideo) {
             SelectBestPreviewAudioTrack(item, clip.path);
             studioPlayer_->SetMediaItem(item);
             item->Release();
+        } else {
+            studioSeekPending_ = false;
         }
     } else if (studioVideoReady_) {
         studioLoadedClipIdx_ = segIdx;
@@ -617,9 +623,12 @@ void MainWindow::SyncStudioMediaState(bool forceSeekVideo) {
             PropVariantInit(&pos);
             pos.vt = VT_I8;
             pos.hVal.QuadPart = static_cast<LONGLONG>(localSec * 1e7);
-            studioPlayer_->SetPosition(MFP_POSITIONTYPE_100NS, &pos);
+            studioSeekPending_ = true;
+            studioIgnoreEndUntilMs_ = GetTickCount64() + 550;
+            if (FAILED(studioPlayer_->SetPosition(MFP_POSITIONTYPE_100NS, &pos))) {
+                studioSeekPending_ = false;
+            }
             PropVariantClear(&pos);
-            studioIgnoreEndUntilMs_ = GetTickCount64() + 180;
         }
         if (studioPlaying_) studioPlayer_->Play();
         else studioPlayer_->Pause();
@@ -686,11 +695,20 @@ void MainWindow::UpdateStudioMetrics() {
 
     int curIdx = studioLoadedClipIdx_;
     if (curIdx < 0 || curIdx >= static_cast<int>(studioClips_.size())) {
-        MapTimelineToClip(studioPlayheadSec_, curIdx, studioPendingSeekSec_, studioPendingAudioSeekSec_);
+        double tmpL = 0.0, tmpC = 0.0;
+        MapTimelineToClip(studioPlayheadSec_, curIdx, tmpL, tmpC);
     }
     if (curIdx < 0 || curIdx >= static_cast<int>(studioClips_.size())) return;
 
     const auto& clip = studioClips_[static_cast<size_t>(curIdx)];
+    if (studioSeekPending_) {
+        if (GetTickCount64() < studioIgnoreEndUntilMs_) {
+            if (hwnd_) InvalidateRect(hwnd_, nullptr, FALSE);
+            return;
+        }
+        studioSeekPending_ = false;
+    }
+
     double localPos = clip.trimStartSec;
     PROPVARIANT pos;
     PropVariantInit(&pos);
@@ -708,7 +726,7 @@ void MainWindow::UpdateStudioMetrics() {
     if (GetTickCount64() >= studioIgnoreEndUntilMs_ && localPos >= clip.trimEndSec - 0.04) {
         double nextTl = clipStartOut + std::max(0.1, clip.trimEndSec - clip.trimStartSec) / std::max(0.5, clip.speed);
         if (curIdx + 1 < static_cast<int>(studioClips_.size())) {
-            studioPlayheadSec_ = nextTl;
+            studioPlayheadSec_ = nextTl + 0.001;
             SyncStudioMediaState(true);
         } else {
             studioPlayheadSec_ = StudioTotalDuration();
@@ -716,9 +734,11 @@ void MainWindow::UpdateStudioMetrics() {
             studioPlayer_->Pause();
             if (studioMusicPlayer_) studioMusicPlayer_->Pause();
         }
-    } else {
+    } else if (GetTickCount64() >= studioIgnoreEndUntilMs_) {
         double relLocal = std::max(0.0, std::min(clip.trimEndSec - clip.trimStartSec, localPos - clip.trimStartSec));
         studioPlayheadSec_ = clipStartOut + relLocal / std::max(0.5, clip.speed);
+        SyncStudioMediaState(false);
+    } else {
         SyncStudioMediaState(false);
     }
 
@@ -1037,24 +1057,50 @@ bool MainWindow::HandleStudioAppMessage(UINT msg, WPARAM /*wParam*/, LPARAM lPar
                             studioPlayer_->SetMute(mute ? TRUE : FALSE);
                             studioPlayer_->SetRate(static_cast<float>(c.speed));
                         }
-                        if (studioPendingSeekSec_ >= 0.0) {
+                        if (studioPendingSeekSec_ > 0.01) {
                             PROPVARIANT sp;
                             PropVariantInit(&sp);
                             sp.vt = VT_I8;
                             sp.hVal.QuadPart = static_cast<LONGLONG>(studioPendingSeekSec_ * 1e7);
-                            studioPlayer_->SetPosition(MFP_POSITIONTYPE_100NS, &sp);
+                            studioSeekPending_ = true;
+                            studioIgnoreEndUntilMs_ = GetTickCount64() + 550;
+                            if (FAILED(studioPlayer_->SetPosition(MFP_POSITIONTYPE_100NS, &sp))) {
+                                studioSeekPending_ = false;
+                            }
                             PropVariantClear(&sp);
-                            studioPendingSeekSec_ = -1.0;
+                        } else {
+                            studioSeekPending_ = false;
                             studioIgnoreEndUntilMs_ = GetTickCount64() + 180;
                         }
+                        studioPendingSeekSec_ = -1.0;
                         studioPlayer_->UpdateVideo();
                         if (studioPlaying_) studioPlayer_->Play();
                         else studioPlayer_->Pause();
+                    } else if (ev->type == MFP_EVENT_TYPE_POSITION_SET) {
+                        studioSeekPending_ = false;
+                        studioIgnoreEndUntilMs_ = GetTickCount64() + 120;
                     } else if (ev->type == MFP_EVENT_TYPE_PLAYBACK_ENDED) {
-                        studioPlaying_ = false;
-                        studioPlayheadSec_ = StudioTotalDuration();
-                        if (studioMusicPlayer_) studioMusicPlayer_->Pause();
-                        if (hwnd_) InvalidateRect(hwnd_, nullptr, FALSE);
+                        if (studioVideoReady_ && !studioSeekPending_ && GetTickCount64() >= studioIgnoreEndUntilMs_) {
+                            int curIdx = studioLoadedClipIdx_;
+                            if (curIdx < 0 || curIdx >= static_cast<int>(studioClips_.size())) {
+                                double tmpL = 0.0, tmpC = 0.0;
+                                MapTimelineToClip(studioPlayheadSec_, curIdx, tmpL, tmpC);
+                            }
+                            if (studioPlaying_ && curIdx >= 0 && curIdx + 1 < static_cast<int>(studioClips_.size())) {
+                                double nextTl = 0.0;
+                                for (int i = 0; i <= curIdx; ++i) {
+                                    const auto& c = studioClips_[static_cast<size_t>(i)];
+                                    nextTl += std::max(0.1, c.trimEndSec - c.trimStartSec) / std::max(0.5, c.speed);
+                                }
+                                studioPlayheadSec_ = nextTl + 0.001;
+                                SyncStudioMediaState(true);
+                            } else {
+                                studioPlaying_ = false;
+                                studioPlayheadSec_ = StudioTotalDuration();
+                                if (studioMusicPlayer_) studioMusicPlayer_->Pause();
+                                if (hwnd_) InvalidateRect(hwnd_, nullptr, FALSE);
+                            }
+                        }
                     }
                 } else if (ev->isAudio && studioMusicPlayer_) {
                     if (ev->type == MFP_EVENT_TYPE_MEDIAITEM_SET) {

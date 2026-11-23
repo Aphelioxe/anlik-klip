@@ -311,6 +311,7 @@ private:
     bool studioDragWasPlaying_ = false;
     ULONGLONG studioLastScrubMs_ = 0;
     ULONGLONG studioIgnoreEndUntilMs_ = 0;
+    bool studioSeekPending_ = false;
     int studioHoverClipIdx_ = -1;
     int studioHoverClipSide_ = 0;  // -1=left, +1=right, 0=none
     int studioHoverMusicIdx_ = -1;
