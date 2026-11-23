@@ -1031,7 +1031,23 @@ bool EditMp4Clip(const ClipEditSpec& spec, std::string& outError,
                 outSmp->SetSampleDuration(newDur);
 
                 bool copied = false;
-                if (needVp && vp && vctx && vpInTex && vpOutTex && vpInView && vpOutView && stgTex) {
+                // Only use VideoProcessor when scaling, 9:16 vertical, or aspect-fit is actually needed for THIS frame
+                bool useVpForFrame = needVp && vp && vctx && vpInTex && vpOutTex && vpInView && vpOutView && stgTex;
+                if (useVpForFrame && !spec.vertical916) {
+                    ComPtr<IMFMediaBuffer> chkBuf;
+                    ComPtr<IMFDXGIBuffer> chkDb;
+                    ComPtr<ID3D11Texture2D> chkTex;
+                    if (SUCCEEDED(smp->GetBufferByIndex(0, chkBuf.Put())) && chkBuf &&
+                        SUCCEEDED(chkBuf->QueryInterface(__uuidof(IMFDXGIBuffer), chkDb.PutVoid())) &&
+                        SUCCEEDED(chkDb->GetResource(__uuidof(ID3D11Texture2D), chkTex.PutVoid()))) {
+                        D3D11_TEXTURE2D_DESC cDesc{};
+                        chkTex->GetDesc(&cDesc);
+                        if (cDesc.Width == outW && cDesc.Height == outH) {
+                            useVpForFrame = false; // direct GPU copy: avoids D3D11 VideoProcessor TDR hangs
+                        }
+                    }
+                }
+                if (useVpForFrame) {
                     ComPtr<IMFMediaBuffer> buf;
                     ComPtr<IMFDXGIBuffer> db;
                     ComPtr<ID3D11Texture2D> dtex;
@@ -1110,11 +1126,13 @@ bool EditMp4Clip(const ClipEditSpec& spec, std::string& outError,
                             vctx->VideoProcessorSetStreamAlpha(vp.Get(), 0, TRUE, segAlpha);
                             D3D11_VIDEO_PROCESSOR_STREAM st{};
                             st.Enable = TRUE; st.pInputSurface = vpInView.Get();
-                            vctx->VideoProcessorBlt(vp.Get(), vpOutView.Get(), 0, 1, &st);
+                            if (FAILED(vctx->VideoProcessorBlt(vp.Get(), vpOutView.Get(), 0, 1, &st))) {
+                                copied = false;
+                            }
                         }
 
                         bool dxgiAttached = false;
-                        if (hasGpuPool) {
+                        if (hasGpuPool && vpOutTex) {
                             const int pIdx = static_cast<int>(outFrameIdx % 16);
                             ctx->CopyResource(gpuOutPool[pIdx].Get(), vpOutTex.Get());
                             ComPtr<IMFMediaBuffer> dxBuf;
@@ -1150,7 +1168,7 @@ bool EditMp4Clip(const ClipEditSpec& spec, std::string& outError,
                         }
                     }
                 }
-                if (!copied && !needVp) {
+                if (!copied) {
                     if (hasGpuPool && ctx) {
                         ComPtr<IMFMediaBuffer> buf;
                         ComPtr<IMFDXGIBuffer> db;
