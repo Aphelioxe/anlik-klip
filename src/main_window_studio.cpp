@@ -1217,9 +1217,17 @@ void MainWindow::PaintStudio(void* gPtr, int cw, int ch) {
         bool hov = enabled && (hoverBtnId_ == id);
         bool prs = enabled && (pressedBtnId_ == id);
         Gdiplus::Color fill = !enabled ? Gc(24, 29, 40) : (prs ? hoverCol : (hov ? hoverCol : baseCol));
-        FillRoundRect(g, (float)rc.left, (float)rc.top, (float)pw, (float)ph, (float)S(7), fill);
-        if (borderCol.GetA() > 0) StrokeRoundRect(g, (float)rc.left, (float)rc.top, (float)pw, (float)ph, (float)S(7), borderCol);
-        Gdiplus::SolidBrush tb(!enabled ? Gc(96, 108, 128) : Gc(242, 246, 252));
+        if (enabled && !prs) {
+            Gdiplus::Color topC(fill.GetA(),
+                static_cast<uint8_t>(std::min(255, fill.GetR() + 14)),
+                static_cast<uint8_t>(std::min(255, fill.GetG() + 14)),
+                static_cast<uint8_t>(std::min(255, fill.GetB() + 16)));
+            FillRoundRectGrad(g, (float)rc.left, (float)rc.top, (float)pw, (float)ph, (float)S(8), topC, fill);
+        } else {
+            FillRoundRect(g, (float)rc.left, (float)rc.top, (float)pw, (float)ph, (float)S(8), fill);
+        }
+        if (borderCol.GetA() > 0) StrokeRoundRect(g, (float)rc.left, (float)rc.top, (float)pw, (float)ph, (float)S(8), borderCol);
+        Gdiplus::SolidBrush tb(!enabled ? Gc(96, 108, 128) : Gc(244, 247, 255));
         g.DrawString(label.c_str(), -1, smallFont ? &fSmall : &fBold,
             Gdiplus::RectF((float)rc.left, (float)rc.top, (float)pw, (float)ph), &sfCenter, &tb);
     };
@@ -1227,73 +1235,110 @@ void MainWindow::PaintStudio(void* gPtr, int cw, int ch) {
     const StudioGeometry gm = CalcStudioGeom(cw, ch, static_cast<int>(dpi_));
     const double totalDur = StudioTotalDuration();
 
-    // Base dark canvas
+    // Base dark Anlık Klip backdrop + subtle signature blue/violet ambient glow orbs
     g.Clear(Gc(9, 12, 19));
-
-    // ================= 1. TOP BAR =================
     {
-        Gdiplus::SolidBrush brTop(Gc(14, 18, 28));
-        g.FillRectangle(&brTop, 0, 0, cw, gm.topH);
-        Gdiplus::Pen pSep(Gc(34, 44, 66), 1.0f);
+        Gdiplus::GraphicsPath gp1;
+        gp1.AddEllipse(S(140), -S(90), S(480), S(280));
+        Gdiplus::PathGradientBrush pgb1(&gp1);
+        pgb1.SetCenterColor(Gc(37, 99, 235, 34));
+        Gdiplus::Color s1[1] = { Gc(37, 99, 235, 0) };
+        int c1 = 1;
+        pgb1.SetSurroundColors(s1, &c1);
+        g.FillPath(&pgb1, &gp1);
+
+        Gdiplus::GraphicsPath gp2;
+        gp2.AddEllipse(cw - S(360), -S(80), S(440), S(260));
+        Gdiplus::PathGradientBrush pgb2(&gp2);
+        pgb2.SetCenterColor(Gc(139, 92, 246, 30));
+        Gdiplus::Color s2[1] = { Gc(139, 92, 246, 0) };
+        int c2 = 1;
+        pgb2.SetSurroundColors(s2, &c2);
+        g.FillPath(&pgb2, &gp2);
+    }
+
+    // ================= 1. TOP BAR (Anlık Klip Stüdyo Signature Header) =================
+    {
+        Gdiplus::LinearGradientBrush brTopGrad(
+            Gdiplus::PointF(0, 0), Gdiplus::PointF(0, (float)gm.topH),
+            Gc(19, 25, 40), Gc(12, 16, 26));
+        g.FillRectangle(&brTopGrad, 0, 0, cw, gm.topH);
+        Gdiplus::Pen pSep(Gc(46, 58, 86), 1.0f);
         g.DrawLine(&pSep, 0, gm.topH, cw, gm.topH);
 
-        FillRoundRectGrad(g, (float)S(12), (float)S(11), (float)S(28), (float)S(28), (float)S(8),
+        // Anlık Klip lens emblem (matching main sidebar & desktop icon DNA)
+        FillRoundRectGrad(g, (float)S(12), (float)S(10), (float)S(28), (float)S(28), (float)S(8),
             Gc(59, 130, 246), Gc(124, 58, 237));
-        g.DrawString(L"Montaj Stüdyosu", -1, &fTitle,
-            Gdiplus::RectF((float)S(48), (float)S(8), (float)S(165), (float)S(34)), &sfLeft, &brText);
+        {
+            Gdiplus::SolidBrush brWhite(Gc(255, 255, 255));
+            g.FillEllipse(&brWhite, (float)S(19), (float)S(17), (float)S(14), (float)S(14));
+            Gdiplus::SolidBrush brCore(app_.IsRunning() ? Gc(239, 68, 68) : Gc(100, 116, 139));
+            g.FillEllipse(&brCore, (float)S(22), (float)S(20), (float)S(8), (float)S(8));
+        }
+
+        g.DrawString(L"Anlık Klip", -1, &fTitle,
+            Gdiplus::RectF((float)S(46), (float)S(7), (float)S(96), (float)S(34)), &sfLeft, &brText);
+        FillRoundRectGrad(g, (float)S(142), (float)S(14), (float)S(60), (float)S(20), (float)S(10),
+            Gc(37, 99, 235, 95), Gc(124, 58, 237, 95));
+        StrokeRoundRect(g, (float)S(142), (float)S(14), (float)S(60), (float)S(20), (float)S(10), Gc(139, 92, 246, 175));
+        g.DrawString(L"STÜDYO", -1, &fTiny,
+            Gdiplus::RectF((float)S(142), (float)S(14), (float)S(60), (float)S(20)), &sfCenter, &brPurple);
 
         wchar_t statsTxt[64] = {};
         swprintf(statsTxt, 64, L"%zu klip • %.1f sn", studioClips_.size(), totalDur);
-        FillRoundRect(g, (float)S(212), (float)S(13), (float)S(118), (float)S(24), (float)S(12), Gc(24, 31, 48));
+        FillRoundRect(g, (float)S(210), (float)S(12), (float)S(112), (float)S(24), (float)S(12), Gc(20, 27, 42));
+        StrokeRoundRect(g, (float)S(210), (float)S(12), (float)S(112), (float)S(24), (float)S(12), Gc(56, 189, 248, 85));
         g.DrawString(statsTxt, -1, &fSmall,
-            Gdiplus::RectF((float)S(212), (float)S(13), (float)S(118), (float)S(24)), &sfCenter, &brCyan);
+            Gdiplus::RectF((float)S(210), (float)S(12), (float)S(112), (float)S(24)), &sfCenter, &brCyan);
 
-        int midX = std::max(S(342), (cw - S(390)) / 2 + S(30));
-        addBtnPx(ui::BTN_STU_ASPECT, midX, S(10), S(104), S(30),
+        int midX = std::max(S(332), (cw - S(390)) / 2 + S(26));
+        addBtnPx(ui::BTN_STU_ASPECT, midX, S(9), S(104), S(30),
             studioVertical916_ ? L"9:16 Dikey" : L"16:9 Yatay",
-            studioVertical916_ ? Gc(109, 40, 217) : Gc(26, 33, 50),
-            studioVertical916_ ? Gc(124, 58, 237) : Gc(38, 48, 72),
-            studioVertical916_ ? Gc(167, 139, 250) : Gc(52, 66, 96), !trimBusy_, true);
-        addBtnPx(ui::BTN_STU_FADE, midX + S(110), S(10), S(124), S(30),
+            studioVertical916_ ? Gc(109, 40, 217) : Gc(24, 31, 48),
+            studioVertical916_ ? Gc(124, 58, 237) : Gc(36, 46, 70),
+            studioVertical916_ ? Gc(167, 139, 250) : Gc(54, 70, 102), !trimBusy_, true);
+        addBtnPx(ui::BTN_STU_FADE, midX + S(110), S(9), S(124), S(30),
             studioFade_ ? L"Geçiş: Karartma" : L"Geçiş: Keskin",
-            studioFade_ ? Gc(30, 64, 175) : Gc(26, 33, 50),
-            studioFade_ ? Gc(37, 99, 235) : Gc(38, 48, 72),
-            studioFade_ ? Gc(96, 165, 250) : Gc(52, 66, 96), !trimBusy_, true);
+            studioFade_ ? Gc(30, 64, 175) : Gc(24, 31, 48),
+            studioFade_ ? Gc(37, 99, 235) : Gc(36, 46, 70),
+            studioFade_ ? Gc(96, 165, 250) : Gc(54, 70, 102), !trimBusy_, true);
 
         const wchar_t* tgtLbl = (studioTargetMb_ == 10) ? L"Discord ≤10 MB"
                               : (studioTargetMb_ == 25 ? L"Discord ≤25 MB" : L"Tam Kalite");
-        addBtnPx(ui::BTN_STU_TARGET, midX + S(240), S(10), S(122), S(30), tgtLbl,
-            studioTargetMb_ > 0 ? Gc(79, 70, 229) : Gc(26, 33, 50),
-            studioTargetMb_ > 0 ? Gc(99, 102, 241) : Gc(38, 48, 72),
-            studioTargetMb_ > 0 ? Gc(165, 180, 252) : Gc(52, 66, 96), !trimBusy_, true);
+        addBtnPx(ui::BTN_STU_TARGET, midX + S(240), S(9), S(122), S(30), tgtLbl,
+            studioTargetMb_ > 0 ? Gc(79, 70, 229) : Gc(24, 31, 48),
+            studioTargetMb_ > 0 ? Gc(99, 102, 241) : Gc(36, 46, 70),
+            studioTargetMb_ > 0 ? Gc(165, 180, 252) : Gc(54, 70, 102), !trimBusy_, true);
 
         if (trimBusy_) {
-            addBtnPx(ui::BTN_STU_CANCEL, cw - S(120), S(10), S(104), S(30), L"İptali Seç",
+            addBtnPx(ui::BTN_STU_CANCEL, cw - S(120), S(9), S(104), S(30), L"İptal Et",
                 Gc(153, 27, 27), Gc(185, 28, 28), Gc(248, 113, 113), true);
         } else {
-            addBtnPx(ui::BTN_STU_EXIT, cw - S(236), S(10), S(84), S(30), L"← Çıkış",
-                Gc(28, 35, 52), Gc(44, 54, 78), Gc(64, 78, 108), true, true);
-            addBtnPx(ui::BTN_STU_RENDER, cw - S(144), S(10), S(130), S(30), L"Montajı Oluştur",
-                Gc(16, 185, 129), Gc(5, 150, 105), Gc(52, 211, 153), !studioClips_.empty(), true);
+            addBtnPx(ui::BTN_STU_EXIT, cw - S(236), S(9), S(84), S(30), L"← Çıkış",
+                Gc(24, 31, 48), Gc(40, 50, 76), Gc(64, 78, 108), true, true);
+            addBtnPx(ui::BTN_STU_RENDER, cw - S(144), S(9), S(130), S(30), L"Montajı Oluştur",
+                Gc(16, 185, 129), Gc(5, 150, 105), Gc(110, 231, 183), !studioClips_.empty(), true);
         }
     }
 
     // ================= 2. FAR-LEFT LIBRARY & MUSIC DRAWER =================
     {
-        Gdiplus::SolidBrush brLeft(Gc(13, 17, 27));
-        g.FillRectangle(&brLeft, 0, gm.topH + 1, gm.leftW, gm.timelineTop - gm.topH - 1);
-        Gdiplus::Pen pSep(Gc(34, 44, 66), 1.0f);
+        Gdiplus::LinearGradientBrush brLeftGrad(
+            Gdiplus::PointF(0, (float)gm.topH), Gdiplus::PointF(0, (float)gm.timelineTop),
+            Gc(16, 21, 34), Gc(11, 15, 24));
+        g.FillRectangle(&brLeftGrad, 0, gm.topH + 1, gm.leftW, gm.timelineTop - gm.topH - 1);
+        Gdiplus::Pen pSep(Gc(42, 54, 80), 1.0f);
         g.DrawLine(&pSep, gm.leftW, gm.topH, gm.leftW, gm.timelineTop);
 
         int halfTabW = (gm.leftW - S(26)) / 2;
         addBtnPx(ui::BTN_STU_LEFT_CLIPS, S(10), gm.topH + S(10), halfTabW, S(30), L"Kliplerim",
-            studioLeftTab_ == 0 ? Gc(37, 99, 235) : Gc(24, 30, 44),
-            studioLeftTab_ == 0 ? Gc(59, 130, 246) : Gc(36, 45, 66),
+            studioLeftTab_ == 0 ? Gc(37, 99, 235) : Gc(22, 28, 42),
+            studioLeftTab_ == 0 ? Gc(59, 130, 246) : Gc(34, 43, 64),
             studioLeftTab_ == 0 ? Gc(96, 165, 250) : Gc(48, 60, 86), true, true);
         addBtnPx(ui::BTN_STU_LEFT_MUSIC, S(16) + halfTabW, gm.topH + S(10), halfTabW, S(30), L"Müzik / MP3",
-            studioLeftTab_ == 1 ? Gc(124, 58, 237) : Gc(24, 30, 44),
-            studioLeftTab_ == 1 ? Gc(139, 92, 246) : Gc(36, 45, 66),
-            studioLeftTab_ == 1 ? Gc(167, 139, 250) : Gc(48, 60, 86), true, true);
+            studioLeftTab_ == 1 ? Gc(124, 58, 237) : Gc(22, 28, 42),
+            studioLeftTab_ == 1 ? Gc(139, 92, 246) : Gc(34, 43, 64),
+            studioLeftTab_ == 1 ? Gc(196, 181, 253) : Gc(48, 60, 86), true, true);
 
         int bodyTop = gm.topH + S(48);
         int bodyH = std::max(S(80), gm.timelineTop - bodyTop - S(6));
@@ -1309,27 +1354,30 @@ void MainWindow::PaintStudio(void* gPtr, int cw, int ch) {
                 if (ci >= static_cast<int>(clips_.size())) break;
                 const auto& c = clips_[static_cast<size_t>(ci)];
                 int ry = bodyTop + vi * rowH;
-                FillRoundRect(g, (float)S(10), (float)ry, (float)(gm.leftW - S(20)), (float)(rowH - S(6)), (float)S(8), Gc(22, 28, 42));
-                StrokeRoundRect(g, (float)S(10), (float)ry, (float)(gm.leftW - S(20)), (float)(rowH - S(6)), (float)S(8), Gc(40, 52, 76));
+                FillRoundRectGrad(g, (float)S(10), (float)ry, (float)(gm.leftW - S(20)), (float)(rowH - S(6)), (float)S(9),
+                    Gc(24, 31, 48), Gc(18, 24, 38));
+                StrokeRoundRect(g, (float)S(10), (float)ry, (float)(gm.leftW - S(20)), (float)(rowH - S(6)), (float)S(9), Gc(48, 62, 92));
+                FillRoundRect(g, (float)S(10), (float)(ry + S(8)), (float)S(3), (float)(rowH - S(22)), 1.5f, Gc(56, 189, 248, 170));
 
                 // Draw cached miniature thumbnail on far left of clip card
-                RECT thRc{ S(15), ry + S(6), S(75), ry + rowH - S(12) };
+                RECT thRc{ S(16), ry + S(6), S(76), ry + rowH - S(12) };
                 auto it = thumbBmps_.find(c.filePath);
                 if (it != thumbBmps_.end() && it->second) {
                     Gdiplus::Bitmap bmp(it->second, nullptr);
                     g.DrawImage(&bmp, static_cast<INT>(thRc.left), static_cast<INT>(thRc.top),
                         static_cast<INT>(thRc.right - thRc.left), static_cast<INT>(thRc.bottom - thRc.top));
+                    StrokeRoundRect(g, (float)thRc.left, (float)thRc.top, (float)(thRc.right - thRc.left), (float)(thRc.bottom - thRc.top), 3.0f, Gc(70, 90, 128));
                 } else {
                     FillRoundRect(g, (float)thRc.left, (float)thRc.top, (float)(thRc.right - thRc.left), (float)(thRc.bottom - thRc.top), (float)S(4), Gc(12, 16, 26));
                 }
 
                 std::wstring stem = BaseNameNoExt(c.fileName);
                 g.DrawString(stem.c_str(), -1, &fSmall,
-                    Gdiplus::RectF((float)S(80), (float)(ry + S(5)), (float)(gm.leftW - S(148)), (float)S(16)), &sfLeft, &brText);
+                    Gdiplus::RectF((float)S(81), (float)(ry + S(5)), (float)(gm.leftW - S(149)), (float)S(16)), &sfLeft, &brText);
                 wchar_t sub[48] = {};
                 swprintf(sub, 48, L"%.1f sn • %.0f MB", c.durationSeconds, static_cast<double>(c.fileSizeBytes) / (1024.0 * 1024.0));
                 g.DrawString(sub, -1, &fTiny,
-                    Gdiplus::RectF((float)S(80), (float)(ry + S(22)), (float)(gm.leftW - S(148)), (float)S(16)), &sfLeft, &brMuted);
+                    Gdiplus::RectF((float)S(81), (float)(ry + S(22)), (float)(gm.leftW - S(149)), (float)S(16)), &sfLeft, &brCyan);
 
                 addBtnPx(ui::BTN_STU_ADD_CLIP_BASE + ci, gm.leftW - S(62), ry + S(10), S(46), S(26), L"+ Ekle",
                     Gc(37, 99, 235), Gc(59, 130, 246), Gc(96, 165, 250), !trimBusy_ && ci < 900, true);
@@ -1346,7 +1394,9 @@ void MainWindow::PaintStudio(void* gPtr, int cw, int ch) {
             for (int ri = 0; ri < maxRec && ri < static_cast<int>(studioRecentAudio_.size()); ++ri) {
                 int ry = recTop + ri * recH;
                 std::wstring name = BaseNameNoExt(studioRecentAudio_[static_cast<size_t>(ri)]);
-                FillRoundRect(g, (float)S(10), (float)ry, (float)(gm.leftW - S(20)), (float)(recH - S(6)), (float)S(8), Gc(26, 22, 46));
+                FillRoundRectGrad(g, (float)S(10), (float)ry, (float)(gm.leftW - S(20)), (float)(recH - S(6)), (float)S(8),
+                    Gc(32, 24, 58), Gc(22, 18, 42));
+                StrokeRoundRect(g, (float)S(10), (float)ry, (float)(gm.leftW - S(20)), (float)(recH - S(6)), (float)S(8), Gc(139, 92, 246, 130));
                 g.DrawString(name.c_str(), -1, &fSmall,
                     Gdiplus::RectF((float)S(18), (float)ry, (float)(gm.leftW - S(90)), (float)(recH - S(6))), &sfLeft, &brPurple);
                 addBtnPx(ui::BTN_STU_ADD_MUSIC_BASE + ri, gm.leftW - S(64), ry + S(4), S(48), S(26), L"+ Koy",
@@ -1355,32 +1405,43 @@ void MainWindow::PaintStudio(void* gPtr, int cw, int ch) {
         }
     }
 
-    // ================= 3. PREVIEW STAGE BACKGROUND =================
+    // ================= 3. PREVIEW STAGE (Framed Anlık Klip Theater Canvas) =================
     {
-        Gdiplus::SolidBrush brStage(Gc(6, 8, 14));
-        g.FillRectangle(&brStage, gm.leftW + 1, gm.topH + 1, cw - gm.leftW - 1, gm.toolY - gm.topH - 1);
+        Gdiplus::LinearGradientBrush brStageGrad(
+            Gdiplus::PointF((float)gm.leftW, (float)gm.topH),
+            Gdiplus::PointF((float)cw, (float)gm.toolY),
+            Gc(7, 10, 17), Gc(11, 15, 26));
+        g.FillRectangle(&brStageGrad, gm.leftW + 1, gm.topH + 1, cw - gm.leftW - 1, gm.toolY - gm.topH - 1);
+
+        int availW = std::max(S(240), static_cast<int>(gm.stageRc.right - gm.stageRc.left) - S(16));
+        int availH = std::max(S(140), static_cast<int>(gm.stageRc.bottom - gm.stageRc.top) - S(12));
+        int vw = studioVertical916_ ? (availH * 9) / 16 : availW;
+        int vh = studioVertical916_ ? availH : (vw * 9) / 16;
+        if (!studioVertical916_ && vh > availH) { vh = availH; vw = (vh * 16) / 9; }
+        if (studioVertical916_ && vw > availW) { vw = availW; vh = (vw * 16) / 9; }
+        int vx = gm.stageRc.left + (static_cast<int>(gm.stageRc.right - gm.stageRc.left) - vw) / 2;
+        int vy = gm.stageRc.top + (static_cast<int>(gm.stageRc.bottom - gm.stageRc.top) - vh) / 2;
+
+        // Ambient frame glow around video viewport
+        StrokeRoundRect(g, (float)(vx - 2), (float)(vy - 2), (float)(vw + 4), (float)(vh + 4), (float)S(10),
+            studioVertical916_ ? Gc(139, 92, 246, 165) : Gc(59, 130, 246, 145), 1.6f);
 
         if (trimBusy_) {
-            int pw = S(360), ph = S(78);
+            int pw = S(380), ph = S(84);
             int px = gm.stageRc.left + (static_cast<int>(gm.stageRc.right - gm.stageRc.left) - pw) / 2;
             int py = gm.stageRc.top + (static_cast<int>(gm.stageRc.bottom - gm.stageRc.top) - ph) / 2;
-            FillRoundRect(g, (float)px, (float)py, (float)pw, (float)ph, (float)S(12), Gc(16, 22, 36));
+            FillRoundRectGrad(g, (float)px, (float)py, (float)pw, (float)ph, (float)S(12), Gc(22, 30, 50), Gc(14, 19, 32));
             StrokeRoundRect(g, (float)px, (float)py, (float)pw, (float)ph, (float)S(12), Gc(52, 211, 153));
-            g.DrawString(L"Montaj render ediliyor, lütfen bekleyin...", -1, &fBold,
+            g.DrawString(L"Anlık Klip Stüdyo render alıyor, lütfen bekleyin...", -1, &fBold,
                 Gdiplus::RectF((float)px, (float)py, (float)pw, (float)ph), &sfCenter, &brCyan);
         } else if (studioClips_.empty()) {
-            int availW = std::max(S(240), static_cast<int>(gm.stageRc.right - gm.stageRc.left) - S(24));
-            int availH = std::max(S(140), static_cast<int>(gm.stageRc.bottom - gm.stageRc.top) - S(16));
-            int vw = studioVertical916_ ? (availH * 9) / 16 : availW;
-            int vh = studioVertical916_ ? availH : (vw * 9) / 16;
-            if (!studioVertical916_ && vh > availH) { vh = availH; vw = (vh * 16) / 9; }
-            if (studioVertical916_ && vw > availW) { vw = availW; vh = (vw * 16) / 9; }
-            int vx = gm.stageRc.left + (static_cast<int>(gm.stageRc.right - gm.stageRc.left) - vw) / 2;
-            int vy = gm.stageRc.top + (static_cast<int>(gm.stageRc.bottom - gm.stageRc.top) - vh) / 2;
-            FillRoundRect(g, (float)vx, (float)vy, (float)vw, (float)vh, (float)S(10), Gc(14, 18, 28));
-            StrokeRoundRect(g, (float)vx, (float)vy, (float)vw, (float)vh, (float)S(10), Gc(44, 56, 82));
+            FillRoundRectGrad(g, (float)vx, (float)vy, (float)vw, (float)vh, (float)S(8), Gc(15, 20, 32), Gc(10, 14, 24));
+            FillRoundRectGrad(g, (float)(vx + vw / 2 - S(22)), (float)(vy + vh / 2 - S(52)), (float)S(44), (float)S(44), (float)S(12),
+                Gc(59, 130, 246, 120), Gc(124, 58, 237, 120));
+            g.DrawString(L"▶", -1, &fTitle,
+                Gdiplus::RectF((float)(vx + vw / 2 - S(22)), (float)(vy + vh / 2 - S(52)), (float)S(44), (float)S(44)), &sfCenter, &brText);
             g.DrawString(L"Sol taraftan klip seçip '+ Ekle'ye basın\nÖnizleme burada canlı olarak oynatılacak.", -1, &fBold,
-                Gdiplus::RectF((float)vx, (float)vy, (float)vw, (float)vh), &sfCenter, &brMuted);
+                Gdiplus::RectF((float)vx, (float)(vy + S(14)), (float)vw, (float)(vh - S(14))), &sfCenter, &brMuted);
         }
     }
 
@@ -1555,7 +1616,7 @@ void MainWindow::PaintStudio(void* gPtr, int cw, int ch) {
             }
         }
 
-        // Video (V1) and Audio (A1) clip blocks
+        // Video (V1) and Audio (A1) clip blocks with Anlık Klip filmstrip & signature cyan highlight
         double curOut = 0.0;
         for (size_t i = 0; i < studioClips_.size(); ++i) {
             const auto& c = studioClips_[i];
@@ -1564,59 +1625,79 @@ void MainWindow::PaintStudio(void* gPtr, int cw, int ch) {
             float bw = std::max<float>((float)S(16), static_cast<float>(outDur * studioPxPerSec_));
             bool sel = (studioSelClip_ == static_cast<int>(i));
 
-            // V1 block
-            FillRoundRectGrad(g, bx + 1.0f, (float)gm.v1Top, bw - 2.0f, (float)gm.v1H, (float)S(6),
-                sel ? Gc(37, 68, 128) : Gc(24, 34, 58),
-                sel ? Gc(25, 44, 88) : Gc(18, 25, 42));
-            if (bw >= S(46)) {
+            // V1 block with subtle filmstrip thumbnail tiling + Anlık Klip dark-blue gradient overlay
+            FillRoundRectGrad(g, bx + 1.0f, (float)gm.v1Top, bw - 2.0f, (float)gm.v1H, (float)S(7),
+                sel ? Gc(34, 62, 120) : Gc(22, 31, 52),
+                sel ? Gc(20, 38, 78) : Gc(15, 21, 36));
+            if (bw >= S(36)) {
                 auto it = thumbBmps_.find(c.path);
                 if (it != thumbBmps_.end() && it->second) {
                     Gdiplus::Bitmap bmp(it->second, nullptr);
-                    g.DrawImage(&bmp, bx + 3.0f, static_cast<Gdiplus::REAL>(gm.v1Top + 3),
-                        static_cast<Gdiplus::REAL>(S(44)), static_cast<Gdiplus::REAL>(gm.v1H - 6));
+                    Gdiplus::Region prevClip;
+                    g.GetClip(&prevClip);
+                    g.SetClip(Gdiplus::RectF(bx + 2.0f, (float)(gm.v1Top + 2), std::max(1.0f, bw - 4.0f), (float)(gm.v1H - 4)), Gdiplus::CombineModeIntersect);
+                    int tileW = std::max(S(56), (gm.v1H * 16) / 9);
+                    for (float tx = bx + 2.0f; tx < bx + bw - 2.0f; tx += static_cast<float>(tileW + 2)) {
+                        g.DrawImage(&bmp, tx, static_cast<Gdiplus::REAL>(gm.v1Top + 2),
+                            static_cast<Gdiplus::REAL>(tileW), static_cast<Gdiplus::REAL>(gm.v1H - 4));
+                    }
+                    g.SetClip(&prevClip);
+                    FillRoundRectGrad(g, bx + 2.0f, (float)(gm.v1Top + 2), bw - 4.0f, (float)(gm.v1H - 4), (float)S(6),
+                        Gc(12, 18, 34, 200), Gc(15, 22, 40, 145));
                 }
             }
-            StrokeRoundRect(g, bx + 1.0f, (float)gm.v1Top, bw - 2.0f, (float)gm.v1H, (float)S(6),
-                sel ? Gc(56, 189, 248) : Gc(54, 72, 112), sel ? 1.8f : 1.0f);
+            StrokeRoundRect(g, bx + 1.0f, (float)gm.v1Top, bw - 2.0f, (float)gm.v1H, (float)S(7),
+                sel ? Gc(56, 189, 248) : Gc(59, 130, 246, 125), sel ? 1.8f : 1.0f);
+            if (sel) {
+                FillRoundRect(g, bx + 2.0f, (float)(gm.v1Top + S(7)), (float)S(3), (float)(gm.v1H - S(14)), 1.5f, Gc(56, 189, 248));
+            }
 
-            float textLeft = bx + (bw >= S(62) ? (float)S(52) : 6.0f);
-            g.DrawString(c.name.c_str(), -1, &fTiny,
-                Gdiplus::RectF(textLeft, (float)(gm.v1Top + S(5)), std::max(8.0f, bw - (textLeft - bx) - S(10)), (float)S(16)), &sfLeft, &brText);
+            float textLeft = bx + S(9);
+            wchar_t titleLine[160] = {};
+            swprintf(titleLine, 160, L"#%zu  %ls", i + 1, c.name.c_str());
+            g.DrawString(titleLine, -1, &fTiny,
+                Gdiplus::RectF(textLeft, (float)(gm.v1Top + S(4)), std::max(8.0f, bw - S(20)), (float)S(16)), &sfLeft, &brText);
             wchar_t meta[48] = {};
             swprintf(meta, 48, L"%.1fs • %.1fx", outDur, c.speed);
-            g.DrawString(meta, -1, &fTiny,
-                Gdiplus::RectF(textLeft, (float)(gm.v1Top + S(23)), std::max(8.0f, bw - (textLeft - bx) - S(10)), (float)S(16)), &sfLeft, &brCyan);
+            if (bw >= S(54)) {
+                FillRoundRect(g, textLeft, (float)(gm.v1Top + gm.v1H - S(21)), std::min<float>(bw - S(20), (float)S(68)), (float)S(16), (float)S(4), Gc(12, 18, 32, 205));
+                g.DrawString(meta, -1, &fTiny,
+                    Gdiplus::RectF(textLeft + 3.0f, (float)(gm.v1Top + gm.v1H - S(21)), std::max(8.0f, bw - S(24)), (float)S(16)), &sfLeft, &brCyan);
+            }
 
             // Draggable L/R trim grip bars on V1 block
-            if (sel && bw >= S(24)) {
+            if (sel && bw >= S(26)) {
                 FillRoundRect(g, bx + 2.0f, (float)(gm.v1Top + S(6)), (float)S(6), (float)(gm.v1H - S(12)), 2.5f, Gc(56, 189, 248));
                 FillRoundRect(g, bx + bw - S(8), (float)(gm.v1Top + S(6)), (float)S(6), (float)(gm.v1H - S(12)), 2.5f, Gc(56, 189, 248));
             }
             if (studioFade_ && i > 0) {
-                FillRoundRect(g, bx - S(6), (float)(gm.v1Top + gm.v1H / 2 - S(7)), (float)S(12), (float)S(14), 3.0f, Gc(59, 130, 246));
+                FillRoundRectGrad(g, bx - S(6), (float)(gm.v1Top + gm.v1H / 2 - S(8)), (float)S(12), (float)S(16), 4.0f,
+                    Gc(59, 130, 246), Gc(124, 58, 237));
             }
 
-            // A1 Clip Audio Waveform block directly underneath V1
+            // A1 Clip Audio Waveform block directly underneath V1 (symmetrical Anlık Klip neon wave)
             const bool aMuted = (c.gameVolPct == 0 && (!c.hasMultiTrack || c.micVolPct == 0));
-            FillRoundRect(g, bx + 1.0f, (float)gm.a1Top, bw - 2.0f, (float)gm.a1H, (float)S(6),
-                aMuted ? Gc(38, 18, 24) : (sel ? Gc(14, 52, 66) : Gc(14, 38, 50)));
+            FillRoundRectGrad(g, bx + 1.0f, (float)gm.a1Top, bw - 2.0f, (float)gm.a1H, (float)S(6),
+                aMuted ? Gc(44, 18, 26) : (sel ? Gc(14, 56, 72) : Gc(12, 36, 48)),
+                aMuted ? Gc(28, 12, 18) : (sel ? Gc(10, 38, 52) : Gc(10, 26, 36)));
             StrokeRoundRect(g, bx + 1.0f, (float)gm.a1Top, bw - 2.0f, (float)gm.a1H, (float)S(6),
-                aMuted ? Gc(185, 28, 28) : (sel ? Gc(45, 212, 191) : Gc(28, 86, 104)), sel ? 1.4f : 1.0f);
+                aMuted ? Gc(220, 38, 38) : (sel ? Gc(45, 212, 191) : Gc(28, 96, 114)), sel ? 1.5f : 1.0f);
 
             if (!aMuted && !c.wavePeaks.empty() && c.sourceDurSec > 0.1 && bw > S(14)) {
-                int bars = std::max(2, static_cast<int>((bw - 6.0f) / 3.0f));
+                int bars = std::max(2, static_cast<int>((bw - 8.0f) / 3.0f));
                 double u0 = std::max(0.0, std::min(1.0, c.trimStartSec / c.sourceDurSec));
                 double u1 = std::max(u0, std::min(1.0, c.trimEndSec / c.sourceDurSec));
                 float gainScale = std::max(0.15f, std::min(1.8f,
                     static_cast<float>(c.hasMultiTrack ? std::max(c.gameVolPct, c.micVolPct) : c.gameVolPct) / 100.0f));
-                Gdiplus::SolidBrush brWave(Gc(45, 212, 191, 200));
+                Gdiplus::SolidBrush brWave(Gc(45, 212, 191, 205));
+                float midY = static_cast<float>(gm.a1Top + gm.a1H / 2 + S(4));
+                float maxHalf = static_cast<float>(gm.a1H - S(16)) * 0.5f;
                 for (int b = 0; b < bars; ++b) {
                     double frac = u0 + (u1 - u0) * (static_cast<double>(b) / bars);
                     size_t pidx = std::min(c.wavePeaks.size() - 1, static_cast<size_t>(frac * c.wavePeaks.size()));
                     float amp = std::min(1.0f, c.wavePeaks[pidx] * gainScale);
-                    float bh = std::max(2.0f, amp * (gm.a1H - S(14)));
-                    float barY = gm.a1Top + gm.a1H - 3.0f - bh;
-                    g.FillRectangle(&brWave, bx + 4.0f + b * 3.0f, barY, 2.0f, bh);
+                    float hh = std::max(1.5f, amp * maxHalf);
+                    g.FillRectangle(&brWave, bx + 4.0f + b * 3.0f, midY - hh, 2.0f, hh * 2.0f);
                 }
             }
             wchar_t albl[32] = {};
@@ -1631,7 +1712,7 @@ void MainWindow::PaintStudio(void* gPtr, int cw, int ch) {
 
         // M1 Music / MP3 blocks placed anywhere along timeline
         if (studioMusic_.empty()) {
-            g.DrawString(L"Müzik yok — Soldaki '+ MP3 Ekle'ye basın, ekledikten sonra müzik şeridini istediğiniz yere sürükleyin",
+            g.DrawString(L"Müzik yok — Soldaki '+ MP3 Ekle'ye basın, ekledikten sonra müzik şeridini istediğiniz saniyeye sürükleyin",
                 -1, &fTiny,
                 Gdiplus::RectF((float)(gm.tlViewRc.left + S(12)), (float)gm.m1Top,
                     (float)std::max(S(200), static_cast<int>(gm.tlViewRc.right - gm.tlViewRc.left) - S(24)), (float)gm.m1H),
@@ -1645,7 +1726,7 @@ void MainWindow::PaintStudio(void* gPtr, int cw, int ch) {
 
                 FillRoundRectGrad(g, bx + 1.0f, (float)gm.m1Top, bw - 2.0f, (float)gm.m1H, (float)S(6),
                     sel ? Gc(109, 40, 217) : Gc(68, 28, 134),
-                    sel ? Gc(76, 29, 149) : Gc(46, 20, 92));
+                    sel ? Gc(76, 29, 149) : Gc(42, 18, 86));
                 StrokeRoundRect(g, bx + 1.0f, (float)gm.m1Top, bw - 2.0f, (float)gm.m1H, (float)S(6),
                     sel ? Gc(216, 180, 254) : Gc(139, 92, 246), sel ? 1.8f : 1.0f);
 
@@ -1654,14 +1735,23 @@ void MainWindow::PaintStudio(void* gPtr, int cw, int ch) {
                     double u0 = std::max(0.0, std::min(1.0, m.trimStartSec / m.sourceDurSec));
                     double u1 = std::max(u0, std::min(1.0, (m.trimStartSec + m.durationSec) / m.sourceDurSec));
                     float gScale = std::max(0.15f, std::min(1.8f, static_cast<float>(m.volPct) / 100.0f));
-                    Gdiplus::SolidBrush brMw(Gc(216, 180, 254, 190));
+                    Gdiplus::SolidBrush brMw(Gc(224, 195, 255, 200));
+                    float midY = static_cast<float>(gm.m1Top + gm.m1H / 2 + S(4));
+                    float maxHalf = static_cast<float>(gm.m1H - S(16)) * 0.5f;
                     for (int b = 0; b < bars; ++b) {
                         double frac = u0 + (u1 - u0) * (static_cast<double>(b) / bars);
                         size_t pidx = std::min(m.wavePeaks.size() - 1, static_cast<size_t>(frac * m.wavePeaks.size()));
                         float amp = std::min(1.0f, m.wavePeaks[pidx] * gScale);
-                        float bh = std::max(2.0f, amp * (gm.m1H - S(16)));
-                        g.FillRectangle(&brMw, bx + 4.0f + b * 3.0f, gm.m1Top + gm.m1H - 3.0f - bh, 2.0f, bh);
+                        float hh = std::max(1.5f, amp * maxHalf);
+                        g.FillRectangle(&brMw, bx + 4.0f + b * 3.0f, midY - hh, 2.0f, hh * 2.0f);
                     }
+                }
+                // Draw subtle fade-in / fade-out slopes on corners
+                if (bw >= S(36)) {
+                    Gdiplus::Pen pFade(Gc(243, 232, 255, 190), 1.4f);
+                    float fW = std::min<float>(bw * 0.18f, (float)S(18));
+                    if (m.fadeIn)  g.DrawLine(&pFade, bx + 3.0f, (float)(gm.m1Top + gm.m1H - 3), bx + 3.0f + fW, (float)(gm.m1Top + S(14)));
+                    if (m.fadeOut) g.DrawLine(&pFade, bx + bw - 3.0f - fW, (float)(gm.m1Top + S(14)), bx + bw - 3.0f, (float)(gm.m1Top + gm.m1H - 3));
                 }
                 if (sel && bw >= S(24)) {
                     FillRoundRect(g, bx + 2.0f, (float)(gm.m1Top + S(6)), (float)S(6), (float)(gm.m1H - S(12)), 2.5f, Gc(233, 213, 255));
@@ -1674,14 +1764,20 @@ void MainWindow::PaintStudio(void* gPtr, int cw, int ch) {
             }
         }
 
-        // Playhead Needle + Scrubber Head
+        // Playhead Needle + Anlık Klip Neon Cyan Scrubber Head
         float pxHead = secToX(studioPlayheadSec_);
-        if (pxHead >= gm.tlViewRc.left - 8 && pxHead <= gm.tlViewRc.right + 8) {
-            Gdiplus::Pen pPlay(Gc(248, 113, 113), 2.0f);
+        if (pxHead >= gm.tlViewRc.left - 2 && pxHead <= gm.tlViewRc.right + 8) {
+            Gdiplus::Pen pPlayHalo(Gc(56, 189, 248, 85), 5.0f);
+            g.DrawLine(&pPlayHalo, pxHead, (float)(gm.timelineTop + S(12)), pxHead, (float)ch);
+            Gdiplus::Pen pPlay(Gc(56, 189, 248), 2.0f);
             g.DrawLine(&pPlay, pxHead, (float)(gm.timelineTop + S(12)), pxHead, (float)ch);
-            FillRoundRect(g, pxHead - S(6), (float)(gm.timelineTop + S(2)), (float)S(12), (float)S(14), 4.0f, Gc(248, 113, 113));
         }
         g.ResetClip();
+        if (pxHead >= gm.tlViewRc.left - 2 && pxHead <= gm.tlViewRc.right + 8) {
+            FillRoundRectGrad(g, pxHead - S(6), (float)(gm.timelineTop + S(2)), (float)S(12), (float)S(14), 4.0f,
+                Gc(125, 211, 252), Gc(37, 99, 235));
+            StrokeRoundRect(g, pxHead - S(6), (float)(gm.timelineTop + S(2)), (float)S(12), (float)S(14), 4.0f, Gc(224, 242, 254));
+        }
     }
 }
 
