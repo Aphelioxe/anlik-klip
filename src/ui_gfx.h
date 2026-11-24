@@ -139,6 +139,7 @@ enum CustomBtnId {
     BTN_STU_ZOOM_IN,
     BTN_STU_ZOOM_OUT,
     BTN_STU_ZOOM_FIT,
+    BTN_STU_TOGGLE_TRACK,
 
     BTN_MNT_ADD_BASE      = 2000,
     BTN_MNT_UP_BASE       = 3000,
@@ -146,7 +147,8 @@ enum CustomBtnId {
     BTN_MNT_DEL_BASE      = 5000,
     BTN_STU_ADD_CLIP_BASE = 6000,
     BTN_STU_ADD_MUSIC_BASE = 7000,
-    BTN_STU_ADD_FX_BASE   = 8000
+    BTN_STU_ADD_FX_BASE   = 8000,
+    BTN_STU_ADD_OVR_BASE  = 9000
 };
 
 inline Gdiplus::Color Gc(uint8_t r, uint8_t g, uint8_t b, uint8_t a = 255) {

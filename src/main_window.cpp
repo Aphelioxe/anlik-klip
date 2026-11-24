@@ -3242,10 +3242,17 @@ LRESULT MainWindow::OnMessage(UINT msg, WPARAM wParam, LPARAM lParam) {
             return 0;
         }
 
+        case WM_MOVE:
+            if (studioOpen_) SyncStudioFxOverlay();
+            return 0;
+
         case WM_SIZE:
             if (wParam != SIZE_MINIMIZED) {
                 UpdateLayoutForSize(LOWORD(lParam), HIWORD(lParam));
+                if (studioOpen_) SyncStudioFxOverlay();
                 InvalidateRect(hwnd_, nullptr, FALSE);
+            } else if (studioOpen_) {
+                SyncStudioFxOverlay();
             }
             return 0;
 
@@ -3694,13 +3701,13 @@ LRESULT MainWindow::OnMessage(UINT msg, WPARAM wParam, LPARAM lParam) {
                 bool wantSizeNESW = false;
                 if (studioOpen_ && activeTab_ == 1) {
                     if (studioDragMode_ == 2 || studioDragMode_ == 3 || studioDragMode_ == 5 || studioDragMode_ == 6 ||
-                        studioDragMode_ == 13 || studioDragMode_ == 14) {
+                        studioDragMode_ == 13 || studioDragMode_ == 14 || studioDragMode_ == 17 || studioDragMode_ == 18) {
                         wantSizeWE = true;
                     } else if ((studioDragMode_ == 10 && studioClipDragged_) || studioDragMode_ == 4 ||
-                               studioDragMode_ == 11 || studioDragMode_ == 15) {
+                               studioDragMode_ == 11 || studioDragMode_ == 15 || studioDragMode_ == 19) {
                         wantSizeAll = true;
-                    } else if (studioDragMode_ == 12) {
-                        int sh = static_cast<int>(std::lround(studioDragOrigD_));
+                    } else if (studioDragMode_ == 12 || studioDragMode_ == 16) {
+                        int sh = static_cast<int>(std::lround(studioDragOrigD_)) % 100;
                         if (sh == 1 || sh == 4) wantSizeNWSE = true;
                         else if (sh == 2 || sh == 3) wantSizeNESW = true;
                         else if (sh == 5) wantSizeAll = true;
@@ -3711,12 +3718,13 @@ LRESULT MainWindow::OnMessage(UINT msg, WPARAM wParam, LPARAM lParam) {
                         RECT cli{};
                         GetClientRect(hwnd_, &cli);
                         int stageH = StudioHitTestStageHandle(pt.x, pt.y, cli.right, cli.bottom);
+                        int cornerId = stageH % 100;
                         int fIdx = -1, fSide = 0;
-                        if (stageH == 1 || stageH == 4) {
+                        if (cornerId == 1 || cornerId == 4) {
                             wantSizeNWSE = true;
-                        } else if (stageH == 2 || stageH == 3) {
+                        } else if (cornerId == 2 || cornerId == 3) {
                             wantSizeNESW = true;
-                        } else if (stageH == 5) {
+                        } else if (cornerId == 5) {
                             wantSizeAll = true;
                         } else if (StudioHitTestTransition(pt.x, pt.y, cli.right, cli.bottom) >= 0) {
                             wantSizeAll = true;

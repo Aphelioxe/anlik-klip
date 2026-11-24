@@ -30,7 +30,7 @@ struct StudioWaveDoneMsg {
 
 struct StudioMpEventMsg {
     uint64_t gen = 0;
-    bool isAudio = false;
+    int role = 0; // 0=V1 video, 1=music audio, 2=V1 mic audio, 3=V2 overlay video
     MFP_EVENT_TYPE type = MFP_EVENT_TYPE_PLAY;
 };
 
@@ -53,31 +53,69 @@ std::wstring BaseNameNoExt(const std::wstring& path) {
     return fn;
 }
 
-// Select highest-energy audio track inside multi-track MP4 so preview matches rendered Mix
-void SelectBestPreviewAudioTrack(IMFPMediaItem* item, const std::wstring& path) {
+// Select specific audio track inside multi-track MP4 (or disable video on Mic-only player)
+void SelectPreviewStreams(IMFPMediaItem* item, int targetAudioPos, bool keepVideo) {
     if (!item) return;
     DWORD nStreams = 0;
-    if (FAILED(item->GetNumberOfStreams(&nStreams)) || nStreams <= 1) return;
+    if (FAILED(item->GetNumberOfStreams(&nStreams)) || nStreams == 0) return;
     std::vector<DWORD> audioStreams;
     for (DWORD si = 0; si < nStreams; ++si) {
         PROPVARIANT vt;
         PropVariantInit(&vt);
-        if (SUCCEEDED(item->GetStreamAttribute(si, MF_MT_MAJOR_TYPE, &vt)) &&
-            vt.vt == VT_CLSID && vt.puuid && *vt.puuid == MFMediaType_Audio) {
-            audioStreams.push_back(si);
+        if (SUCCEEDED(item->GetStreamAttribute(si, MF_MT_MAJOR_TYPE, &vt)) && vt.vt == VT_CLSID && vt.puuid) {
+            if (*vt.puuid == MFMediaType_Audio) {
+                audioStreams.push_back(si);
+            } else if (*vt.puuid == MFMediaType_Video && !keepVideo) {
+                item->SetStreamSelection(si, FALSE);
+            }
         }
         PropVariantClear(&vt);
     }
-    if (audioStreams.size() <= 1) return;
-
-    DWORD chosenAudio = audioStreams.front();
-    ClipAudioTrackLayout layout;
-    if (DetectClipAudioLayout(path, layout) && layout.mixStreamPos >= 0 &&
-        static_cast<size_t>(layout.mixStreamPos) < audioStreams.size()) {
-        chosenAudio = audioStreams[static_cast<size_t>(layout.mixStreamPos)];
+    if (audioStreams.empty()) return;
+    if (!keepVideo && targetAudioPos < 0) {
+        for (DWORD asi : audioStreams) item->SetStreamSelection(asi, FALSE);
+        return;
     }
+    if (audioStreams.size() == 1) {
+        item->SetStreamSelection(audioStreams[0], TRUE);
+        return;
+    }
+    size_t chosenIdx = (targetAudioPos >= 0 && static_cast<size_t>(targetAudioPos) < audioStreams.size())
+        ? static_cast<size_t>(targetAudioPos) : 0;
+    DWORD chosenAudio = audioStreams[chosenIdx];
     for (DWORD asi : audioStreams) {
         item->SetStreamSelection(asi, asi == chosenAudio ? TRUE : FALSE);
+    }
+}
+
+void ApplyPlayerRateSafe(IMFPMediaPlayer* player, float rate, float& appliedRate) {
+    if (!player || std::abs(rate - appliedRate) <= 0.001f) return;
+    HRESULT hr = player->SetRate(rate);
+    if (FAILED(hr)) {
+        float minR = 0.5f, maxR = 1.0f;
+        if (SUCCEEDED(player->GetSupportedRates(FALSE, &minR, &maxR)) && maxR >= 0.5f) {
+            player->SetRate(std::max(minR, std::min(maxR, rate)));
+        }
+    }
+    appliedRate = rate;
+}
+
+template <typename ClipT>
+void ComputeClipPreviewAudio(const ClipT& clip, float& outGameVol, bool& outGameMute,
+                             float& outMicVol, bool& outMicMute, bool& outSplitMicPlayer) {
+    outSplitMicPlayer = clip.hasMultiTrack && clip.gameStreamPos >= 0 && clip.micStreamPos >= 0;
+    if (outSplitMicPlayer) {
+        int maxP = std::max(100, std::max(clip.gameVolPct, clip.micVolPct));
+        float norm = 100.0f / static_cast<float>(maxP);
+        outGameMute = (clip.gameVolPct <= 0);
+        outMicMute = (clip.micVolPct <= 0);
+        outGameVol = std::max(0.0f, std::min(1.0f, (static_cast<float>(clip.gameVolPct) * norm) / 100.0f));
+        outMicVol = std::max(0.0f, std::min(1.0f, (static_cast<float>(clip.micVolPct) * norm) / 100.0f));
+    } else {
+        outGameMute = (clip.gameVolPct <= 0);
+        outGameVol = std::max(0.0f, std::min(1.0f, static_cast<float>(clip.gameVolPct) / 100.0f));
+        outMicMute = true;
+        outMicVol = 0.0f;
     }
 }
 
@@ -129,6 +167,41 @@ LRESULT CALLBACK StudioVideoHostProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM 
     return DefWindowProcW(hwnd, msg, wParam, lParam);
 }
 
+LRESULT CALLBACK StudioOverlayHostProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+    auto* mw = reinterpret_cast<MainWindow*>(GetWindowLongPtrW(hwnd, GWLP_USERDATA));
+    if (msg == WM_NCCREATE) {
+        auto* cs = reinterpret_cast<CREATESTRUCTW*>(lParam);
+        SetWindowLongPtrW(hwnd, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(cs->lpCreateParams));
+        return TRUE;
+    }
+    switch (msg) {
+        case WM_ERASEBKGND:
+            return 1;
+        case WM_NCHITTEST:
+            return HTTRANSPARENT; // Stage click/drag/corner resize flows seamlessly to MainWindow
+        case WM_SIZE:
+            if (mw && mw->IsStudioOverlayReady()) mw->StudioOverlayHostUpdate();
+            return 0;
+        case WM_PAINT: {
+            if (mw && mw->IsStudioOverlayReady()) {
+                ValidateRect(hwnd, nullptr);
+                mw->StudioOverlayHostUpdate();
+                return 0;
+            }
+            PAINTSTRUCT ps{};
+            HDC hdc = BeginPaint(hwnd, &ps);
+            RECT rc{};
+            GetClientRect(hwnd, &rc);
+            HBRUSH br = CreateSolidBrush(RGB(10, 14, 24));
+            FillRect(hdc, &rc, br);
+            DeleteObject(br);
+            EndPaint(hwnd, &ps);
+            return 0;
+        }
+    }
+    return DefWindowProcW(hwnd, msg, wParam, lParam);
+}
+
 struct StudioGeometry {
     int leftW = 0;
     int topH = 0;
@@ -139,6 +212,7 @@ struct StudioGeometry {
     int toolRow2H = 0;
     int toolH = 0;
     int rulerH = 0;
+    int v2Top = 0, v2H = 0;
     int v1Top = 0, v1H = 0;
     int a1Top = 0, a1H = 0;
     int m1Top = 0, m1H = 0;
@@ -156,21 +230,23 @@ StudioGeometry CalcStudioGeom(int cw, int ch, int dpi) {
     StudioGeometry gm;
     gm.leftW = S(246);
     gm.topH = S(48);
-    int tlH = std::max(S(204), std::min(S(248), (ch * 34) / 100));
-    gm.timelineTop = std::max(S(280), ch - tlH);
+    int tlH = std::max(S(218), std::min(S(276), (ch * 36) / 100));
+    gm.timelineTop = std::max(S(276), ch - tlH);
     gm.toolRow1H = S(36);
     gm.toolRow2H = S(34);
     gm.toolH = gm.toolRow1H + gm.toolRow2H;
     gm.toolY = gm.timelineTop - gm.toolH;
     gm.toolRow2Y = gm.toolY + gm.toolRow1H;
-    gm.rulerH = S(24);
+    gm.rulerH = S(22);
     gm.hdrW = S(118);
 
-    int tracksAvail = std::max(S(154), ch - gm.timelineTop - gm.rulerH - S(12));
-    gm.v1H = std::max(S(50), (tracksAvail * 38) / 100);
-    gm.a1H = std::max(S(42), (tracksAvail * 30) / 100);
-    gm.m1H = std::max(S(46), tracksAvail - gm.v1H - gm.a1H - S(8));
-    gm.v1Top = gm.timelineTop + gm.rulerH + S(4);
+    int tracksAvail = std::max(S(168), ch - gm.timelineTop - gm.rulerH - S(16));
+    gm.v2H = std::max(S(36), (tracksAvail * 22) / 100);
+    gm.v1H = std::max(S(44), (tracksAvail * 31) / 100);
+    gm.a1H = std::max(S(36), (tracksAvail * 23) / 100);
+    gm.m1H = std::max(S(38), tracksAvail - gm.v2H - gm.v1H - gm.a1H - S(12));
+    gm.v2Top = gm.timelineTop + gm.rulerH + S(3);
+    gm.v1Top = gm.v2Top + gm.v2H + S(4);
     gm.a1Top = gm.v1Top + gm.v1H + S(4);
     gm.m1Top = gm.a1Top + gm.a1H + S(4);
 
@@ -266,8 +342,8 @@ const StudioFxPreset& GetFxPreset(MontageTransitionType t) {
 
 class MainWindow::StudioMpCallback : public IMFPMediaPlayerCallback {
 public:
-    StudioMpCallback(HWND notifyHwnd, uint64_t gen, bool isAudio)
-        : notifyHwnd_(notifyHwnd), gen_(gen), isAudio_(isAudio) {}
+    StudioMpCallback(HWND notifyHwnd, uint64_t gen, int role)
+        : notifyHwnd_(notifyHwnd), gen_(gen), role_(role) {}
 
     void Detach() { alive_.store(false); notifyHwnd_ = nullptr; }
 
@@ -291,7 +367,7 @@ public:
 
     void STDMETHODCALLTYPE OnMediaPlayerEvent(MFP_EVENT_HEADER* pEventHeader) override {
         if (!pEventHeader || !alive_.load() || !notifyHwnd_) return;
-        auto* m = new StudioMpEventMsg{ gen_, isAudio_, pEventHeader->eEventType };
+        auto* m = new StudioMpEventMsg{ gen_, role_, pEventHeader->eEventType };
         if (!PostMessageW(notifyHwnd_, ui::WM_MW_STUDIO_VIDEO_EV, 0, reinterpret_cast<LPARAM>(m))) {
             delete m;
         }
@@ -302,7 +378,7 @@ private:
     volatile LONG ref_ = 1;
     HWND notifyHwnd_;
     uint64_t gen_;
-    bool isAudio_;
+    int role_;
     std::atomic<bool> alive_{true};
 };
 
@@ -311,7 +387,31 @@ double MainWindow::StudioTotalDuration() const {
     for (const auto& c : studioClips_) {
         maxEnd = std::max(maxEnd, std::max(0.0, c.timelineStartSec) + ClipOutDur(c));
     }
+    for (const auto& c : studioOverlayClips_) {
+        maxEnd = std::max(maxEnd, std::max(0.0, c.timelineStartSec) + ClipOutDur(c));
+    }
     return maxEnd;
+}
+
+bool MainWindow::MapTimelineToOverlayClip(double tlSec, int& outIdx, double& outLocalSec, double& outClipStartSec) const {
+    outIdx = -1;
+    outLocalSec = 0.0;
+    outClipStartSec = 0.0;
+    if (studioOverlayClips_.empty()) return false;
+    for (int i = static_cast<int>(studioOverlayClips_.size()) - 1; i >= 0; --i) {
+        const auto& c = studioOverlayClips_[static_cast<size_t>(i)];
+        double cStart = std::max(0.0, c.timelineStartSec);
+        double outDur = ClipOutDur(c);
+        double cEnd = cStart + outDur;
+        if (tlSec >= cStart - 1e-6 && tlSec <= cEnd + 1e-6) {
+            double relOut = std::max(0.0, std::min(outDur, tlSec - cStart));
+            outIdx = i;
+            outClipStartSec = cStart;
+            outLocalSec = std::max(c.trimStartSec, std::min(c.trimEndSec, c.trimStartSec + relOut * c.speed));
+            return true;
+        }
+    }
+    return false;
 }
 
 bool MainWindow::MapTimelineToClip(double tlSec, int& outIdx, double& outLocalSec, double& outClipStartSec) const {
@@ -397,6 +497,35 @@ bool MainWindow::StudioHitTestTrimEdge(int mx, int my, int cw, int ch,
         }
     }
 
+    if (my >= gm.v2Top - S(2) && my <= gm.v2Top + gm.v2H && !studioOverlayClips_.empty()) {
+        for (int i = static_cast<int>(studioOverlayClips_.size()) - 1; i >= 0; --i) {
+            const auto& c = studioOverlayClips_[static_cast<size_t>(i)];
+            double cStart = std::max(0.0, c.timelineStartSec);
+            double outDur = ClipOutDur(c);
+            int x0 = secToX(cStart);
+            int x1 = secToX(cStart + outDur);
+            int visX1 = std::max(x0 + S(16), x1);
+            int w = visX1 - x0;
+            int handleW = std::min<int>(S(11), std::max<int>(S(6), w / 3));
+            if (x0 >= gm.tlViewRc.left - S(10) && x0 <= gm.tlViewRc.right + S(10) &&
+                mx >= x0 - S(8) && mx <= std::min(x0 + handleW, (x0 + visX1) / 2)) {
+                outKind = 3;
+                outIdx = i;
+                outSide = -1;
+                outAccSec = cStart;
+                return true;
+            }
+            if (visX1 >= gm.tlViewRc.left - S(8) && visX1 <= gm.tlViewRc.right + S(14) &&
+                mx >= std::max(visX1 - handleW, (x0 + visX1) / 2 + 1) && mx <= visX1 + S(10)) {
+                outKind = 3;
+                outIdx = i;
+                outSide = +1;
+                outAccSec = cStart;
+                return true;
+            }
+        }
+    }
+
     if (my >= gm.m1Top && my <= gm.m1Top + gm.m1H && !studioMusic_.empty()) {
         for (size_t i = 0; i < studioMusic_.size(); ++i) {
             const auto& m = studioMusic_[i];
@@ -426,13 +555,24 @@ bool MainWindow::StudioHitTestTrimEdge(int mx, int my, int cw, int ch,
 }
 
 int MainWindow::StudioHitTestClipBody(int mx, int my, int cw, int ch) const {
-    if (!studioOpen_ || trimBusy_ || cw <= 0 || ch <= 0 || studioClips_.empty()) return -1;
+    if (!studioOpen_ || trimBusy_ || cw <= 0 || ch <= 0) return -1;
     const StudioGeometry gm = CalcStudioGeom(cw, ch, static_cast<int>(dpi_));
     if (mx < gm.tlViewRc.left || mx > gm.tlViewRc.right) return -1;
-    if (my < gm.v1Top || my > gm.a1Top + gm.a1H) return -1;
     auto secToX = [&](double s) {
         return static_cast<int>(std::lround(gm.tlViewRc.left + (s - studioTimelineScrollSec_) * studioPxPerSec_));
     };
+    if (my >= gm.v2Top && my <= gm.v2Top + gm.v2H && !studioOverlayClips_.empty()) {
+        for (int i = static_cast<int>(studioOverlayClips_.size()) - 1; i >= 0; --i) {
+            const auto& c = studioOverlayClips_[static_cast<size_t>(i)];
+            double cStart = std::max(0.0, c.timelineStartSec);
+            double outDur = ClipOutDur(c);
+            int x0 = secToX(cStart);
+            int visX1 = std::max(x0 + S(16), secToX(cStart + outDur));
+            if (mx >= x0 && mx <= visX1) return i;
+        }
+        return -1;
+    }
+    if (studioClips_.empty() || my < gm.v1Top || my > gm.a1Top + gm.a1H) return -1;
     for (size_t i = 0; i < studioClips_.size(); ++i) {
         const auto& c = studioClips_[i];
         double cStart = std::max(0.0, c.timelineStartSec);
@@ -494,8 +634,11 @@ void MainWindow::StudioAddTransition(MontageTransitionType type) {
     studioTransitions_.push_back(item);
     studioSelFx_ = static_cast<int>(studioTransitions_.size()) - 1;
     studioSelClip_ = -1;
+    studioSelOverlay_ = -1;
     studioSelMusic_ = -1;
+    studioSelFrame_ = -1;
     SetFooterMessage(std::wstring(L"Efekt eklendi: ") + preset.title + L" — Üst şeritten sürükleyip istediğiniz saniyeye koyabilirsiniz.");
+    SyncStudioFxOverlay();
     if (hwnd_) InvalidateRect(hwnd_, nullptr, FALSE);
 }
 
@@ -537,13 +680,35 @@ bool MainWindow::StudioHitTestFrameBar(int mx, int my, int cw, int ch, int& outI
 }
 
 int MainWindow::StudioHitTestStageHandle(int mx, int my, int cw, int ch) const {
-    if (!studioOpen_ || trimBusy_ || studioClips_.empty() || cw <= 0 || ch <= 0) return 0;
+    if (!studioOpen_ || trimBusy_ || (studioClips_.empty() && studioOverlayClips_.empty()) || cw <= 0 || ch <= 0) return 0;
+
+    const StudioGeometry gm = CalcStudioGeom(cw, ch, static_cast<int>(dpi_));
+    const RECT canvasRc = CalcStageCanvasRect(gm, studioVertical916_, static_cast<int>(dpi_));
+
+    int ovIdx = -1;
+    double ovLoc = 0.0, ovStart = 0.0;
+    if (MapTimelineToOverlayClip(studioPlayheadSec_, ovIdx, ovLoc, ovStart) && ovIdx >= 0) {
+        const auto& ov = studioOverlayClips_[static_cast<size_t>(ovIdx)];
+        MontageFrameSpec ovFrm{};
+        ovFrm.centerX = ov.pipCenterX;
+        ovFrm.centerY = ov.pipCenterY;
+        ovFrm.scale = ov.pipScale;
+        const RECT oRc = CalcVideoSubRect(canvasRc, ovFrm);
+        const int arm = std::min<int>(S(14), std::max<int>(S(7), (oRc.right - oRc.left) / 4));
+        auto nearOv = [&](int cx, int cy) { return std::abs(mx - cx) <= arm && std::abs(my - cy) <= arm; };
+        if (nearOv(oRc.right, oRc.bottom)) return 104;
+        if (nearOv(oRc.left, oRc.top))     return 101;
+        if (nearOv(oRc.right, oRc.top))    return 102;
+        if (nearOv(oRc.left, oRc.bottom))  return 103;
+        if (mx >= oRc.left && mx <= oRc.right && my >= oRc.top && my <= oRc.bottom) {
+            return 105; // Move/click V2 overlay box
+        }
+    }
+
     int tmpIdx = -1;
     double tmpLoc = 0.0, tmpStart = 0.0;
     if (!MapTimelineToClip(studioPlayheadSec_, tmpIdx, tmpLoc, tmpStart)) return 0;
 
-    const StudioGeometry gm = CalcStudioGeom(cw, ch, static_cast<int>(dpi_));
-    const RECT canvasRc = CalcStageCanvasRect(gm, studioVertical916_, static_cast<int>(dpi_));
     const MontageFrameSpec f = ResolveFrameAt(studioFrames_, studioPlayheadSec_);
     const RECT vRc = CalcVideoSubRect(canvasRc, f);
 
@@ -589,6 +754,7 @@ void MainWindow::StudioTrimClipEdgeToPlayhead(bool leftEdge) {
         studioPlayheadSec_ = c.timelineStartSec + std::max(0.02, outDur - 0.04);
     }
     studioSelClip_ = idx;
+    studioSelOverlay_ = -1;
     studioSelMusic_ = -1;
     studioLoadedClipIdx_ = -1;
     SyncStudioMediaState(true);
@@ -599,6 +765,45 @@ void MainWindow::StudioVideoHostUpdate() {
     if (studioPlayer_ && studioVideoReady_) {
         studioPlayer_->UpdateVideo();
     }
+}
+
+void MainWindow::StudioOverlayHostUpdate() {
+    if (studioOverlayPlayer_ && studioOverlayReady_) {
+        studioOverlayPlayer_->UpdateVideo();
+    }
+}
+
+bool MainWindow::BuildStudioClipItem(const std::wstring& path, const std::wstring& name,
+                                     double fallbackDurSec, StudioClipItem& outItem) const {
+    outItem = {};
+    outItem.path = path;
+    outItem.name = name;
+    outItem.sourceDurSec = fallbackDurSec;
+    bool multi = false;
+    double probedDur = 0.0;
+    ProbeClipAudioTracks(path, multi, &probedDur);
+    if (probedDur > 0.2) outItem.sourceDurSec = probedDur;
+    if (outItem.sourceDurSec <= 0.2) return false;
+
+    ClipAudioTrackLayout lay;
+    if (DetectClipAudioLayout(path, lay) && lay.streamIndices.size() >= 3 &&
+        lay.hasSeparateGameMic && lay.gameStreamPos >= 0 && lay.micStreamPos >= 0) {
+        outItem.hasMultiTrack = true;
+        outItem.mixStreamPos = lay.mixStreamPos;
+        outItem.gameStreamPos = lay.gameStreamPos;
+        outItem.micStreamPos = lay.micStreamPos;
+    } else {
+        outItem.hasMultiTrack = multi;
+        outItem.mixStreamPos = lay.streamIndices.empty() ? 0 : lay.mixStreamPos;
+        outItem.gameStreamPos = -1;
+        outItem.micStreamPos = -1;
+    }
+    outItem.trimStartSec = 0.0;
+    outItem.trimEndSec = outItem.sourceDurSec;
+    outItem.speed = 1.0;
+    outItem.gameVolPct = 100;
+    outItem.micVolPct = 100;
+    return true;
 }
 
 void MainWindow::OpenStudio(bool loadQueued) {
@@ -617,54 +822,65 @@ void MainWindow::OpenStudio(bool loadQueued) {
     studioPlaying_ = false;
     studioVideoReady_ = false;
     studioAudioReady_ = false;
+    studioMicReady_ = false;
+    studioOverlayReady_ = false;
     studioSeekPending_ = false;
+    studioOverlaySeekPending_ = false;
     studioLoadedClipIdx_ = -1;
+    studioLoadedOverlayIdx_ = -1;
     studioLoadedClipPath_.clear();
     studioLoadedMusicPath_.clear();
+    studioLoadedMicPath_.clear();
+    studioLoadedOverlayPath_.clear();
     studioPendingSeekSec_ = -1.0;
     studioPendingAudioSeekSec_ = -1.0;
+    studioPendingMicSeekSec_ = -1.0;
+    studioPendingOverlaySeekSec_ = -1.0;
     studioAppliedVol_ = -1.0f;
     studioAppliedMute_ = -1;
     studioAppliedRate_ = -1.0f;
     studioAppliedMusVol_ = -1.0f;
+    studioAppliedMicVol_ = -1.0f;
+    studioAppliedMicMute_ = -1;
+    studioAppliedMicRate_ = -1.0f;
+    studioAppliedOverlayVol_ = -1.0f;
+    studioAppliedOverlayMute_ = -1;
+    studioAppliedOverlayRate_ = -1.0f;
     studioLastFxActive_ = false;
     studioDragMode_ = 0;
     studioClipDragged_ = false;
     studioDragOrigStarts_.clear();
     studioGapLastTickMs_ = 0;
+    studioOverlayIgnoreEndUntilMs_ = 0;
     studioHoverClipIdx_ = -1;
     studioHoverClipSide_ = 0;
+    studioHoverOverlayIdx_ = -1;
+    studioHoverOverlaySide_ = 0;
     studioHoverMusicIdx_ = -1;
     studioHoverMusicSide_ = 0;
     studioHoverFxIdx_ = -1;
     studioSelFx_ = -1;
     studioSelFrame_ = -1;
+    studioSelOverlay_ = -1;
     studioHoverFrameIdx_ = -1;
     studioHoverFrameSide_ = 0;
     studioHoverStageCorner_ = 0;
     studioStageBodyDragged_ = false;
     studioLastVideoRc_ = {};
+    studioLastOverlayVideoRc_ = {};
+    studioLastFxOverlayScreenRc_ = {};
 
     if (loadQueued && studioClips_.empty() && !montagePaths_.empty()) {
         for (const auto& mp : montagePaths_) {
-            StudioClipItem item;
-            item.path = mp;
-            item.name = BaseNameNoExt(mp);
+            double fallbackDur = 0.0;
             for (const auto& c : clips_) {
-                if (_wcsicmp(c.filePath.c_str(), mp.c_str()) == 0) {
-                    item.sourceDurSec = c.durationSeconds;
-                    break;
-                }
+                if (_wcsicmp(c.filePath.c_str(), mp.c_str()) == 0) { fallbackDur = c.durationSeconds; break; }
             }
-            bool multi = false;
-            double probedDur = 0.0;
-            ProbeClipAudioTracks(mp, multi, &probedDur);
-            if (probedDur > 0.2) item.sourceDurSec = probedDur;
-            if (item.sourceDurSec <= 0.2) continue;
-            item.hasMultiTrack = multi;
-            item.trimStartSec = 0.0;
-            item.trimEndSec = item.sourceDurSec;
-            item.timelineStartSec = StudioTotalDuration();
+            StudioClipItem item;
+            if (!BuildStudioClipItem(mp, BaseNameNoExt(mp), fallbackDur, item)) continue;
+            double v1End = 0.0;
+            for (const auto& sc : studioClips_) v1End = std::max(v1End, std::max(0.0, sc.timelineStartSec) + ClipOutDur(sc));
+            item.timelineStartSec = v1End;
             item.speed = std::max(0.5, std::min(2.0, montageSpeed_));
             item.gameVolPct = montageGameMuted_ ? 0 : 100;
             item.micVolPct = montageMicMuted_ ? 0 : 100;
@@ -678,6 +894,7 @@ void MainWindow::OpenStudio(bool loadQueued) {
 
     static bool s_reg = false;
     const wchar_t* vCls = L"AnlikKlipStudioVideo";
+    const wchar_t* oCls = L"AnlikKlipStudioOverlay";
     if (!s_reg) {
         WNDCLASSEXW wc{};
         wc.cbSize = sizeof(wc);
@@ -686,24 +903,44 @@ void MainWindow::OpenStudio(bool loadQueued) {
         wc.lpszClassName = vCls;
         wc.hCursor = LoadCursorW(nullptr, IDC_HAND);
         RegisterClassExW(&wc);
+
+        WNDCLASSEXW owc{};
+        owc.cbSize = sizeof(owc);
+        owc.lpfnWndProc = StudioOverlayHostProc;
+        owc.hInstance = hInst_;
+        owc.lpszClassName = oCls;
+        RegisterClassExW(&owc);
         s_reg = true;
     }
 
     studioVideoHwnd_ = CreateWindowExW(0, vCls, L"", WS_CHILD | WS_CLIPSIBLINGS,
         0, 0, 160, 90, hwnd_, nullptr, hInst_, this);
+    studioOverlayVideoHwnd_ = CreateWindowExW(0, oCls, L"", WS_CHILD | WS_CLIPSIBLINGS,
+        0, 0, 160, 90, hwnd_, nullptr, hInst_, this);
+    if (studioOverlayVideoHwnd_ && studioVideoHwnd_) {
+        SetWindowPos(studioOverlayVideoHwnd_, HWND_TOP, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+    }
 
     RECT cli{};
     GetClientRect(hwnd_, &cli);
-    if (!studioClips_.empty()) {
+    if (!studioClips_.empty() || !studioOverlayClips_.empty()) {
         StudioFitZoomToView(cli.right, cli.bottom);
     }
     UpdateStudioLayout(cli.right, cli.bottom);
     StartStudioWaveformWorker();
-    if (!studioClips_.empty()) {
+    if (!studioClips_.empty() || !studioOverlayClips_.empty()) {
         SyncStudioMediaState(true);
     }
-    SetTimer(hwnd_, ui::TIMER_PLAYER_ID, 60, nullptr);
+    SetTimer(hwnd_, ui::TIMER_PLAYER_ID, 33, nullptr);
     InvalidateRect(hwnd_, nullptr, FALSE);
+}
+
+void MainWindow::DestroyStudioFxOverlay() {
+    if (studioFxOverlayHwnd_) {
+        DestroyWindow(studioFxOverlayHwnd_);
+        studioFxOverlayHwnd_ = nullptr;
+    }
+    studioLastFxOverlayScreenRc_ = {};
 }
 
 void MainWindow::CloseStudio() {
@@ -711,43 +948,49 @@ void MainWindow::CloseStudio() {
     if (hwnd_) KillTimer(hwnd_, ui::TIMER_PLAYER_ID);
     ++studioGen_;
 
-    if (studioVideoCb_) {
-        studioVideoCb_->Detach();
-        studioVideoCb_->Release();
-        studioVideoCb_ = nullptr;
-    }
-    if (studioPlayer_) {
-        studioPlayer_->Shutdown();
-        studioPlayer_->Release();
-        studioPlayer_ = nullptr;
-    }
-    if (studioAudioCb_) {
-        studioAudioCb_->Detach();
-        studioAudioCb_->Release();
-        studioAudioCb_ = nullptr;
-    }
-    if (studioMusicPlayer_) {
-        studioMusicPlayer_->Shutdown();
-        studioMusicPlayer_->Release();
-        studioMusicPlayer_ = nullptr;
+    auto releasePlayer = [](StudioMpCallback*& cb, IMFPMediaPlayer*& mp) {
+        if (cb) { cb->Detach(); cb->Release(); cb = nullptr; }
+        if (mp) { mp->Shutdown(); mp->Release(); mp = nullptr; }
+    };
+    releasePlayer(studioVideoCb_, studioPlayer_);
+    releasePlayer(studioAudioCb_, studioMusicPlayer_);
+    releasePlayer(studioMicCb_, studioMicPlayer_);
+    releasePlayer(studioOverlayCb_, studioOverlayPlayer_);
+
+    if (studioOverlayVideoHwnd_) {
+        DestroyWindow(studioOverlayVideoHwnd_);
+        studioOverlayVideoHwnd_ = nullptr;
     }
     if (studioVideoHwnd_) {
         DestroyWindow(studioVideoHwnd_);
         studioVideoHwnd_ = nullptr;
     }
+    DestroyStudioFxOverlay();
 
     studioOpen_ = false;
     studioPlaying_ = false;
     studioVideoReady_ = false;
     studioAudioReady_ = false;
+    studioMicReady_ = false;
+    studioOverlayReady_ = false;
     studioSeekPending_ = false;
+    studioOverlaySeekPending_ = false;
     studioLoadedClipIdx_ = -1;
+    studioLoadedOverlayIdx_ = -1;
     studioLoadedClipPath_.clear();
     studioLoadedMusicPath_.clear();
+    studioLoadedMicPath_.clear();
+    studioLoadedOverlayPath_.clear();
     studioAppliedVol_ = -1.0f;
     studioAppliedMute_ = -1;
     studioAppliedRate_ = -1.0f;
     studioAppliedMusVol_ = -1.0f;
+    studioAppliedMicVol_ = -1.0f;
+    studioAppliedMicMute_ = -1;
+    studioAppliedMicRate_ = -1.0f;
+    studioAppliedOverlayVol_ = -1.0f;
+    studioAppliedOverlayMute_ = -1;
+    studioAppliedOverlayRate_ = -1.0f;
     studioLastFxActive_ = false;
     studioDragMode_ = 0;
     studioClipDragged_ = false;
@@ -755,29 +998,202 @@ void MainWindow::CloseStudio() {
     studioGapLastTickMs_ = 0;
     studioHoverClipIdx_ = -1;
     studioHoverClipSide_ = 0;
+    studioHoverOverlayIdx_ = -1;
+    studioHoverOverlaySide_ = 0;
     studioHoverMusicIdx_ = -1;
     studioHoverMusicSide_ = 0;
     studioHoverFxIdx_ = -1;
     studioSelFx_ = -1;
     studioSelFrame_ = -1;
+    studioSelOverlay_ = -1;
     studioHoverFrameIdx_ = -1;
     studioHoverFrameSide_ = 0;
     studioHoverStageCorner_ = 0;
     studioStageBodyDragged_ = false;
     studioLastVideoRc_ = {};
+    studioLastOverlayVideoRc_ = {};
     // Free cached waveform peaks when leaving studio so idle RAM returns near baseline
     for (auto& c : studioClips_) { c.waveLoaded = false; std::vector<float>().swap(c.wavePeaks); }
+    for (auto& c : studioOverlayClips_) { c.waveLoaded = false; std::vector<float>().swap(c.wavePeaks); }
     for (auto& m : studioMusic_) { m.waveLoaded = false; std::vector<float>().swap(m.wavePeaks); }
 
     UpdateGalleryControlVisibility();
     if (hwnd_) InvalidateRect(hwnd_, nullptr, FALSE);
 }
 
+void MainWindow::SyncStudioFxOverlay() {
+    if (!studioOpen_ || trimBusy_ || !hwnd_ || !IsWindowVisible(hwnd_) || IsIconic(hwnd_) ||
+        (studioClips_.empty() && studioOverlayClips_.empty())) {
+        if (studioFxOverlayHwnd_ && IsWindowVisible(studioFxOverlayHwnd_)) {
+            ShowWindow(studioFxOverlayHwnd_, SW_HIDE);
+        }
+        return;
+    }
+
+    const StudioTransitionItem* activeFx = nullptr;
+    for (const auto& fx : studioTransitions_) {
+        double halfW = std::max(0.15, fx.durationSec) * 0.5;
+        if (studioPlayheadSec_ >= fx.timelineSec - halfW - 1e-4 &&
+            studioPlayheadSec_ <= fx.timelineSec + halfW + 1e-4) {
+            activeFx = &fx;
+            break;
+        }
+    }
+    if (!activeFx) {
+        if (studioFxOverlayHwnd_ && IsWindowVisible(studioFxOverlayHwnd_)) {
+            ShowWindow(studioFxOverlayHwnd_, SW_HIDE);
+        }
+        return;
+    }
+
+    RECT cli{};
+    GetClientRect(hwnd_, &cli);
+    if (cli.right <= 0 || cli.bottom <= 0) return;
+    StudioGeometry gm = CalcStudioGeom(cli.right, cli.bottom, static_cast<int>(dpi_));
+    RECT canvasRc = CalcStageCanvasRect(gm, studioVertical916_, static_cast<int>(dpi_));
+    const int cw = static_cast<int>(canvasRc.right - canvasRc.left);
+    const int ch = static_cast<int>(canvasRc.bottom - canvasRc.top);
+    if (cw < 16 || ch < 16) return;
+
+    if (!studioFxOverlayHwnd_) {
+        static bool s_fxCls = false;
+        const wchar_t* fxCls = L"AnlikKlipStudioFxOverlay";
+        if (!s_fxCls) {
+            WNDCLASSEXW fwc{};
+            fwc.cbSize = sizeof(fwc);
+            fwc.lpfnWndProc = DefWindowProcW;
+            fwc.hInstance = hInst_;
+            fwc.lpszClassName = fxCls;
+            RegisterClassExW(&fwc);
+            s_fxCls = true;
+        }
+        studioFxOverlayHwnd_ = CreateWindowExW(
+            WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW,
+            fxCls, L"", WS_POPUP,
+            0, 0, cw, ch, hwnd_, nullptr, hInst_, nullptr);
+    }
+    if (!studioFxOverlayHwnd_) return;
+
+    POINT scrTL{ canvasRc.left, canvasRc.top };
+    ClientToScreen(hwnd_, &scrTL);
+
+    const double dur = std::max(0.15, activeFx->durationSec);
+    const double startT = activeFx->timelineSec - dur * 0.5;
+    double u = std::max(0.0, std::min(1.0, (studioPlayheadSec_ - startT) / dur));
+    if (!studioPlaying_ && std::abs(studioPlayheadSec_ - activeFx->timelineSec) < 0.04) u = 0.5;
+    const double bell = std::sin(u * 3.14159265358979323846);
+
+    BITMAPINFO bi{};
+    bi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+    bi.bmiHeader.biWidth = cw;
+    bi.bmiHeader.biHeight = -ch;
+    bi.bmiHeader.biPlanes = 1;
+    bi.bmiHeader.biBitCount = 32;
+    bi.bmiHeader.biCompression = BI_RGB;
+
+    void* bits = nullptr;
+    HDC scrDc = GetDC(nullptr);
+    HDC memDc = CreateCompatibleDC(scrDc);
+    HBITMAP hbm = CreateDIBSection(scrDc, &bi, DIB_RGB_COLORS, &bits, nullptr, 0);
+    if (hbm && memDc && bits) {
+        HGDIOBJ oldBm = SelectObject(memDc, hbm);
+        memset(bits, 0, static_cast<size_t>(cw) * ch * 4);
+        {
+            Gdiplus::Bitmap bmp(cw, ch, cw * 4, PixelFormat32bppPARGB, static_cast<BYTE*>(bits));
+            Gdiplus::Graphics g(&bmp);
+            g.SetSmoothingMode(Gdiplus::SmoothingModeHighSpeed);
+
+            switch (activeFx->type) {
+                case MontageTransitionType::FadeBlack: {
+                    double edgeDist = std::abs(u - 0.5) * 2.0;
+                    double blackStrength = 1.0 - std::pow(edgeDist, 1.35);
+                    BYTE a = static_cast<BYTE>(std::max(0, std::min(250, static_cast<int>(std::lround(blackStrength * 248.0)))));
+                    Gdiplus::SolidBrush br(Gdiplus::Color(a, 0, 0, 0));
+                    g.FillRectangle(&br, 0, 0, cw, ch);
+                    break;
+                }
+                case MontageTransitionType::FlashWhite: {
+                    double strength = std::pow(std::max(0.0, bell), 1.85);
+                    BYTE a = static_cast<BYTE>(std::max(0, std::min(245, static_cast<int>(std::lround(strength * 238.0)))));
+                    Gdiplus::SolidBrush br(Gdiplus::Color(a, 255, 255, 255));
+                    g.FillRectangle(&br, 0, 0, cw, ch);
+                    break;
+                }
+                case MontageTransitionType::ZoomPunch: {
+                    double strength = bell * bell;
+                    BYTE ba = static_cast<BYTE>(std::max(0, std::min(210, static_cast<int>(std::lround(strength * 185.0)))));
+                    BYTE fa = static_cast<BYTE>(std::max(0, std::min(150, static_cast<int>(std::lround(std::pow(strength, 1.5) * 120.0)))));
+                    Gdiplus::SolidBrush brF(Gdiplus::Color(fa, 224, 242, 254));
+                    g.FillRectangle(&brF, 0, 0, cw, ch);
+                    float pad = static_cast<float>((1.0 - strength * 0.25) * 24.0);
+                    Gdiplus::Pen pZoom(Gdiplus::Color(ba, 96, 165, 250), 4.0f);
+                    g.DrawRectangle(&pZoom, pad, pad, static_cast<float>(cw) - pad * 2.0f, static_cast<float>(ch) - pad * 2.0f);
+                    break;
+                }
+                case MontageTransitionType::GlitchShake: {
+                    double amp = std::max(0.25, bell * bell);
+                    uint32_t seed = static_cast<uint32_t>(std::llround(u * 120.0)) * 2654435761u + 37u;
+                    int bands = 9;
+                    int bandH = std::max(8, ch / bands);
+                    for (int b = 0; b < bands; ++b) {
+                        uint32_t hsh = (seed ^ (static_cast<uint32_t>(b) * 2246822519u)) * 3266489917u;
+                        if ((hsh % 10u) < 6u) {
+                            BYTE a = static_cast<BYTE>(std::min(205, static_cast<int>(135.0 * amp)));
+                            Gdiplus::Color c = ((b & 1) == 0)
+                                ? Gdiplus::Color(a, 34, 211, 238)
+                                : Gdiplus::Color(a, 236, 72, 153);
+                            if ((hsh % 11u) == 0u) c = Gdiplus::Color(a, 255, 255, 255);
+                            Gdiplus::SolidBrush brG(c);
+                            int xShift = static_cast<int>((hsh >> 8) % 60u) - 30;
+                            int bh = std::max(4, bandH / 3);
+                            g.FillRectangle(&brG, xShift, b * bandH + (bandH / 3), cw, bh);
+                        }
+                    }
+                    break;
+                }
+                case MontageTransitionType::SlideWipe: {
+                    int covL = 0, covR = 0, edgePos = 0;
+                    if (u < 0.5) {
+                        covR = static_cast<int>(std::lround(cw * (u * 2.0)));
+                        edgePos = covR;
+                    } else {
+                        covL = static_cast<int>(std::lround(cw * ((u - 0.5) * 2.0)));
+                        covR = cw;
+                        edgePos = covL;
+                    }
+                    if (covR > covL) {
+                        Gdiplus::SolidBrush brBk(Gdiplus::Color(246, 0, 0, 0));
+                        g.FillRectangle(&brBk, covL, 0, covR - covL, ch);
+                    }
+                    Gdiplus::SolidBrush brBar(Gdiplus::Color(235, 255, 255, 255));
+                    g.FillRectangle(&brBar, std::max(0, edgePos - 4), 0, 8, ch);
+                    break;
+                }
+            }
+        }
+        POINT srcPt{ 0, 0 };
+        SIZE dstSz{ cw, ch };
+        BLENDFUNCTION bf{};
+        bf.BlendOp = AC_SRC_OVER;
+        bf.SourceConstantAlpha = 255;
+        bf.AlphaFormat = AC_SRC_ALPHA;
+        SetWindowPos(studioFxOverlayHwnd_, HWND_TOP, scrTL.x, scrTL.y, cw, ch, SWP_NOACTIVATE | SWP_SHOWWINDOW);
+        UpdateLayeredWindow(studioFxOverlayHwnd_, scrDc, &scrTL, &dstSz, memDc, &srcPt, 0, &bf, ULW_ALPHA);
+        SelectObject(memDc, oldBm);
+    }
+    if (hbm) DeleteObject(hbm);
+    if (memDc) DeleteDC(memDc);
+    if (scrDc) ReleaseDC(nullptr, scrDc);
+}
+
 void MainWindow::UpdateStudioLayout(int cw, int ch) {
     if (!studioOpen_ || !studioVideoHwnd_ || cw <= 0 || ch <= 0) return;
-    if (studioClips_.empty() || trimBusy_) {
+    if ((studioClips_.empty() && studioOverlayClips_.empty()) || trimBusy_) {
         ShowWindow(studioVideoHwnd_, SW_HIDE);
+        if (studioOverlayVideoHwnd_) ShowWindow(studioOverlayVideoHwnd_, SW_HIDE);
         studioLastVideoRc_ = {};
+        studioLastOverlayVideoRc_ = {};
+        SyncStudioFxOverlay();
         return;
     }
     StudioGeometry gm = CalcStudioGeom(cw, ch, static_cast<int>(dpi_));
@@ -794,10 +1210,34 @@ void MainWindow::UpdateStudioLayout(int cw, int ch) {
         SWP_NOZORDER | SWP_NOACTIVATE);
     studioLastVideoRc_ = vRc;
     if (inClip && studioPlayer_) studioPlayer_->UpdateVideo();
+
+    if (studioOverlayVideoHwnd_) {
+        int ovIdx = -1;
+        double ovLoc = 0.0, ovStart = 0.0;
+        const bool inOv = MapTimelineToOverlayClip(studioPlayheadSec_, ovIdx, ovLoc, ovStart) && ovIdx >= 0;
+        if (inOv) {
+            const auto& ov = studioOverlayClips_[static_cast<size_t>(ovIdx)];
+            MontageFrameSpec ovF{};
+            ovF.centerX = ov.pipCenterX;
+            ovF.centerY = ov.pipCenterY;
+            ovF.scale = ov.pipScale;
+            RECT oRc = CalcVideoSubRect(canvasRc, ovF);
+            ShowWindow(studioOverlayVideoHwnd_, SW_SHOW);
+            SetWindowPos(studioOverlayVideoHwnd_, HWND_TOP, oRc.left, oRc.top,
+                std::max<int>(8, oRc.right - oRc.left), std::max<int>(8, oRc.bottom - oRc.top),
+                SWP_NOACTIVATE);
+            studioLastOverlayVideoRc_ = oRc;
+            if (studioOverlayPlayer_) studioOverlayPlayer_->UpdateVideo();
+        } else {
+            ShowWindow(studioOverlayVideoHwnd_, SW_HIDE);
+            studioLastOverlayVideoRc_ = {};
+        }
+    }
+    SyncStudioFxOverlay();
 }
 
 void MainWindow::SyncStudioVideoFrameRect() {
-    if (!studioOpen_ || !studioVideoHwnd_ || !hwnd_ || studioClips_.empty() || trimBusy_) return;
+    if (!studioOpen_ || !studioVideoHwnd_ || !hwnd_ || (studioClips_.empty() && studioOverlayClips_.empty()) || trimBusy_) return;
     RECT cli{};
     GetClientRect(hwnd_, &cli);
     if (cli.right <= 0 || cli.bottom <= 0) return;
@@ -805,6 +1245,22 @@ void MainWindow::SyncStudioVideoFrameRect() {
     RECT canvasRc = CalcStageCanvasRect(gm, studioVertical916_, static_cast<int>(dpi_));
     MontageFrameSpec f = ResolveFrameAt(studioFrames_, studioPlayheadSec_);
     RECT vRc = CalcVideoSubRect(canvasRc, f);
+
+    // Subtle real-time glitch/zoom punch preview shift on active FX
+    int dxShake = 0;
+    for (const auto& fx : studioTransitions_) {
+        double dur = std::max(0.15, fx.durationSec);
+        double halfW = dur * 0.5;
+        if (studioPlayheadSec_ >= fx.timelineSec - halfW && studioPlayheadSec_ <= fx.timelineSec + halfW) {
+            if (fx.type == MontageTransitionType::GlitchShake) {
+                double u = (studioPlayheadSec_ - (fx.timelineSec - halfW)) / dur;
+                dxShake = ((static_cast<int>(std::llround(u * 40.0)) & 1) ? 1 : -1) * S(5);
+            }
+            break;
+        }
+    }
+    OffsetRect(&vRc, dxShake, 0);
+
     if (vRc.left != studioLastVideoRc_.left || vRc.top != studioLastVideoRc_.top ||
         vRc.right != studioLastVideoRc_.right || vRc.bottom != studioLastVideoRc_.bottom) {
         SetWindowPos(studioVideoHwnd_, nullptr, vRc.left, vRc.top,
@@ -813,6 +1269,35 @@ void MainWindow::SyncStudioVideoFrameRect() {
         studioLastVideoRc_ = vRc;
         if (studioPlayer_) studioPlayer_->UpdateVideo();
         InvalidateRect(hwnd_, &gm.stageRc, FALSE);
+    }
+
+    if (studioOverlayVideoHwnd_) {
+        int ovIdx = -1;
+        double ovLoc = 0.0, ovStart = 0.0;
+        if (MapTimelineToOverlayClip(studioPlayheadSec_, ovIdx, ovLoc, ovStart) && ovIdx >= 0) {
+            const auto& ov = studioOverlayClips_[static_cast<size_t>(ovIdx)];
+            MontageFrameSpec ovF{};
+            ovF.centerX = ov.pipCenterX;
+            ovF.centerY = ov.pipCenterY;
+            ovF.scale = ov.pipScale;
+            RECT oRc = CalcVideoSubRect(canvasRc, ovF);
+            OffsetRect(&oRc, dxShake, 0);
+            if (!IsWindowVisible(studioOverlayVideoHwnd_) ||
+                oRc.left != studioLastOverlayVideoRc_.left || oRc.top != studioLastOverlayVideoRc_.top ||
+                oRc.right != studioLastOverlayVideoRc_.right || oRc.bottom != studioLastOverlayVideoRc_.bottom) {
+                if (!IsWindowVisible(studioOverlayVideoHwnd_)) ShowWindow(studioOverlayVideoHwnd_, SW_SHOW);
+                SetWindowPos(studioOverlayVideoHwnd_, HWND_TOP, oRc.left, oRc.top,
+                    std::max<int>(8, oRc.right - oRc.left), std::max<int>(8, oRc.bottom - oRc.top),
+                    SWP_NOACTIVATE);
+                studioLastOverlayVideoRc_ = oRc;
+                if (studioOverlayPlayer_) studioOverlayPlayer_->UpdateVideo();
+                InvalidateRect(hwnd_, &gm.stageRc, FALSE);
+            }
+        } else if (IsWindowVisible(studioOverlayVideoHwnd_)) {
+            ShowWindow(studioOverlayVideoHwnd_, SW_HIDE);
+            studioLastOverlayVideoRc_ = {};
+            InvalidateRect(hwnd_, &gm.stageRc, FALSE);
+        }
     }
 }
 
@@ -835,6 +1320,9 @@ void MainWindow::StartStudioWaveformWorker() {
         jobs.push_back({ isMus, p });
     };
     for (const auto& c : studioClips_) {
+        if (!c.waveLoaded && !c.path.empty()) pushUnique(false, c.path);
+    }
+    for (const auto& c : studioOverlayClips_) {
         if (!c.waveLoaded && !c.path.empty()) pushUnique(false, c.path);
     }
     for (const auto& m : studioMusic_) {
@@ -861,31 +1349,42 @@ void MainWindow::StartStudioWaveformWorker() {
 
 void MainWindow::SyncStudioMediaState(bool forceSeekVideo) {
     if (!studioOpen_ || trimBusy_ || !studioVideoHwnd_) return;
-    if (studioClips_.empty()) {
-        if (studioPlayer_) {
+    if (studioClips_.empty() && studioOverlayClips_.empty()) {
+        auto pauseIfPlaying = [](IMFPMediaPlayer* p) {
+            if (!p) return;
             MFP_MEDIAPLAYER_STATE st = MFP_MEDIAPLAYER_STATE_EMPTY;
-            if (FAILED(studioPlayer_->GetState(&st)) || st == MFP_MEDIAPLAYER_STATE_PLAYING) {
-                studioPlayer_->Pause();
-            }
-        }
-        if (studioMusicPlayer_) {
-            MFP_MEDIAPLAYER_STATE ast = MFP_MEDIAPLAYER_STATE_EMPTY;
-            if (FAILED(studioMusicPlayer_->GetState(&ast)) || ast == MFP_MEDIAPLAYER_STATE_PLAYING) {
-                studioMusicPlayer_->Pause();
-            }
-        }
+            if (FAILED(p->GetState(&st)) || st == MFP_MEDIAPLAYER_STATE_PLAYING) p->Pause();
+        };
+        pauseIfPlaying(studioPlayer_);
+        pauseIfPlaying(studioMicPlayer_);
+        pauseIfPlaying(studioOverlayPlayer_);
+        pauseIfPlaying(studioMusicPlayer_);
         studioPlaying_ = false;
         if (IsWindowVisible(studioVideoHwnd_)) ShowWindow(studioVideoHwnd_, SW_HIDE);
+        if (studioOverlayVideoHwnd_ && IsWindowVisible(studioOverlayVideoHwnd_)) ShowWindow(studioOverlayVideoHwnd_, SW_HIDE);
+        SyncStudioFxOverlay();
         return;
     }
 
     int segIdx = -1;
     double localSec = 0.0, clipStartOut = 0.0;
-    if (!MapTimelineToClip(studioPlayheadSec_, segIdx, localSec, clipStartOut) || segIdx < 0) {
+    const bool hasV1Clip = MapTimelineToClip(studioPlayheadSec_, segIdx, localSec, clipStartOut) && segIdx >= 0;
+    bool v1SplitMic = false;
+    float v1MicVol = 0.0f;
+    bool v1MicMute = true;
+    double v1Speed = 1.0;
+
+    if (!hasV1Clip) {
         if (studioPlayer_) {
             MFP_MEDIAPLAYER_STATE st = MFP_MEDIAPLAYER_STATE_EMPTY;
             if (FAILED(studioPlayer_->GetState(&st)) || st == MFP_MEDIAPLAYER_STATE_PLAYING) {
                 studioPlayer_->Pause();
+            }
+        }
+        if (studioMicPlayer_) {
+            MFP_MEDIAPLAYER_STATE mst = MFP_MEDIAPLAYER_STATE_EMPTY;
+            if (FAILED(studioMicPlayer_->GetState(&mst)) || mst == MFP_MEDIAPLAYER_STATE_PLAYING) {
+                studioMicPlayer_->Pause();
             }
         }
         studioLoadedClipIdx_ = -1;
@@ -900,21 +1399,22 @@ void MainWindow::SyncStudioMediaState(bool forceSeekVideo) {
         }
     } else {
         const auto& clip = studioClips_[static_cast<size_t>(segIdx)];
+        v1Speed = clip.speed;
+        float previewVol = 1.0f;
+        bool previewMute = false;
+        ComputeClipPreviewAudio(clip, previewVol, previewMute, v1MicVol, v1MicMute, v1SplitMic);
+
         SyncStudioVideoFrameRect();
         if (!IsWindowVisible(studioVideoHwnd_)) ShowWindow(studioVideoHwnd_, SW_SHOW);
 
         if (!studioPlayer_) {
-            studioVideoCb_ = new StudioMpCallback(hwnd_, studioGen_.load(), false);
+            studioVideoCb_ = new StudioMpCallback(hwnd_, studioGen_.load(), 0);
             HRESULT hr = MFPCreateMediaPlayer(nullptr, FALSE, MFP_OPTION_NONE,
                 studioVideoCb_, studioVideoHwnd_, &studioPlayer_);
             if (FAILED(hr) || !studioPlayer_) return;
         }
 
         const bool needNewItem = (_wcsicmp(studioLoadedClipPath_.c_str(), clip.path.c_str()) != 0);
-        float previewVol = std::max(0.0f, std::min(1.0f,
-            static_cast<float>(clip.hasMultiTrack ? std::max(clip.gameVolPct, clip.micVolPct) : clip.gameVolPct) / 100.0f));
-        bool previewMute = (clip.gameVolPct == 0 && (!clip.hasMultiTrack || clip.micVolPct == 0));
-
         if (needNewItem) {
             studioVideoReady_ = false;
             studioSeekPending_ = true;
@@ -927,7 +1427,7 @@ void MainWindow::SyncStudioMediaState(bool forceSeekVideo) {
             studioAppliedRate_ = -1.0f;
             IMFPMediaItem* item = nullptr;
             if (SUCCEEDED(studioPlayer_->CreateMediaItemFromURL(clip.path.c_str(), TRUE, 0, &item)) && item) {
-                SelectBestPreviewAudioTrack(item, clip.path);
+                SelectPreviewStreams(item, v1SplitMic ? clip.gameStreamPos : clip.mixStreamPos, true);
                 studioPlayer_->SetMediaItem(item);
                 item->Release();
             } else {
@@ -945,10 +1445,7 @@ void MainWindow::SyncStudioMediaState(bool forceSeekVideo) {
                 studioPlayer_->SetMute(wantMute ? TRUE : FALSE);
                 studioAppliedMute_ = wantMute;
             }
-            if (std::abs(wantRate - studioAppliedRate_) > 0.001f) {
-                studioPlayer_->SetRate(wantRate);
-                studioAppliedRate_ = wantRate;
-            }
+            ApplyPlayerRateSafe(studioPlayer_, wantRate, studioAppliedRate_);
             MFP_MEDIAPLAYER_STATE vState = MFP_MEDIAPLAYER_STATE_EMPTY;
             const bool haveVState = SUCCEEDED(studioPlayer_->GetState(&vState));
             if (forceSeekVideo) {
@@ -975,7 +1472,177 @@ void MainWindow::SyncStudioMediaState(bool forceSeekVideo) {
         }
     }
 
-    // Sync secondary audio-only MP3 preview player (created only when music exists)
+    // Sync independent Microphone audio player for V1 multi-track clips (role = 2)
+    if (hasV1Clip && v1SplitMic && studioPlaying_ && !v1MicMute) {
+        const auto& clip = studioClips_[static_cast<size_t>(segIdx)];
+        if (!studioMicPlayer_) {
+            studioMicCb_ = new StudioMpCallback(hwnd_, studioGen_.load(), 2);
+            MFPCreateMediaPlayer(nullptr, FALSE, MFP_OPTION_NONE, studioMicCb_, nullptr, &studioMicPlayer_);
+        }
+        if (studioMicPlayer_) {
+            if (_wcsicmp(studioLoadedMicPath_.c_str(), clip.path.c_str()) != 0) {
+                studioMicReady_ = false;
+                studioLoadedMicPath_ = clip.path;
+                studioPendingMicSeekSec_ = localSec;
+                studioAppliedMicVol_ = -1.0f;
+                studioAppliedMicMute_ = -1;
+                studioAppliedMicRate_ = -1.0f;
+                IMFPMediaItem* mItem = nullptr;
+                if (SUCCEEDED(studioMicPlayer_->CreateMediaItemFromURL(clip.path.c_str(), TRUE, 0, &mItem)) && mItem) {
+                    SelectPreviewStreams(mItem, clip.micStreamPos, false);
+                    studioMicPlayer_->SetMediaItem(mItem);
+                    mItem->Release();
+                }
+            } else if (studioMicReady_) {
+                if (std::abs(v1MicVol - studioAppliedMicVol_) > 0.002f) {
+                    studioMicPlayer_->SetVolume(v1MicVol);
+                    studioAppliedMicVol_ = v1MicVol;
+                }
+                if (studioAppliedMicMute_ != 0) {
+                    studioMicPlayer_->SetMute(FALSE);
+                    studioAppliedMicMute_ = 0;
+                }
+                ApplyPlayerRateSafe(studioMicPlayer_, static_cast<float>(v1Speed), studioAppliedMicRate_);
+                PROPVARIANT mPos;
+                PropVariantInit(&mPos);
+                double curMSec = localSec;
+                if (SUCCEEDED(studioMicPlayer_->GetPosition(MFP_POSITIONTYPE_100NS, &mPos)) && mPos.vt == VT_I8) {
+                    curMSec = static_cast<double>(mPos.hVal.QuadPart) / 1e7;
+                }
+                PropVariantClear(&mPos);
+                if (forceSeekVideo || std::abs(curMSec - localSec) > 0.25) {
+                    PROPVARIANT np;
+                    PropVariantInit(&np);
+                    np.vt = VT_I8;
+                    np.hVal.QuadPart = static_cast<LONGLONG>(localSec * 1e7);
+                    studioMicPlayer_->SetPosition(MFP_POSITIONTYPE_100NS, &np);
+                    PropVariantClear(&np);
+                }
+                MFP_MEDIAPLAYER_STATE mState = MFP_MEDIAPLAYER_STATE_EMPTY;
+                if (FAILED(studioMicPlayer_->GetState(&mState)) || mState != MFP_MEDIAPLAYER_STATE_PLAYING) {
+                    studioMicPlayer_->Play();
+                }
+            }
+        }
+    } else if (studioMicPlayer_ && studioMicReady_) {
+        MFP_MEDIAPLAYER_STATE mState = MFP_MEDIAPLAYER_STATE_EMPTY;
+        if (FAILED(studioMicPlayer_->GetState(&mState)) || mState == MFP_MEDIAPLAYER_STATE_PLAYING) {
+            studioMicPlayer_->Pause();
+        }
+    }
+
+    // Sync V2 PiP Overlay Video Player (role = 3)
+    if (studioOverlayVideoHwnd_) {
+        int ovIdx = -1;
+        double ovLocalSec = 0.0, ovStartOut = 0.0;
+        const bool hasV2 = MapTimelineToOverlayClip(studioPlayheadSec_, ovIdx, ovLocalSec, ovStartOut) && ovIdx >= 0;
+        if (!hasV2) {
+            if (studioOverlayPlayer_) {
+                MFP_MEDIAPLAYER_STATE ost = MFP_MEDIAPLAYER_STATE_EMPTY;
+                if (FAILED(studioOverlayPlayer_->GetState(&ost)) || ost == MFP_MEDIAPLAYER_STATE_PLAYING) {
+                    studioOverlayPlayer_->Pause();
+                }
+            }
+            studioLoadedOverlayIdx_ = -1;
+            if (IsWindowVisible(studioOverlayVideoHwnd_)) {
+                ShowWindow(studioOverlayVideoHwnd_, SW_HIDE);
+                studioLastOverlayVideoRc_ = {};
+                if (hwnd_) {
+                    RECT cli{};
+                    GetClientRect(hwnd_, &cli);
+                    StudioGeometry gm = CalcStudioGeom(cli.right, cli.bottom, static_cast<int>(dpi_));
+                    InvalidateRect(hwnd_, &gm.stageRc, FALSE);
+                }
+            }
+        } else {
+            const auto& ov = studioOverlayClips_[static_cast<size_t>(ovIdx)];
+            SyncStudioVideoFrameRect();
+            if (!studioOverlayPlayer_) {
+                studioOverlayCb_ = new StudioMpCallback(hwnd_, studioGen_.load(), 3);
+                MFPCreateMediaPlayer(nullptr, FALSE, MFP_OPTION_NONE,
+                    studioOverlayCb_, studioOverlayVideoHwnd_, &studioOverlayPlayer_);
+            }
+            if (studioOverlayPlayer_) {
+                const bool needNewOv = (_wcsicmp(studioLoadedOverlayPath_.c_str(), ov.path.c_str()) != 0);
+                int selAudioPos = ov.mixStreamPos;
+                float ovVol = std::max(0.0f, std::min(1.0f,
+                    static_cast<float>(ov.hasMultiTrack ? std::max(ov.gameVolPct, ov.micVolPct) : ov.gameVolPct) / 100.0f));
+                bool ovMute = (ov.gameVolPct <= 0 && (!ov.hasMultiTrack || ov.micVolPct <= 0));
+                if (ov.hasMultiTrack && ov.gameStreamPos >= 0 && ov.micStreamPos >= 0) {
+                    if (ov.gameVolPct > 0 && ov.micVolPct <= 0) {
+                        selAudioPos = ov.gameStreamPos;
+                        ovVol = std::max(0.0f, std::min(1.0f, static_cast<float>(ov.gameVolPct) / 100.0f));
+                    } else if (ov.micVolPct > 0 && ov.gameVolPct <= 0) {
+                        selAudioPos = ov.micStreamPos;
+                        ovVol = std::max(0.0f, std::min(1.0f, static_cast<float>(ov.micVolPct) / 100.0f));
+                    }
+                }
+                if (needNewOv) {
+                    studioOverlayReady_ = false;
+                    studioOverlaySeekPending_ = true;
+                    studioOverlayIgnoreEndUntilMs_ = GetTickCount64() + 700;
+                    studioLoadedOverlayIdx_ = ovIdx;
+                    studioLoadedOverlayPath_ = ov.path;
+                    studioPendingOverlaySeekSec_ = ovLocalSec;
+                    studioAppliedOverlayVol_ = -1.0f;
+                    studioAppliedOverlayMute_ = -1;
+                    studioAppliedOverlayRate_ = -1.0f;
+                    IMFPMediaItem* oItem = nullptr;
+                    if (SUCCEEDED(studioOverlayPlayer_->CreateMediaItemFromURL(ov.path.c_str(), TRUE, 0, &oItem)) && oItem) {
+                        SelectPreviewStreams(oItem, selAudioPos, true);
+                        studioOverlayPlayer_->SetMediaItem(oItem);
+                        oItem->Release();
+                    } else {
+                        studioOverlaySeekPending_ = false;
+                    }
+                } else if (studioOverlayReady_) {
+                    studioLoadedOverlayIdx_ = ovIdx;
+                    const int wantMute = ovMute ? 1 : 0;
+                    if (std::abs(ovVol - studioAppliedOverlayVol_) > 0.002f) {
+                        studioOverlayPlayer_->SetVolume(ovVol);
+                        studioAppliedOverlayVol_ = ovVol;
+                    }
+                    if (wantMute != studioAppliedOverlayMute_) {
+                        studioOverlayPlayer_->SetMute(wantMute ? TRUE : FALSE);
+                        studioAppliedOverlayMute_ = wantMute;
+                    }
+                    ApplyPlayerRateSafe(studioOverlayPlayer_, static_cast<float>(ov.speed), studioAppliedOverlayRate_);
+                    double curOvSec = ovLocalSec;
+                    PROPVARIANT oPos;
+                    PropVariantInit(&oPos);
+                    if (SUCCEEDED(studioOverlayPlayer_->GetPosition(MFP_POSITIONTYPE_100NS, &oPos)) && oPos.vt == VT_I8) {
+                        curOvSec = static_cast<double>(oPos.hVal.QuadPart) / 1e7;
+                    }
+                    PropVariantClear(&oPos);
+                    if (forceSeekVideo || (hasV1Clip && std::abs(curOvSec - ovLocalSec) > 0.28)) {
+                        PROPVARIANT np;
+                        PropVariantInit(&np);
+                        np.vt = VT_I8;
+                        np.hVal.QuadPart = static_cast<LONGLONG>(ovLocalSec * 1e7);
+                        studioOverlaySeekPending_ = true;
+                        studioOverlayIgnoreEndUntilMs_ = GetTickCount64() + 450;
+                        if (FAILED(studioOverlayPlayer_->SetPosition(MFP_POSITIONTYPE_100NS, &np))) {
+                            studioOverlaySeekPending_ = false;
+                        }
+                        PropVariantClear(&np);
+                    }
+                    MFP_MEDIAPLAYER_STATE oState = MFP_MEDIAPLAYER_STATE_EMPTY;
+                    const bool haveOState = SUCCEEDED(studioOverlayPlayer_->GetState(&oState));
+                    if (studioPlaying_) {
+                        const bool needPlay = !haveOState || (oState != MFP_MEDIAPLAYER_STATE_PLAYING);
+                        if (forceSeekVideo || needPlay) studioOverlayPlayer_->UpdateVideo();
+                        if (needPlay) studioOverlayPlayer_->Play();
+                    } else {
+                        const bool needPause = !haveOState || (oState == MFP_MEDIAPLAYER_STATE_PLAYING);
+                        if (forceSeekVideo || needPause) studioOverlayPlayer_->UpdateVideo();
+                        if (needPause) studioOverlayPlayer_->Pause();
+                    }
+                }
+            }
+        }
+    }
+
+    // Sync secondary audio-only MP3 preview player (created only when music exists, role = 1)
     const StudioMusicItem* activeMus = nullptr;
     for (const auto& m : studioMusic_) {
         if (studioPlayheadSec_ >= m.timelineStartSec && studioPlayheadSec_ < m.timelineStartSec + m.durationSec - 0.04) {
@@ -985,7 +1652,7 @@ void MainWindow::SyncStudioMediaState(bool forceSeekVideo) {
     }
     if (studioPlaying_ && activeMus && activeMus->volPct > 0) {
         if (!studioMusicPlayer_) {
-            studioAudioCb_ = new StudioMpCallback(hwnd_, studioGen_.load(), true);
+            studioAudioCb_ = new StudioMpCallback(hwnd_, studioGen_.load(), 1);
             MFPCreateMediaPlayer(nullptr, FALSE, MFP_OPTION_NONE, studioAudioCb_, nullptr, &studioMusicPlayer_);
         }
         if (studioMusicPlayer_) {
@@ -1033,13 +1700,15 @@ void MainWindow::SyncStudioMediaState(bool forceSeekVideo) {
             studioMusicPlayer_->Pause();
         }
     }
+    SyncStudioFxOverlay();
 }
 
 void MainWindow::UpdateStudioMetrics() {
     if (!studioOpen_ || trimBusy_ || !studioPlaying_) return;
-    if (studioClips_.empty()) {
+    if (studioClips_.empty() && studioOverlayClips_.empty()) {
         studioPlaying_ = false;
         studioGapLastTickMs_ = 0;
+        SyncStudioFxOverlay();
         return;
     }
 
@@ -1050,6 +1719,12 @@ void MainWindow::UpdateStudioMetrics() {
             MFP_MEDIAPLAYER_STATE vState = MFP_MEDIAPLAYER_STATE_EMPTY;
             if (FAILED(studioPlayer_->GetState(&vState)) || vState == MFP_MEDIAPLAYER_STATE_PLAYING) {
                 studioPlayer_->Pause();
+            }
+        }
+        if (studioMicPlayer_) {
+            MFP_MEDIAPLAYER_STATE mState = MFP_MEDIAPLAYER_STATE_EMPTY;
+            if (FAILED(studioMicPlayer_->GetState(&mState)) || mState == MFP_MEDIAPLAYER_STATE_PLAYING) {
+                studioMicPlayer_->Pause();
             }
         }
         bool hidVideoWindow = false;
@@ -1070,12 +1745,14 @@ void MainWindow::UpdateStudioMetrics() {
             studioPlayheadSec_ = tot;
             studioPlaying_ = false;
             studioGapLastTickMs_ = 0;
+            if (studioOverlayPlayer_) studioOverlayPlayer_->Pause();
             if (studioMusicPlayer_) {
                 MFP_MEDIAPLAYER_STATE aState = MFP_MEDIAPLAYER_STATE_EMPTY;
                 if (FAILED(studioMusicPlayer_->GetState(&aState)) || aState == MFP_MEDIAPLAYER_STATE_PLAYING) {
                     studioMusicPlayer_->Pause();
                 }
             }
+            SyncStudioFxOverlay();
         } else {
             int nextIdx = -1;
             double nl = 0.0, nc = 0.0;
@@ -1084,6 +1761,7 @@ void MainWindow::UpdateStudioMetrics() {
                 studioPlayheadSec_ = std::max(0.0, studioClips_[static_cast<size_t>(nextIdx)].timelineStartSec) + 0.001;
                 SyncStudioMediaState(true);
             } else {
+                SyncStudioVideoFrameRect();
                 SyncStudioMediaState(false);
             }
         }
@@ -1164,6 +1842,9 @@ void MainWindow::UpdateStudioMetrics() {
                 break;
             }
         }
+        if (fxNow || studioLastFxActive_) {
+            SyncStudioFxOverlay();
+        }
         if (fxNow != studioLastFxActive_) {
             studioLastFxActive_ = fxNow;
             InvalidateRect(hwnd_, &gm.stageRc, FALSE);
@@ -1177,32 +1858,29 @@ void MainWindow::StudioAddClipFromLibrary(size_t rawClipIdx) {
     if (trimBusy_ || rawClipIdx >= clips_.size()) return;
     const auto& src = clips_[rawClipIdx];
     StudioClipItem item;
-    item.path = src.filePath;
-    item.name = BaseNameNoExt(src.fileName);
-    item.sourceDurSec = src.durationSeconds;
-    bool multi = false;
-    double probedDur = 0.0;
-    ProbeClipAudioTracks(src.filePath, multi, &probedDur);
-    if (probedDur > 0.2) item.sourceDurSec = probedDur;
-    if (item.sourceDurSec <= 0.2) return;
-    item.hasMultiTrack = multi;
-    item.trimStartSec = 0.0;
-    item.trimEndSec = item.sourceDurSec;
-    item.timelineStartSec = StudioTotalDuration();
-    item.speed = 1.0;
-    item.gameVolPct = 100;
-    item.micVolPct = 100;
+    if (!BuildStudioClipItem(src.filePath, BaseNameNoExt(src.fileName), src.durationSeconds, item)) return;
+    double v1End = 0.0;
+    for (const auto& sc : studioClips_) v1End = std::max(v1End, std::max(0.0, sc.timelineStartSec) + ClipOutDur(sc));
+    item.timelineStartSec = v1End;
     for (const auto& existing : studioClips_) {
         if (existing.waveLoaded && _wcsicmp(existing.path.c_str(), src.filePath.c_str()) == 0) {
-            item.waveLoaded = true;
-            item.wavePeaks = existing.wavePeaks;
-            break;
+            item.waveLoaded = true; item.wavePeaks = existing.wavePeaks; break;
+        }
+    }
+    if (!item.waveLoaded) {
+        for (const auto& existing : studioOverlayClips_) {
+            if (existing.waveLoaded && _wcsicmp(existing.path.c_str(), src.filePath.c_str()) == 0) {
+                item.waveLoaded = true; item.wavePeaks = existing.wavePeaks; break;
+            }
         }
     }
 
     studioClips_.push_back(std::move(item));
     studioSelClip_ = static_cast<int>(studioClips_.size()) - 1;
+    studioSelOverlay_ = -1;
     studioSelMusic_ = -1;
+    studioSelFx_ = -1;
+    studioSelFrame_ = -1;
 
     RECT cli{};
     if (hwnd_) GetClientRect(hwnd_, &cli);
@@ -1215,10 +1893,94 @@ void MainWindow::StudioAddClipFromLibrary(size_t rawClipIdx) {
             StudioFitZoomToView(cli.right, cli.bottom);
         }
     }
-    if (studioClips_.size() == 1) {
+    if (studioClips_.size() == 1 && studioOverlayClips_.empty()) {
         studioPlayheadSec_ = 0.0;
         SyncStudioMediaState(true);
+    } else if (MapTimelineToClip(studioPlayheadSec_, studioLoadedClipIdx_, v1End, v1End)) {
+        studioLoadedClipIdx_ = -1;
+        SyncStudioMediaState(false);
     }
+    if (hwnd_) InvalidateRect(hwnd_, nullptr, FALSE);
+}
+
+void MainWindow::StudioAddClipToOverlay(size_t rawClipIdx) {
+    if (trimBusy_ || rawClipIdx >= clips_.size()) return;
+    const auto& src = clips_[rawClipIdx];
+    StudioClipItem item;
+    if (!BuildStudioClipItem(src.filePath, BaseNameNoExt(src.fileName), src.durationSeconds, item)) return;
+    item.timelineStartSec = std::max(0.0, studioPlayheadSec_);
+    item.pipScale = 0.38;
+    item.pipCenterX = 0.77;
+    item.pipCenterY = 0.72;
+    for (const auto& existing : studioClips_) {
+        if (existing.waveLoaded && _wcsicmp(existing.path.c_str(), src.filePath.c_str()) == 0) {
+            item.waveLoaded = true; item.wavePeaks = existing.wavePeaks; break;
+        }
+    }
+    if (!item.waveLoaded) {
+        for (const auto& existing : studioOverlayClips_) {
+            if (existing.waveLoaded && _wcsicmp(existing.path.c_str(), src.filePath.c_str()) == 0) {
+                item.waveLoaded = true; item.wavePeaks = existing.wavePeaks; break;
+            }
+        }
+    }
+
+    studioOverlayClips_.push_back(std::move(item));
+    studioSelOverlay_ = static_cast<int>(studioOverlayClips_.size()) - 1;
+    studioSelClip_ = -1;
+    studioSelMusic_ = -1;
+    studioSelFx_ = -1;
+    studioSelFrame_ = -1;
+    studioLoadedOverlayIdx_ = -1;
+
+    SetFooterMessage(L"Üst katmana (V2) eklendi: Sahneden köşeleriyle küçültüp büyütebilir, istediğiniz saniyeye sürükleyebilirsiniz.");
+
+    RECT cli{};
+    if (hwnd_) GetClientRect(hwnd_, &cli);
+    UpdateStudioLayout(cli.right, cli.bottom);
+    StartStudioWaveformWorker();
+    if (cli.right > 0 && cli.bottom > 0) {
+        const StudioGeometry gm = CalcStudioGeom(cli.right, cli.bottom, static_cast<int>(dpi_));
+        double visSec = std::max(1.0, static_cast<double>(gm.tlViewRc.right - gm.tlViewRc.left - S(44)) / studioPxPerSec_);
+        if (StudioTotalDuration() > studioTimelineScrollSec_ + visSec) {
+            StudioFitZoomToView(cli.right, cli.bottom);
+        }
+    }
+    SyncStudioMediaState(true);
+    if (hwnd_) InvalidateRect(hwnd_, nullptr, FALSE);
+}
+
+void MainWindow::StudioToggleSelectedClipTrack() {
+    if (trimBusy_) return;
+    if (studioSelClip_ >= 0 && studioSelClip_ < static_cast<int>(studioClips_.size())) {
+        StudioClipItem mv = std::move(studioClips_[static_cast<size_t>(studioSelClip_)]);
+        studioClips_.erase(studioClips_.begin() + studioSelClip_);
+        studioLoadedClipIdx_ = -1;
+        studioLoadedClipPath_.clear();
+        mv.pipScale = std::max(0.20, std::min(1.0, mv.pipScale >= 0.99 ? 0.38 : mv.pipScale));
+        studioOverlayClips_.push_back(std::move(mv));
+        studioSelOverlay_ = static_cast<int>(studioOverlayClips_.size()) - 1;
+        studioSelClip_ = -1;
+        studioLoadedOverlayIdx_ = -1;
+        SetFooterMessage(L"Klip üst katmana (V2) taşındı: Köşelerinden küçültüp büyütebilirsiniz.");
+    } else if (studioSelOverlay_ >= 0 && studioSelOverlay_ < static_cast<int>(studioOverlayClips_.size())) {
+        StudioClipItem mv = std::move(studioOverlayClips_[static_cast<size_t>(studioSelOverlay_)]);
+        studioOverlayClips_.erase(studioOverlayClips_.begin() + studioSelOverlay_);
+        studioLoadedOverlayIdx_ = -1;
+        studioLoadedOverlayPath_.clear();
+        double v1End = 0.0;
+        for (const auto& sc : studioClips_) v1End = std::max(v1End, std::max(0.0, sc.timelineStartSec) + ClipOutDur(sc));
+        if (mv.timelineStartSec < v1End) mv.timelineStartSec = v1End;
+        studioClips_.push_back(std::move(mv));
+        studioSelClip_ = static_cast<int>(studioClips_.size()) - 1;
+        studioSelOverlay_ = -1;
+        studioLoadedClipIdx_ = -1;
+        SetFooterMessage(L"Klip ana video şeridine (V1) taşındı.");
+    }
+    RECT cli{};
+    if (hwnd_) GetClientRect(hwnd_, &cli);
+    UpdateStudioLayout(cli.right, cli.bottom);
+    SyncStudioMediaState(true);
     if (hwnd_) InvalidateRect(hwnd_, nullptr, FALSE);
 }
 
@@ -1312,6 +2074,8 @@ void MainWindow::StudioDeleteSelection() {
     if (trimBusy_) return;
     studioHoverClipIdx_ = -1;
     studioHoverClipSide_ = 0;
+    studioHoverOverlayIdx_ = -1;
+    studioHoverOverlaySide_ = 0;
     studioHoverMusicIdx_ = -1;
     studioHoverMusicSide_ = 0;
     studioHoverFxIdx_ = -1;
@@ -1320,25 +2084,41 @@ void MainWindow::StudioDeleteSelection() {
     if (studioSelFrame_ >= 0 && studioSelFrame_ < static_cast<int>(studioFrames_.size())) {
         studioFrames_.erase(studioFrames_.begin() + studioSelFrame_);
         studioSelFrame_ = studioFrames_.empty() ? -1 : std::min(studioSelFrame_, static_cast<int>(studioFrames_.size()) - 1);
-        if (studioSelFrame_ < 0 && studioSelFx_ < 0 && studioSelMusic_ < 0 && !studioClips_.empty()) studioSelClip_ = 0;
+        if (studioSelFrame_ < 0 && studioSelFx_ < 0 && studioSelMusic_ < 0 && studioSelOverlay_ < 0 && !studioClips_.empty()) studioSelClip_ = 0;
         SyncStudioVideoFrameRect();
     } else if (studioSelFx_ >= 0 && studioSelFx_ < static_cast<int>(studioTransitions_.size())) {
         studioTransitions_.erase(studioTransitions_.begin() + studioSelFx_);
         studioSelFx_ = studioTransitions_.empty() ? -1 : std::min(studioSelFx_, static_cast<int>(studioTransitions_.size()) - 1);
-        if (studioSelFx_ < 0 && studioSelMusic_ < 0 && !studioClips_.empty()) studioSelClip_ = 0;
+        if (studioSelFx_ < 0 && studioSelMusic_ < 0 && studioSelOverlay_ < 0 && !studioClips_.empty()) studioSelClip_ = 0;
+        SyncStudioFxOverlay();
     } else if (studioSelMusic_ >= 0 && studioSelMusic_ < static_cast<int>(studioMusic_.size())) {
         studioMusic_.erase(studioMusic_.begin() + studioSelMusic_);
         if (studioMusicPlayer_) studioMusicPlayer_->Pause();
         studioLoadedMusicPath_.clear();
         studioSelMusic_ = studioMusic_.empty() ? -1 : std::min(studioSelMusic_, static_cast<int>(studioMusic_.size()) - 1);
-        if (studioSelMusic_ < 0 && !studioClips_.empty()) studioSelClip_ = 0;
+        if (studioSelMusic_ < 0 && studioSelOverlay_ < 0 && !studioClips_.empty()) studioSelClip_ = 0;
+    } else if (studioSelOverlay_ >= 0 && studioSelOverlay_ < static_cast<int>(studioOverlayClips_.size())) {
+        studioOverlayClips_.erase(studioOverlayClips_.begin() + studioSelOverlay_);
+        studioLoadedOverlayIdx_ = -1;
+        studioLoadedOverlayPath_.clear();
+        if (studioOverlayPlayer_) studioOverlayPlayer_->Pause();
+        double tot = StudioTotalDuration();
+        if (studioPlayheadSec_ > tot) studioPlayheadSec_ = tot;
+        studioSelOverlay_ = studioOverlayClips_.empty() ? -1 : std::min(studioSelOverlay_, static_cast<int>(studioOverlayClips_.size()) - 1);
+        if (studioSelOverlay_ < 0 && !studioClips_.empty()) studioSelClip_ = 0;
+        RECT cli{};
+        if (hwnd_) GetClientRect(hwnd_, &cli);
+        UpdateStudioLayout(cli.right, cli.bottom);
+        SyncStudioMediaState(true);
     } else if (studioSelClip_ >= 0 && studioSelClip_ < static_cast<int>(studioClips_.size())) {
         studioClips_.erase(studioClips_.begin() + studioSelClip_);
         studioLoadedClipIdx_ = -1;
         studioLoadedClipPath_.clear();
+        if (studioMicPlayer_) studioMicPlayer_->Pause();
         double tot = StudioTotalDuration();
         if (studioPlayheadSec_ > tot) studioPlayheadSec_ = tot;
         studioSelClip_ = studioClips_.empty() ? -1 : std::min(studioSelClip_, static_cast<int>(studioClips_.size()) - 1);
+        if (studioSelClip_ < 0 && !studioOverlayClips_.empty()) studioSelOverlay_ = 0;
         RECT cli{};
         if (hwnd_) GetClientRect(hwnd_, &cli);
         UpdateStudioLayout(cli.right, cli.bottom);
@@ -1367,15 +2147,23 @@ void MainWindow::StudioMoveSelectedClip(int dir) {
 }
 
 void MainWindow::StudioCycleClipSpeed() {
-    if (trimBusy_ || studioSelClip_ < 0 || studioSelClip_ >= static_cast<int>(studioClips_.size())) return;
-    auto& c = studioClips_[static_cast<size_t>(studioSelClip_)];
-    if (c.speed < 0.75) c.speed = 1.0;
-    else if (c.speed < 1.25) c.speed = 1.5;
-    else if (c.speed < 1.75) c.speed = 2.0;
-    else c.speed = 0.5;
-    for (size_t j = static_cast<size_t>(studioSelClip_) + 1; j < studioClips_.size(); ++j) {
-        double prevEnd = std::max(0.0, studioClips_[j - 1].timelineStartSec) + ClipOutDur(studioClips_[j - 1]);
-        studioClips_[j].timelineStartSec = std::max(studioClips_[j].timelineStartSec, prevEnd);
+    if (trimBusy_) return;
+    auto cycleSpd = [](StudioClipItem& c) {
+        if (c.speed < 0.75) c.speed = 1.0;
+        else if (c.speed < 1.25) c.speed = 1.5;
+        else if (c.speed < 1.75) c.speed = 2.0;
+        else c.speed = 0.5;
+    };
+    if (studioSelOverlay_ >= 0 && studioSelOverlay_ < static_cast<int>(studioOverlayClips_.size())) {
+        cycleSpd(studioOverlayClips_[static_cast<size_t>(studioSelOverlay_)]);
+    } else if (studioSelClip_ >= 0 && studioSelClip_ < static_cast<int>(studioClips_.size())) {
+        cycleSpd(studioClips_[static_cast<size_t>(studioSelClip_)]);
+        for (size_t j = static_cast<size_t>(studioSelClip_) + 1; j < studioClips_.size(); ++j) {
+            double prevEnd = std::max(0.0, studioClips_[j - 1].timelineStartSec) + ClipOutDur(studioClips_[j - 1]);
+            studioClips_[j].timelineStartSec = std::max(studioClips_[j].timelineStartSec, prevEnd);
+        }
+    } else {
+        return;
     }
     studioPlayheadSec_ = std::min(studioPlayheadSec_, StudioTotalDuration());
     SyncStudioMediaState(false);
@@ -1383,7 +2171,7 @@ void MainWindow::StudioCycleClipSpeed() {
 }
 
 void MainWindow::StudioTogglePlayPause() {
-    if (!studioOpen_ || trimBusy_ || studioClips_.empty()) return;
+    if (!studioOpen_ || trimBusy_ || (studioClips_.empty() && studioOverlayClips_.empty())) return;
     studioPlaying_ = !studioPlaying_;
     if (studioPlaying_) {
         double tot = StudioTotalDuration();
@@ -1393,6 +2181,8 @@ void MainWindow::StudioTogglePlayPause() {
     } else {
         studioGapLastTickMs_ = 0;
         if (studioPlayer_) studioPlayer_->Pause();
+        if (studioMicPlayer_) studioMicPlayer_->Pause();
+        if (studioOverlayPlayer_) studioOverlayPlayer_->Pause();
         if (studioMusicPlayer_) studioMusicPlayer_->Pause();
     }
     if (hwnd_) InvalidateRect(hwnd_, nullptr, FALSE);
@@ -1403,6 +2193,7 @@ void MainWindow::StudioSeekTimeline(double targetSec, bool syncAudio) {
     studioPlayheadSec_ = std::max(0.0, std::min(tot, targetSec));
     studioGapLastTickMs_ = studioPlaying_ ? GetTickCount64() : 0;
     SyncStudioVideoFrameRect();
+    SyncStudioFxOverlay();
     if (syncAudio) SyncStudioMediaState(true);
     if (hwnd_) InvalidateRect(hwnd_, nullptr, FALSE);
 }
@@ -1413,7 +2204,10 @@ void MainWindow::AdvancePastStudioClip(int curIdx) {
         studioGapLastTickMs_ = 0;
         studioPlayheadSec_ = StudioTotalDuration();
         if (studioPlayer_) studioPlayer_->Pause();
+        if (studioMicPlayer_) studioMicPlayer_->Pause();
+        if (studioOverlayPlayer_) studioOverlayPlayer_->Pause();
         if (studioMusicPlayer_) studioMusicPlayer_->Pause();
+        SyncStudioFxOverlay();
         return;
     }
     const auto& clip = studioClips_[static_cast<size_t>(curIdx)];
@@ -1428,6 +2222,7 @@ void MainWindow::AdvancePastStudioClip(int curIdx) {
             studioPlayheadSec_ = clipEndTl + 0.002;
             studioGapLastTickMs_ = GetTickCount64();
             if (studioPlayer_) studioPlayer_->Pause();
+            if (studioMicPlayer_) studioMicPlayer_->Pause();
             if (studioVideoHwnd_) ShowWindow(studioVideoHwnd_, SW_HIDE);
             SyncStudioMediaState(false);
         } else {
@@ -1435,46 +2230,74 @@ void MainWindow::AdvancePastStudioClip(int curIdx) {
             studioPlayheadSec_ = std::max(clipEndTl, nextClip.timelineStartSec) + 0.001;
             SyncStudioMediaState(true);
         }
+    } else if (StudioTotalDuration() > clipEndTl + 0.04) {
+        studioLoadedClipIdx_ = -1;
+        studioPlayheadSec_ = clipEndTl + 0.002;
+        studioGapLastTickMs_ = GetTickCount64();
+        if (studioPlayer_) studioPlayer_->Pause();
+        if (studioMicPlayer_) studioMicPlayer_->Pause();
+        if (studioVideoHwnd_) ShowWindow(studioVideoHwnd_, SW_HIDE);
+        SyncStudioMediaState(false);
     } else {
         studioPlaying_ = false;
         studioGapLastTickMs_ = 0;
         studioPlayheadSec_ = StudioTotalDuration();
         if (studioPlayer_) studioPlayer_->Pause();
+        if (studioMicPlayer_) studioMicPlayer_->Pause();
+        if (studioOverlayPlayer_) studioOverlayPlayer_->Pause();
         if (studioMusicPlayer_) studioMusicPlayer_->Pause();
+        SyncStudioFxOverlay();
         if (hwnd_) InvalidateRect(hwnd_, nullptr, FALSE);
     }
 }
 
 void MainWindow::StartStudioRender() {
-    if (trimBusy_ || studioClips_.empty()) return;
+    if (trimBusy_ || (studioClips_.empty() && studioOverlayClips_.empty())) return;
     if (trimThread_.joinable()) trimThread_.join();
 
     // Release preview players and waveform readers cleanly so source files have zero contention during encode
     StopStudioWaveformWorker();
     studioPlaying_ = false;
     ++studioGen_;
-    if (studioVideoCb_) { studioVideoCb_->Detach(); studioVideoCb_->Release(); studioVideoCb_ = nullptr; }
-    if (studioPlayer_) { studioPlayer_->Shutdown(); studioPlayer_->Release(); studioPlayer_ = nullptr; }
-    if (studioAudioCb_) { studioAudioCb_->Detach(); studioAudioCb_->Release(); studioAudioCb_ = nullptr; }
-    if (studioMusicPlayer_) { studioMusicPlayer_->Shutdown(); studioMusicPlayer_->Release(); studioMusicPlayer_ = nullptr; }
+    auto releasePlayer = [](StudioMpCallback*& cb, IMFPMediaPlayer*& mp) {
+        if (cb) { cb->Detach(); cb->Release(); cb = nullptr; }
+        if (mp) { mp->Shutdown(); mp->Release(); mp = nullptr; }
+    };
+    releasePlayer(studioVideoCb_, studioPlayer_);
+    releasePlayer(studioAudioCb_, studioMusicPlayer_);
+    releasePlayer(studioMicCb_, studioMicPlayer_);
+    releasePlayer(studioOverlayCb_, studioOverlayPlayer_);
     studioVideoReady_ = false;
     studioAudioReady_ = false;
+    studioMicReady_ = false;
+    studioOverlayReady_ = false;
     studioLoadedClipPath_.clear();
     studioLoadedMusicPath_.clear();
+    studioLoadedMicPath_.clear();
+    studioLoadedOverlayPath_.clear();
     studioAppliedVol_ = -1.0f;
     studioAppliedMute_ = -1;
     studioAppliedRate_ = -1.0f;
     studioAppliedMusVol_ = -1.0f;
+    studioAppliedMicVol_ = -1.0f;
+    studioAppliedMicMute_ = -1;
+    studioAppliedMicRate_ = -1.0f;
+    studioAppliedOverlayVol_ = -1.0f;
+    studioAppliedOverlayMute_ = -1;
+    studioAppliedOverlayRate_ = -1.0f;
     studioLastFxActive_ = false;
     if (studioVideoHwnd_) ShowWindow(studioVideoHwnd_, SW_HIDE);
+    if (studioOverlayVideoHwnd_) ShowWindow(studioOverlayVideoHwnd_, SW_HIDE);
+    SyncStudioFxOverlay();
 
     trimCancel_.store(false);
     trimBusy_ = true;
 
+    const std::wstring refPath = !studioClips_.empty() ? studioClips_[0].path : studioOverlayClips_[0].path;
     std::wstring outDir = app_.Config().outputDir;
     if (outDir.empty()) {
-        size_t sl = studioClips_[0].path.find_last_of(L"\\/");
-        if (sl != std::wstring::npos) outDir = studioClips_[0].path.substr(0, sl);
+        size_t sl = refPath.find_last_of(L"\\/");
+        if (sl != std::wstring::npos) outDir = refPath.substr(0, sl);
     }
     const std::wstring outPath = BuildMontageOutputPath(outDir);
 
@@ -1492,6 +2315,22 @@ void MainWindow::StartStudioRender() {
         ms.gameVolPct = c.gameVolPct;
         ms.micVolPct = c.micVolPct;
         ms.timelineStartSec = std::max(0.0, c.timelineStartSec);
+        ms.track = 0;
+        editSpec.montageSegments.push_back(std::move(ms));
+    }
+    for (const auto& ov : studioOverlayClips_) {
+        MontageSegmentSpec ms;
+        ms.path = ov.path;
+        ms.startSec = ov.trimStartSec;
+        ms.endSec = ov.trimEndSec;
+        ms.speed = ov.speed;
+        ms.gameVolPct = ov.gameVolPct;
+        ms.micVolPct = ov.micVolPct;
+        ms.timelineStartSec = std::max(0.0, ov.timelineStartSec);
+        ms.track = 1;
+        ms.centerX = ov.pipCenterX;
+        ms.centerY = ov.pipCenterY;
+        ms.scale = ov.pipScale;
         editSpec.montageSegments.push_back(std::move(ms));
     }
     for (const auto& m : studioMusic_) {
@@ -1554,22 +2393,22 @@ bool MainWindow::HandleStudioAppMessage(UINT msg, WPARAM /*wParam*/, LPARAM lPar
         auto* ev = reinterpret_cast<StudioMpEventMsg*>(lParam);
         if (ev) {
             if (ev->gen == studioGen_.load() && studioOpen_) {
-                if (!ev->isAudio && studioPlayer_) {
+                if (ev->role == 0 && studioPlayer_) {
                     if (ev->type == MFP_EVENT_TYPE_MEDIAITEM_SET) {
                         studioVideoReady_ = true;
                         int idx = studioLoadedClipIdx_;
                         if (idx >= 0 && idx < static_cast<int>(studioClips_.size())) {
                             const auto& c = studioClips_[static_cast<size_t>(idx)];
-                            float vol = std::max(0.0f, std::min(1.0f,
-                                static_cast<float>(c.hasMultiTrack ? std::max(c.gameVolPct, c.micVolPct) : c.gameVolPct) / 100.0f));
-                            bool mute = (c.gameVolPct == 0 && (!c.hasMultiTrack || c.micVolPct == 0));
+                            float gVol = 1.0f, mVol = 0.0f;
+                            bool gMute = false, mMute = true, splitMic = false;
+                            ComputeClipPreviewAudio(c, gVol, gMute, mVol, mMute, splitMic);
                             float wantRate = static_cast<float>(c.speed);
-                            studioPlayer_->SetVolume(vol);
-                            studioPlayer_->SetMute(mute ? TRUE : FALSE);
-                            studioPlayer_->SetRate(wantRate);
-                            studioAppliedVol_ = vol;
-                            studioAppliedMute_ = mute ? 1 : 0;
-                            studioAppliedRate_ = wantRate;
+                            studioPlayer_->SetVolume(gVol);
+                            studioPlayer_->SetMute(gMute ? TRUE : FALSE);
+                            studioAppliedVol_ = gVol;
+                            studioAppliedMute_ = gMute ? 1 : 0;
+                            studioAppliedRate_ = -1.0f;
+                            ApplyPlayerRateSafe(studioPlayer_, wantRate, studioAppliedRate_);
                         }
                         if (studioPendingSeekSec_ > 0.01) {
                             PROPVARIANT sp;
@@ -1594,6 +2433,8 @@ bool MainWindow::HandleStudioAppMessage(UINT msg, WPARAM /*wParam*/, LPARAM lPar
                         studioSeekPending_ = false;
                         studioIgnoreEndUntilMs_ = GetTickCount64() + 120;
                         if (!studioPlaying_) studioPlayer_->UpdateVideo();
+                    } else if (ev->type == MFP_EVENT_TYPE_RATE_SET) {
+                        studioIgnoreEndUntilMs_ = GetTickCount64() + 150;
                     } else if (ev->type == MFP_EVENT_TYPE_PLAYBACK_ENDED) {
                         if (studioVideoReady_ && !studioSeekPending_ && GetTickCount64() >= studioIgnoreEndUntilMs_) {
                             int curIdx = studioLoadedClipIdx_;
@@ -1607,12 +2448,15 @@ bool MainWindow::HandleStudioAppMessage(UINT msg, WPARAM /*wParam*/, LPARAM lPar
                                 studioPlaying_ = false;
                                 studioGapLastTickMs_ = 0;
                                 studioPlayheadSec_ = StudioTotalDuration();
+                                if (studioMicPlayer_) studioMicPlayer_->Pause();
+                                if (studioOverlayPlayer_) studioOverlayPlayer_->Pause();
                                 if (studioMusicPlayer_) studioMusicPlayer_->Pause();
+                                SyncStudioFxOverlay();
                                 if (hwnd_) InvalidateRect(hwnd_, nullptr, FALSE);
                             }
                         }
                     }
-                } else if (ev->isAudio && studioMusicPlayer_) {
+                } else if (ev->role == 1 && studioMusicPlayer_) {
                     if (ev->type == MFP_EVENT_TYPE_MEDIAITEM_SET) {
                         studioAudioReady_ = true;
                         studioMusicPlayer_->SetMute(FALSE);
@@ -1636,6 +2480,81 @@ bool MainWindow::HandleStudioAppMessage(UINT msg, WPARAM /*wParam*/, LPARAM lPar
                         if (studioPlaying_) studioMusicPlayer_->Play();
                         else studioMusicPlayer_->Pause();
                     }
+                } else if (ev->role == 2 && studioMicPlayer_) {
+                    if (ev->type == MFP_EVENT_TYPE_MEDIAITEM_SET) {
+                        studioMicReady_ = true;
+                        int idx = studioLoadedClipIdx_;
+                        if (idx >= 0 && idx < static_cast<int>(studioClips_.size())) {
+                            const auto& c = studioClips_[static_cast<size_t>(idx)];
+                            float gVol = 1.0f, mVol = 0.0f;
+                            bool gMute = false, mMute = true, splitMic = false;
+                            ComputeClipPreviewAudio(c, gVol, gMute, mVol, mMute, splitMic);
+                            studioMicPlayer_->SetVolume(mVol);
+                            studioMicPlayer_->SetMute(mMute ? TRUE : FALSE);
+                            studioAppliedMicVol_ = mVol;
+                            studioAppliedMicMute_ = mMute ? 1 : 0;
+                            studioAppliedMicRate_ = -1.0f;
+                            ApplyPlayerRateSafe(studioMicPlayer_, static_cast<float>(c.speed), studioAppliedMicRate_);
+                        }
+                        if (studioPendingMicSeekSec_ >= 0.0) {
+                            PROPVARIANT mp;
+                            PropVariantInit(&mp);
+                            mp.vt = VT_I8;
+                            mp.hVal.QuadPart = static_cast<LONGLONG>(studioPendingMicSeekSec_ * 1e7);
+                            studioMicPlayer_->SetPosition(MFP_POSITIONTYPE_100NS, &mp);
+                            PropVariantClear(&mp);
+                            studioPendingMicSeekSec_ = -1.0;
+                        }
+                        if (studioPlaying_) studioMicPlayer_->Play();
+                        else studioMicPlayer_->Pause();
+                    }
+                } else if (ev->role == 3 && studioOverlayPlayer_) {
+                    if (ev->type == MFP_EVENT_TYPE_MEDIAITEM_SET) {
+                        studioOverlayReady_ = true;
+                        int idx = studioLoadedOverlayIdx_;
+                        if (idx >= 0 && idx < static_cast<int>(studioOverlayClips_.size())) {
+                            const auto& ov = studioOverlayClips_[static_cast<size_t>(idx)];
+                            float vol = std::max(0.0f, std::min(1.0f,
+                                static_cast<float>(ov.hasMultiTrack ? std::max(ov.gameVolPct, ov.micVolPct) : ov.gameVolPct) / 100.0f));
+                            bool mute = (ov.gameVolPct <= 0 && (!ov.hasMultiTrack || ov.micVolPct <= 0));
+                            studioOverlayPlayer_->SetVolume(vol);
+                            studioOverlayPlayer_->SetMute(mute ? TRUE : FALSE);
+                            studioAppliedOverlayVol_ = vol;
+                            studioAppliedOverlayMute_ = mute ? 1 : 0;
+                            studioAppliedOverlayRate_ = -1.0f;
+                            ApplyPlayerRateSafe(studioOverlayPlayer_, static_cast<float>(ov.speed), studioAppliedOverlayRate_);
+                        }
+                        if (studioPendingOverlaySeekSec_ > 0.01) {
+                            PROPVARIANT op;
+                            PropVariantInit(&op);
+                            op.vt = VT_I8;
+                            op.hVal.QuadPart = static_cast<LONGLONG>(studioPendingOverlaySeekSec_ * 1e7);
+                            studioOverlaySeekPending_ = true;
+                            studioOverlayIgnoreEndUntilMs_ = GetTickCount64() + 500;
+                            if (FAILED(studioOverlayPlayer_->SetPosition(MFP_POSITIONTYPE_100NS, &op))) {
+                                studioOverlaySeekPending_ = false;
+                            }
+                            PropVariantClear(&op);
+                        } else {
+                            studioOverlaySeekPending_ = false;
+                            studioOverlayIgnoreEndUntilMs_ = GetTickCount64() + 180;
+                        }
+                        studioPendingOverlaySeekSec_ = -1.0;
+                        studioOverlayPlayer_->UpdateVideo();
+                        if (studioPlaying_) studioOverlayPlayer_->Play();
+                        else studioOverlayPlayer_->Pause();
+                    } else if (ev->type == MFP_EVENT_TYPE_POSITION_SET) {
+                        studioOverlaySeekPending_ = false;
+                        studioOverlayIgnoreEndUntilMs_ = GetTickCount64() + 120;
+                        if (!studioPlaying_) studioOverlayPlayer_->UpdateVideo();
+                    } else if (ev->type == MFP_EVENT_TYPE_RATE_SET) {
+                        studioOverlayIgnoreEndUntilMs_ = GetTickCount64() + 150;
+                    } else if (ev->type == MFP_EVENT_TYPE_PLAYBACK_ENDED) {
+                        if (studioOverlayReady_ && !studioOverlaySeekPending_ &&
+                            GetTickCount64() >= studioOverlayIgnoreEndUntilMs_) {
+                            studioOverlayPlayer_->Pause();
+                        }
+                    }
                 }
             }
             delete ev;
@@ -1650,6 +2569,12 @@ bool MainWindow::HandleStudioAppMessage(UINT msg, WPARAM /*wParam*/, LPARAM lPar
             if (wm->gen == studioGen_.load() && studioOpen_) {
                 if (!wm->isMusic) {
                     for (auto& c : studioClips_) {
+                        if (_wcsicmp(c.path.c_str(), wm->path.c_str()) == 0) {
+                            c.wavePeaks = wm->peaks;
+                            c.waveLoaded = true;
+                        }
+                    }
+                    for (auto& c : studioOverlayClips_) {
                         if (_wcsicmp(c.path.c_str(), wm->path.c_str()) == 0) {
                             c.wavePeaks = wm->peaks;
                             c.waveLoaded = true;
@@ -1994,7 +2919,7 @@ void MainWindow::PaintStudio(void* gPtr, int cw, int ch) {
             addBtnPx(ui::BTN_STU_EXIT, cw - S(236), S(9), S(84), S(30), L"← Çıkış",
                 Gc(24, 31, 48), Gc(40, 50, 76), Gc(64, 78, 108), true, true);
             addBtnPx(ui::BTN_STU_RENDER, cw - S(144), S(9), S(130), S(30), L"Montajı Oluştur",
-                Gc(16, 185, 129), Gc(5, 150, 105), Gc(110, 231, 183), !studioClips_.empty(), true);
+                Gc(16, 185, 129), Gc(5, 150, 105), Gc(110, 231, 183), !studioClips_.empty() || !studioOverlayClips_.empty(), true);
         }
     }
 
@@ -2042,7 +2967,7 @@ void MainWindow::PaintStudio(void* gPtr, int cw, int ch) {
                 FillRoundRect(g, (float)S(10), (float)(ry + S(8)), (float)S(3), (float)(rowH - S(22)), 1.5f, Gc(56, 189, 248, 170));
 
                 // Draw cached miniature thumbnail on far left of clip card
-                RECT thRc{ S(16), ry + S(6), S(76), ry + rowH - S(12) };
+                RECT thRc{ S(16), ry + S(6), S(68), ry + rowH - S(12) };
                 auto it = thumbBmps_.find(c.filePath);
                 if (it != thumbBmps_.end() && it->second) {
                     Gdiplus::Bitmap bmp(it->second, nullptr);
@@ -2055,14 +2980,16 @@ void MainWindow::PaintStudio(void* gPtr, int cw, int ch) {
 
                 std::wstring stem = BaseNameNoExt(c.fileName);
                 g.DrawString(stem.c_str(), -1, &fSmall,
-                    Gdiplus::RectF((float)S(81), (float)(ry + S(5)), (float)(gm.leftW - S(149)), (float)S(16)), &sfLeft, &brText);
+                    Gdiplus::RectF((float)S(72), (float)(ry + S(5)), (float)(gm.leftW - S(168)), (float)S(16)), &sfLeft, &brText);
                 wchar_t sub[48] = {};
                 swprintf(sub, 48, L"%.1f sn • %.0f MB", c.durationSeconds, static_cast<double>(c.fileSizeBytes) / (1024.0 * 1024.0));
                 g.DrawString(sub, -1, &fTiny,
-                    Gdiplus::RectF((float)S(81), (float)(ry + S(22)), (float)(gm.leftW - S(149)), (float)S(16)), &sfLeft, &brCyan);
+                    Gdiplus::RectF((float)S(72), (float)(ry + S(22)), (float)(gm.leftW - S(168)), (float)S(16)), &sfLeft, &brCyan);
 
-                addBtnPx(ui::BTN_STU_ADD_CLIP_BASE + ci, gm.leftW - S(62), ry + S(10), S(46), S(26), L"+ Ekle",
+                addBtnPx(ui::BTN_STU_ADD_CLIP_BASE + ci, gm.leftW - S(92), ry + S(10), S(40), S(26), L"+ V1",
                     Gc(37, 99, 235), Gc(59, 130, 246), Gc(96, 165, 250), !trimBusy_ && ci < 900, true);
+                addBtnPx(ui::BTN_STU_ADD_OVR_BASE + ci, gm.leftW - S(49), ry + S(10), S(35), S(26), L"+ V2",
+                    Gc(124, 58, 237), Gc(147, 51, 234), Gc(196, 181, 253), !trimBusy_ && ci < 900, true);
             }
         } else if (studioLeftTab_ == 1) {
             addBtnPx(ui::BTN_STU_PICK_MP3, S(12), bodyTop + S(2), gm.leftW - S(24), S(36), L"+ PC'den MP3 / Ses Ekle",
@@ -2170,19 +3097,23 @@ void MainWindow::PaintStudio(void* gPtr, int cw, int ch) {
             StrokeRoundRect(g, (float)px, (float)py, (float)pw, (float)ph, (float)S(12), Gc(52, 211, 153));
             g.DrawString(L"Anlık Klip Stüdyo render alıyor, lütfen bekleyin...", -1, &fBold,
                 Gdiplus::RectF((float)px, (float)py, (float)pw, (float)ph), &sfCenter, &brCyan);
-        } else if (studioClips_.empty()) {
+        } else if (studioClips_.empty() && studioOverlayClips_.empty()) {
             FillRoundRectGrad(g, (float)vx, (float)vy, (float)vw, (float)vh, (float)S(8), Gc(15, 20, 32), Gc(10, 14, 24));
             FillRoundRectGrad(g, (float)(vx + vw / 2 - S(22)), (float)(vy + vh / 2 - S(52)), (float)S(44), (float)S(44), (float)S(12),
                 Gc(59, 130, 246, 120), Gc(124, 58, 237, 120));
             g.DrawString(L"▶", -1, &fTitle,
                 Gdiplus::RectF((float)(vx + vw / 2 - S(22)), (float)(vy + vh / 2 - S(52)), (float)S(44), (float)S(44)), &sfCenter, &brText);
-            g.DrawString(L"Sol taraftan klip seçip '+ Ekle'ye basın\nÖnizleme burada canlı olarak oynatılacak.", -1, &fBold,
+            g.DrawString(L"Sol taraftan klip seçip '+ V1' veya '+ V2'ye basın\nÖnizleme burada canlı olarak oynatılacak.", -1, &fBold,
                 Gdiplus::RectF((float)vx, (float)(vy + S(14)), (float)vw, (float)(vh - S(14))), &sfCenter, &brMuted);
         } else {
             int chkIdx = -1;
             double chkLoc = 0.0, chkStart = 0.0;
             const bool inClipStage = MapTimelineToClip(studioPlayheadSec_, chkIdx, chkLoc, chkStart);
-            if (!inClipStage) {
+            int ovStageIdx = -1;
+            double ovStageLoc = 0.0, ovStageStart = 0.0;
+            const bool hasOvStage = MapTimelineToOverlayClip(studioPlayheadSec_, ovStageIdx, ovStageLoc, ovStageStart) && ovStageIdx >= 0;
+
+            if (!inClipStage && !hasOvStage) {
                 Gdiplus::Color gapCol = Gc(4, 6, 12);
                 if (activeFx && activeFx->type == MontageTransitionType::FlashWhite) {
                     double u = std::max(0.0, std::min(1.0, (studioPlayheadSec_ - (activeFx->timelineSec - activeFx->durationSec * 0.5)) / std::max(0.1, activeFx->durationSec)));
@@ -2201,24 +3132,69 @@ void MainWindow::PaintStudio(void* gPtr, int cw, int ch) {
                 g.DrawString(gtxt, -1, &fSmall,
                     Gdiplus::RectF((float)vx, (float)vy, (float)vw, (float)vh), &sfCenter, &brMuted);
             } else {
-                // Draw 4 outer corner resize L-brackets & knobs around video frame (always outside HWND)
-                auto drawCornerHandle = [&](int cornerId, float cx, float cy, float dirX, float dirY) {
-                    const bool activeCorner = (studioHoverStageCorner_ == cornerId) ||
-                                              (studioDragMode_ == 12 && static_cast<int>(std::lround(studioDragOrigD_)) == cornerId);
-                    Gdiplus::Color col = activeCorner ? Gc(251, 191, 36) : Gc(186, 230, 253, 215);
-                    Gdiplus::Pen pBr(col, activeCorner ? 3.2f : 2.2f);
-                    float arm = (float)S(10);
-                    float ox = cx - dirX * 3.0f;
-                    float oy = cy - dirY * 3.0f;
-                    g.DrawLine(&pBr, ox, oy, ox + dirX * arm, oy);
-                    g.DrawLine(&pBr, ox, oy, ox, oy + dirY * arm);
-                    float rad = activeCorner ? (float)S(4) : (float)S(3);
-                    FillRoundRect(g, ox - rad, oy - rad, rad * 2.0f, rad * 2.0f, rad * 0.5f, col);
-                };
-                drawCornerHandle(1, (float)vSubRc.left,  (float)vSubRc.top,    +1.0f, +1.0f);
-                drawCornerHandle(2, (float)vSubRc.right, (float)vSubRc.top,    -1.0f, +1.0f);
-                drawCornerHandle(3, (float)vSubRc.left,  (float)vSubRc.bottom, +1.0f, -1.0f);
-                drawCornerHandle(4, (float)vSubRc.right, (float)vSubRc.bottom, -1.0f, -1.0f);
+                if (!inClipStage) {
+                    FillRoundRect(g, (float)vx, (float)vy, (float)vw, (float)vh, (float)S(8), Gc(4, 6, 12));
+                    StrokeRoundRect(g, (float)vx, (float)vy, (float)vw, (float)vh, (float)S(8), Gc(52, 211, 153, 140), 1.4f);
+                } else {
+                    // Draw 4 outer corner resize L-brackets & knobs around V1 video frame
+                    auto drawCornerHandle = [&](int cornerId, float cx, float cy, float dirX, float dirY) {
+                        const bool activeCorner = (studioHoverStageCorner_ == cornerId) ||
+                                                  (studioDragMode_ == 12 && static_cast<int>(std::lround(studioDragOrigD_)) == cornerId);
+                        Gdiplus::Color col = activeCorner ? Gc(251, 191, 36) : Gc(186, 230, 253, 215);
+                        Gdiplus::Pen pBr(col, activeCorner ? 3.2f : 2.2f);
+                        float arm = (float)S(10);
+                        float ox = cx - dirX * 3.0f;
+                        float oy = cy - dirY * 3.0f;
+                        g.DrawLine(&pBr, ox, oy, ox + dirX * arm, oy);
+                        g.DrawLine(&pBr, ox, oy, ox, oy + dirY * arm);
+                        float rad = activeCorner ? (float)S(4) : (float)S(3);
+                        FillRoundRect(g, ox - rad, oy - rad, rad * 2.0f, rad * 2.0f, rad * 0.5f, col);
+                    };
+                    drawCornerHandle(1, (float)vSubRc.left,  (float)vSubRc.top,    +1.0f, +1.0f);
+                    drawCornerHandle(2, (float)vSubRc.right, (float)vSubRc.top,    -1.0f, +1.0f);
+                    drawCornerHandle(3, (float)vSubRc.left,  (float)vSubRc.bottom, +1.0f, -1.0f);
+                    drawCornerHandle(4, (float)vSubRc.right, (float)vSubRc.bottom, -1.0f, -1.0f);
+                }
+
+                if (hasOvStage) {
+                    const auto& ovC = studioOverlayClips_[static_cast<size_t>(ovStageIdx)];
+                    MontageFrameSpec ovF;
+                    ovF.scale = ovC.pipScale;
+                    ovF.centerX = ovC.pipCenterX;
+                    ovF.centerY = ovC.pipCenterY;
+                    const RECT oSubRc = CalcVideoSubRect(canvasRc, ovF);
+                    const bool ovSelNow = (studioSelOverlay_ == ovStageIdx) || (studioDragMode_ == 16);
+                    StrokeRoundRect(g, (float)(oSubRc.left - 2), (float)(oSubRc.top - 2),
+                        (float)((oSubRc.right - oSubRc.left) + 4), (float)((oSubRc.bottom - oSubRc.top) + 4),
+                        (float)S(6), ovSelNow ? Gc(52, 211, 153, 240) : Gc(16, 185, 129, 190), ovSelNow ? 2.4f : 1.6f);
+                    auto drawOvCorner = [&](int cid, float cx, float cy, float dirX, float dirY) {
+                        const bool act = (studioHoverStageCorner_ == cid) ||
+                                         (studioDragMode_ == 16 && static_cast<int>(std::lround(studioDragOrigD_)) == cid);
+                        Gdiplus::Color col = act ? Gc(251, 191, 36) : Gc(52, 211, 153, 235);
+                        Gdiplus::Pen pBr(col, act ? 3.2f : 2.2f);
+                        float arm = (float)S(9);
+                        float ox = cx - dirX * 3.0f;
+                        float oy = cy - dirY * 3.0f;
+                        g.DrawLine(&pBr, ox, oy, ox + dirX * arm, oy);
+                        g.DrawLine(&pBr, ox, oy, ox, oy + dirY * arm);
+                        float rad = act ? (float)S(4) : (float)S(3);
+                        FillRoundRect(g, ox - rad, oy - rad, rad * 2.0f, rad * 2.0f, rad * 0.5f, col);
+                    };
+                    drawOvCorner(101, (float)oSubRc.left,  (float)oSubRc.top,    +1.0f, +1.0f);
+                    drawOvCorner(102, (float)oSubRc.right, (float)oSubRc.top,    -1.0f, +1.0f);
+                    drawOvCorner(103, (float)oSubRc.left,  (float)oSubRc.bottom, +1.0f, -1.0f);
+                    drawOvCorner(104, (float)oSubRc.right, (float)oSubRc.bottom, -1.0f, -1.0f);
+
+                    wchar_t ovlbl[64] = {};
+                    swprintf(ovlbl, 64, L"⬒ V2 PiP %%%d", static_cast<int>(std::lround(ovC.pipScale * 100.0)));
+                    float owB = (float)S(102), ohB = (float)S(20);
+                    float oxB = static_cast<float>(oSubRc.left + S(4));
+                    float oyB = static_cast<float>(std::max<int>(gm.stageRc.top + S(2), oSubRc.top - S(22)));
+                    FillRoundRect(g, oxB, oyB, owB, ohB, 5.0f, Gc(10, 32, 26, 235));
+                    StrokeRoundRect(g, oxB, oyB, owB, ohB, 5.0f, Gc(52, 211, 153), 1.2f);
+                    Gdiplus::SolidBrush brEm(Gc(110, 231, 183));
+                    g.DrawString(ovlbl, -1, &fTiny, Gdiplus::RectF(oxB + 3.0f, oyB, owB - 6.0f, ohB), &sfCenter, &brEm);
+                }
             }
             if (activeFrm.scale < 0.995 || studioDragMode_ == 12) {
                 wchar_t frlbl[64] = {};
@@ -2260,6 +3236,7 @@ void MainWindow::PaintStudio(void* gPtr, int cw, int ch) {
         int bx = gm.leftW + S(10);
         int by = gm.toolY + S(5);
         bool hasClipSel = (studioSelClip_ >= 0 && studioSelClip_ < static_cast<int>(studioClips_.size()));
+        bool hasOvrSel = (studioSelOverlay_ >= 0 && studioSelOverlay_ < static_cast<int>(studioOverlayClips_.size()));
         bool hasMusSel = (studioSelMusic_ >= 0 && studioSelMusic_ < static_cast<int>(studioMusic_.size()));
         bool hasFxSel = (studioSelFx_ >= 0 && studioSelFx_ < static_cast<int>(studioTransitions_.size()));
         bool hasFrmSel = (studioSelFrame_ >= 0 && studioSelFrame_ < static_cast<int>(studioFrames_.size()));
@@ -2276,7 +3253,7 @@ void MainWindow::PaintStudio(void* gPtr, int cw, int ch) {
         addBtnPx(ui::BTN_STU_SPLIT, bx, by, S(60), S(26), L"✂ Böl",
             Gc(30, 41, 66), Gc(48, 64, 102), Gc(71, 85, 118), canSplit, true);
         addBtnPx(ui::BTN_STU_DELETE, bx + S(64), by, S(44), S(26), L"Sil",
-            Gc(127, 29, 29), Gc(185, 28, 28), Gc(248, 113, 113), !trimBusy_ && (hasClipSel || hasMusSel || hasFxSel || hasFrmSel), true);
+            Gc(127, 29, 29), Gc(185, 28, 28), Gc(248, 113, 113), !trimBusy_ && (hasClipSel || hasOvrSel || hasMusSel || hasFxSel || hasFrmSel), true);
         addBtnPx(ui::BTN_STU_MOVE_LEFT, bx + S(112), by, S(26), S(26), L"◀",
             Gc(26, 33, 50), Gc(40, 50, 76), Gc(56, 70, 104), !trimBusy_ && hasClipSel && studioSelClip_ > 0, true);
         addBtnPx(ui::BTN_STU_MOVE_RIGHT, bx + S(140), by, S(26), S(26), L"▶",
@@ -2284,15 +3261,22 @@ void MainWindow::PaintStudio(void* gPtr, int cw, int ch) {
             !trimBusy_ && hasClipSel && (studioSelClip_ + 1 < static_cast<int>(studioClips_.size())), true);
 
         wchar_t spdLbl[24] = L"Hız: 1.0x";
-        if (hasClipSel) swprintf(spdLbl, 24, L"Hız: %.1fx", studioClips_[static_cast<size_t>(studioSelClip_)].speed);
+        if (hasOvrSel) swprintf(spdLbl, 24, L"Hız: %.1fx", studioOverlayClips_[static_cast<size_t>(studioSelOverlay_)].speed);
+        else if (hasClipSel) swprintf(spdLbl, 24, L"Hız: %.1fx", studioClips_[static_cast<size_t>(studioSelClip_)].speed);
         addBtnPx(ui::BTN_STU_SPEED, bx + S(170), by, S(68), S(26), spdLbl,
-            Gc(26, 33, 50), Gc(40, 50, 76), Gc(56, 70, 104), !trimBusy_ && hasClipSel, true);
+            Gc(26, 33, 50), Gc(40, 50, 76), Gc(56, 70, 104), !trimBusy_ && (hasClipSel || hasOvrSel), true);
+        addBtnPx(ui::BTN_STU_TOGGLE_TRACK, bx + S(242), by, S(72), S(26),
+            hasOvrSel ? L"↓ V1'e" : L"↑ V2'ye",
+            hasOvrSel ? Gc(30, 58, 138) : Gc(14, 116, 144),
+            hasOvrSel ? Gc(37, 99, 235) : Gc(16, 185, 129),
+            hasOvrSel ? Gc(96, 165, 250) : Gc(52, 211, 153),
+            !trimBusy_ && (hasClipSel || hasOvrSel), true);
 
-        int tx = std::max(bx + S(248), (gm.leftW + cw) / 2 - S(92));
+        int tx = std::max(bx + S(320), (gm.leftW + cw) / 2 - S(72));
         addBtnPx(ui::BTN_STU_TO_START, tx, by, S(28), S(26), L"⏮",
-            Gc(26, 33, 50), Gc(40, 50, 76), Gc(56, 70, 104), !trimBusy_ && !studioClips_.empty(), true);
+            Gc(26, 33, 50), Gc(40, 50, 76), Gc(56, 70, 104), !trimBusy_ && (!studioClips_.empty() || !studioOverlayClips_.empty()), true);
         addBtnPx(ui::BTN_STU_PLAYPAUSE, tx + S(32), by, S(34), S(26), studioPlaying_ ? L"⏸" : L"▶",
-            Gc(37, 99, 235), Gc(59, 130, 246), Gc(96, 165, 250), !trimBusy_ && !studioClips_.empty(), true);
+            Gc(37, 99, 235), Gc(59, 130, 246), Gc(96, 165, 250), !trimBusy_ && (!studioClips_.empty() || !studioOverlayClips_.empty()), true);
         std::wstring timeDisp = FormatSecTenths(studioPlayheadSec_) + L" / " + FormatSecTenths(totalDur);
         g.DrawString(timeDisp.c_str(), -1, &fSmall,
             Gdiplus::RectF((float)(tx + S(72)), (float)by, (float)S(102), (float)S(26)), &sfLeft, &brText);
@@ -2362,11 +3346,14 @@ void MainWindow::PaintStudio(void* gPtr, int cw, int ch) {
             addBtnPx(ui::BTN_STU_MUS_FADEOUT, gm.musSlRc.right + S(130), mby, S(76), S(24),
                 m.fadeOut ? L"Çıkış Fade ✓" : L"Çıkış Fade",
                 m.fadeOut ? Gc(109, 40, 217) : Gc(26, 33, 50), Gc(124, 58, 237), Gc(167, 139, 250), !trimBusy_, true);
-        } else if (hasClipSel || !studioClips_.empty()) {
-            int ci = hasClipSel ? studioSelClip_ : 0;
-            const auto& c = studioClips_[static_cast<size_t>(ci)];
+        } else if (hasOvrSel || hasClipSel || !studioClips_.empty() || !studioOverlayClips_.empty()) {
+            const bool isOvAudio = hasOvrSel || (!hasClipSel && studioClips_.empty() && !studioOverlayClips_.empty());
+            int ci = isOvAudio ? (hasOvrSel ? studioSelOverlay_ : 0) : (hasClipSel ? studioSelClip_ : 0);
+            const auto& c = isOvAudio
+                ? studioOverlayClips_[static_cast<size_t>(ci)]
+                : studioClips_[static_cast<size_t>(ci)];
             wchar_t clbl[32] = {};
-            swprintf(clbl, 32, L"Klip #%d Ses:", ci + 1);
+            swprintf(clbl, 32, isOvAudio ? L"Üst #%d Ses:" : L"Klip #%d Ses:", ci + 1);
             g.DrawString(clbl, -1, &fTiny,
                 Gdiplus::RectF((float)bx, (float)mby, (float)S(72), (float)S(24)), &sfLeft, &brCyan);
 
@@ -2399,9 +3386,13 @@ void MainWindow::PaintStudio(void* gPtr, int cw, int ch) {
             if (hasFrmSel) usedRight = bx + S(464);
             else if (hasFxSel) usedRight = bx + S(450);
             else if (hasMusSel) usedRight = gm.musSlRc.right + S(214);
-            else if (hasClipSel || !studioClips_.empty()) {
-                int ci = hasClipSel ? studioSelClip_ : 0;
-                usedRight = studioClips_[static_cast<size_t>(ci)].hasMultiTrack
+            else if (hasOvrSel || hasClipSel || !studioClips_.empty() || !studioOverlayClips_.empty()) {
+                const bool isOvAudio = hasOvrSel || (!hasClipSel && studioClips_.empty() && !studioOverlayClips_.empty());
+                int ci = isOvAudio ? (hasOvrSel ? studioSelOverlay_ : 0) : (hasClipSel ? studioSelClip_ : 0);
+                const auto& c = isOvAudio
+                    ? studioOverlayClips_[static_cast<size_t>(ci)]
+                    : studioClips_[static_cast<size_t>(ci)];
+                usedRight = c.hasMultiTrack
                     ? (gm.micSlRc.right + S(48)) : (gm.gameSlRc.right + S(48));
             }
             int availR = cw - S(10) - usedRight;
@@ -2454,6 +3445,7 @@ void MainWindow::PaintStudio(void* gPtr, int cw, int ch) {
                 Gdiplus::RectF((float)S(38), (float)(top + S(5)), (float)(gm.hdrW - S(44)), (float)S(20)), &sfLeft, &brText);
             g.DrawLine(&pGrid, 0, top + h + S(2), cw, top + h + S(2));
         };
+        drawTrackHdr(gm.v2Top, gm.v2H, L"V2", L"Üst / PiP", Gc(16, 185, 129));
         drawTrackHdr(gm.v1Top, gm.v1H, L"V1", L"Video", Gc(37, 99, 235));
         drawTrackHdr(gm.a1Top, gm.a1H, L"A1", L"Klip Sesi", Gc(14, 116, 144));
         drawTrackHdr(gm.m1Top, gm.m1H, L"M1", L"MP3 / Müzik", Gc(124, 58, 237));
@@ -2509,6 +3501,82 @@ void MainWindow::PaintStudio(void* gPtr, int cw, int ch) {
         float trimBadgeX = 0.0f;
         int trimBadgeTrackY = gm.v1Top;
         std::wstring trimBadgeText;
+
+        // V2 Overlay / PiP Track Blocks (independent free placement overlapping V1)
+        if (studioOverlayClips_.empty()) {
+            g.DrawString(L"Üst katman (V2 / PiP) boş — Soldan '+ V2' ile veya '↑ V2'ye' butonuyla aynı anda oynayan ikinci klip ekleyin",
+                -1, &fTiny,
+                Gdiplus::RectF((float)(gm.tlViewRc.left + S(12)), (float)gm.v2Top,
+                    (float)std::max(S(200), static_cast<int>(gm.tlViewRc.right - gm.tlViewRc.left) - S(24)), (float)gm.v2H),
+                &sfLeft, &brMuted);
+        } else {
+            for (size_t i = 0; i < studioOverlayClips_.size(); ++i) {
+                const auto& ov = studioOverlayClips_[i];
+                double outDur = ClipOutDur(ov);
+                double drawStartSec = std::max(0.0, ov.timelineStartSec);
+                float bx = secToX(drawStartSec);
+                float bw = std::max<float>((float)S(14), static_cast<float>(outDur * studioPxPerSec_));
+                bool sel = (studioSelOverlay_ == static_cast<int>(i));
+                const bool isOvTrim = ((studioDragMode_ == 17 || studioDragMode_ == 18) && studioDragIdx_ == static_cast<int>(i));
+                const bool isOvMove = (studioDragMode_ == 19 && studioClipDragged_ && studioDragIdx_ == static_cast<int>(i));
+
+                FillRoundRectGrad(g, bx + 1.0f, (float)gm.v2Top, bw - 2.0f, (float)gm.v2H, (float)S(6),
+                    sel ? Gc(16, 120, 92) : Gc(14, 74, 58),
+                    sel ? Gc(10, 82, 64) : Gc(10, 48, 38));
+                if (bw >= S(36)) {
+                    auto it = thumbBmps_.find(ov.path);
+                    if (it != thumbBmps_.end() && it->second) {
+                        Gdiplus::Bitmap bmp(it->second, nullptr);
+                        Gdiplus::Region prevClip;
+                        g.GetClip(&prevClip);
+                        g.SetClip(Gdiplus::RectF(bx + 2.0f, (float)(gm.v2Top + 2), std::max(1.0f, bw - 4.0f), (float)(gm.v2H - 4)), Gdiplus::CombineModeIntersect);
+                        int tileW = std::max(S(44), (gm.v2H * 16) / 9);
+                        for (float ttx = bx + 2.0f; ttx < bx + bw - 2.0f; ttx += static_cast<float>(tileW + 2)) {
+                            g.DrawImage(&bmp, ttx, static_cast<Gdiplus::REAL>(gm.v2Top + 2),
+                                static_cast<Gdiplus::REAL>(tileW), static_cast<Gdiplus::REAL>(gm.v2H - 4));
+                        }
+                        g.SetClip(&prevClip);
+                        FillRoundRectGrad(g, bx + 2.0f, (float)(gm.v2Top + 2), bw - 4.0f, (float)(gm.v2H - 4), (float)S(5),
+                            Gc(10, 34, 28, 190), Gc(10, 44, 36, 135));
+                    }
+                }
+                StrokeRoundRect(g, bx + 1.0f, (float)gm.v2Top, bw - 2.0f, (float)gm.v2H, (float)S(6),
+                    sel ? Gc(52, 211, 153) : Gc(16, 185, 129, 150), sel ? 1.8f : 1.0f);
+
+                wchar_t ovTitle[160] = {};
+                swprintf(ovTitle, 160, L"⬒ #%zu %ls (%.1fx • %%%d)", i + 1, ov.name.c_str(),
+                    ov.speed, static_cast<int>(std::lround(ov.pipScale * 100.0)));
+                g.DrawString(ovTitle, -1, &fTiny,
+                    Gdiplus::RectF(bx + S(9), (float)(gm.v2Top + S(2)), std::max(8.0f, bw - S(18)), (float)(gm.v2H - S(4))),
+                    &sfLeft, &brText);
+
+                const bool activeOvL = (isOvTrim && studioDragMode_ == 17) ||
+                                       (studioHoverOverlayIdx_ == static_cast<int>(i) && studioHoverOverlaySide_ < 0);
+                const bool activeOvR = (isOvTrim && studioDragMode_ == 18) ||
+                                       (studioHoverOverlayIdx_ == static_cast<int>(i) && studioHoverOverlaySide_ > 0);
+                if (bw >= S(14)) {
+                    float gl = activeOvL ? (float)S(7) : (sel ? (float)S(5) : (float)S(4));
+                    float gr = activeOvR ? (float)S(7) : (sel ? (float)S(5) : (float)S(4));
+                    FillRoundRect(g, bx + 2.0f, (float)(gm.v2Top + S(4)), gl, (float)(gm.v2H - S(8)), 2.0f,
+                        activeOvL ? Gc(209, 250, 229) : (sel ? Gc(52, 211, 153) : Gc(110, 231, 183, 140)));
+                    FillRoundRect(g, bx + bw - 2.0f - gr, (float)(gm.v2Top + S(4)), gr, (float)(gm.v2H - S(8)), 2.0f,
+                        activeOvR ? Gc(209, 250, 229) : (sel ? Gc(52, 211, 153) : Gc(110, 231, 183, 140)));
+                }
+                if (isOvTrim || isOvMove) {
+                    hasTrimBadge = true;
+                    trimBadgeX = isOvTrim ? ((studioDragMode_ == 17) ? bx : (bx + bw)) : (bx + bw * 0.5f);
+                    trimBadgeTrackY = gm.v2Top;
+                    wchar_t ob[80] = {};
+                    if (isOvMove) {
+                        swprintf(ob, 80, L"Üst #%zu Konum: %ls", i + 1, FormatSecTenths(drawStartSec).c_str());
+                    } else {
+                        swprintf(ob, 80, L"Üst Kesim: %ls (%.1fs)",
+                            FormatSecTenths(studioDragMode_ == 17 ? ov.trimStartSec : ov.trimEndSec).c_str(), outDur);
+                    }
+                    trimBadgeText = ob;
+                }
+            }
+        }
 
         double prevClipEnd = 0.0;
         for (size_t i = 0; i < studioClips_.size(); ++i) {
@@ -2928,6 +3996,7 @@ bool MainWindow::OnStudioLButtonDown(int mx, int my) {
     // 1. Tool bar volume sliders
     bool hasMusSel = (studioSelMusic_ >= 0 && studioSelMusic_ < static_cast<int>(studioMusic_.size()));
     bool hasClipSel = (studioSelClip_ >= 0 && studioSelClip_ < static_cast<int>(studioClips_.size()));
+    bool hasOvrSel = (studioSelOverlay_ >= 0 && studioSelOverlay_ < static_cast<int>(studioOverlayClips_.size()));
     bool hasFxSel = (studioSelFx_ >= 0 && studioSelFx_ < static_cast<int>(studioTransitions_.size()));
     bool hasFrmSel = (studioSelFrame_ >= 0 && studioSelFrame_ < static_cast<int>(studioFrames_.size()));
     if (!hasFrmSel && !hasFxSel && hasMusSel && mx >= gm.musSlRc.left - S(4) && mx <= gm.musSlRc.right + S(4) && my >= gm.musSlRc.top - S(4) && my <= gm.musSlRc.bottom + S(4)) {
@@ -2939,36 +4008,73 @@ bool MainWindow::OnStudioLButtonDown(int mx, int my) {
         InvalidateRect(hwnd_, nullptr, FALSE);
         return true;
     }
-    if (!hasFrmSel && !hasFxSel && !hasMusSel && (hasClipSel || !studioClips_.empty())) {
-        int ci = hasClipSel ? studioSelClip_ : 0;
-        studioSelClip_ = ci;
+    if (!hasFrmSel && !hasFxSel && !hasMusSel && (hasOvrSel || hasClipSel || !studioClips_.empty() || !studioOverlayClips_.empty())) {
+        const bool isOvAudio = hasOvrSel || (!hasClipSel && studioClips_.empty() && !studioOverlayClips_.empty());
+        int ci = isOvAudio ? (hasOvrSel ? studioSelOverlay_ : 0) : (hasClipSel ? studioSelClip_ : 0);
+        auto& targetVec = isOvAudio ? studioOverlayClips_ : studioClips_;
         if (mx >= gm.gameSlRc.left - S(4) && mx <= gm.gameSlRc.right + S(4) && my >= gm.gameSlRc.top - S(4) && my <= gm.gameSlRc.bottom + S(4)) {
+            if (isOvAudio) { studioSelOverlay_ = ci; studioSelClip_ = -1; }
+            else { studioSelClip_ = ci; studioSelOverlay_ = -1; }
             studioDragMode_ = 7;
             studioDragIdx_ = ci;
+            studioDragOrigA_ = isOvAudio ? 1.0 : 0.0;
             SetCapture(hwnd_);
             double r = std::max(0.0, std::min(1.0, static_cast<double>(mx - gm.gameSlRc.left) / std::max(1L, gm.gameSlRc.right - gm.gameSlRc.left)));
-            studioClips_[static_cast<size_t>(ci)].gameVolPct = static_cast<int>(std::lround(r * 200.0));
+            targetVec[static_cast<size_t>(ci)].gameVolPct = static_cast<int>(std::lround(r * 200.0));
             SyncStudioMediaState(false);
             InvalidateRect(hwnd_, nullptr, FALSE);
             return true;
         }
-        if (studioClips_[static_cast<size_t>(ci)].hasMultiTrack &&
+        if (targetVec[static_cast<size_t>(ci)].hasMultiTrack &&
             mx >= gm.micSlRc.left - S(4) && mx <= gm.micSlRc.right + S(4) && my >= gm.micSlRc.top - S(4) && my <= gm.micSlRc.bottom + S(4)) {
+            if (isOvAudio) { studioSelOverlay_ = ci; studioSelClip_ = -1; }
+            else { studioSelClip_ = ci; studioSelOverlay_ = -1; }
             studioDragMode_ = 8;
             studioDragIdx_ = ci;
+            studioDragOrigA_ = isOvAudio ? 1.0 : 0.0;
             SetCapture(hwnd_);
             double r = std::max(0.0, std::min(1.0, static_cast<double>(mx - gm.micSlRc.left) / std::max(1L, gm.micSlRc.right - gm.micSlRc.left)));
-            studioClips_[static_cast<size_t>(ci)].micVolPct = static_cast<int>(std::lround(r * 200.0));
+            targetVec[static_cast<size_t>(ci)].micVolPct = static_cast<int>(std::lround(r * 200.0));
             SyncStudioMediaState(false);
             InvalidateRect(hwnd_, nullptr, FALSE);
             return true;
         }
     }
 
-    // 1b. Preview Stage corner resize / shrunk frame move handles
+    // 1b. Preview Stage corner resize / shrunk frame / V2 PiP move handles
     if (mx >= gm.leftW && my >= gm.topH && my < gm.toolY) {
         int stH = StudioHitTestStageHandle(mx, my, cli.right, cli.bottom);
-        if (stH != 0) {
+        if (stH >= 101 && stH <= 105) {
+            int ovIdx = -1; double ovLoc = 0.0, ovStart = 0.0;
+            if (MapTimelineToOverlayClip(studioPlayheadSec_, ovIdx, ovLoc, ovStart) && ovIdx >= 0) {
+                const auto& ov = studioOverlayClips_[static_cast<size_t>(ovIdx)];
+                studioSelOverlay_ = ovIdx;
+                studioSelClip_ = -1;
+                studioSelMusic_ = -1;
+                studioSelFx_ = -1;
+                studioSelFrame_ = -1;
+                studioDragIdx_ = ovIdx;
+                studioDragMode_ = 16;
+                studioDragStartX_ = mx;
+                studioDragStartY_ = my;
+                studioDragOrigA_ = ov.pipScale;
+                studioDragOrigB_ = ov.pipCenterX;
+                studioDragOrigC_ = ov.pipCenterY;
+                studioDragOrigD_ = static_cast<double>(stH);
+                studioStageBodyDragged_ = false;
+                if (stH != 105 && studioPlaying_) {
+                    studioPlaying_ = false;
+                    if (studioPlayer_) studioPlayer_->Pause();
+                    if (studioMicPlayer_) studioMicPlayer_->Pause();
+                    if (studioOverlayPlayer_) studioOverlayPlayer_->Pause();
+                    if (studioMusicPlayer_) studioMusicPlayer_->Pause();
+                    studioGapLastTickMs_ = 0;
+                }
+                SetCapture(hwnd_);
+                InvalidateRect(hwnd_, nullptr, FALSE);
+                return true;
+            }
+        } else if (stH != 0) {
             int cIdx = -1; double cLoc = 0.0, cStart = 0.0;
             if (MapTimelineToClip(studioPlayheadSec_, cIdx, cLoc, cStart) && cIdx >= 0) {
                 int fIdx = -1;
@@ -2997,6 +4103,7 @@ bool MainWindow::OnStudioLButtonDown(int mx, int my) {
                 const auto& fr = studioFrames_[static_cast<size_t>(fIdx)];
                 studioSelFrame_ = fIdx;
                 studioSelClip_ = -1;
+                studioSelOverlay_ = -1;
                 studioSelMusic_ = -1;
                 studioSelFx_ = -1;
                 studioDragIdx_ = fIdx;
@@ -3011,6 +4118,8 @@ bool MainWindow::OnStudioLButtonDown(int mx, int my) {
                 if (stH != 5 && studioPlaying_) {
                     studioPlaying_ = false;
                     if (studioPlayer_) studioPlayer_->Pause();
+                    if (studioMicPlayer_) studioMicPlayer_->Pause();
+                    if (studioOverlayPlayer_) studioOverlayPlayer_->Pause();
                     if (studioMusicPlayer_) studioMusicPlayer_->Pause();
                     studioGapLastTickMs_ = 0;
                 }
@@ -3034,6 +4143,7 @@ bool MainWindow::OnStudioLButtonDown(int mx, int my) {
         if (fxHit >= 0 && fxHit < static_cast<int>(studioTransitions_.size())) {
             studioSelFx_ = fxHit;
             studioSelClip_ = -1;
+            studioSelOverlay_ = -1;
             studioSelMusic_ = -1;
             studioSelFrame_ = -1;
             studioDragIdx_ = fxHit;
@@ -3052,6 +4162,7 @@ bool MainWindow::OnStudioLButtonDown(int mx, int my) {
             const auto& fr = studioFrames_[static_cast<size_t>(fBarIdx)];
             studioSelFrame_ = fBarIdx;
             studioSelClip_ = -1;
+            studioSelOverlay_ = -1;
             studioSelMusic_ = -1;
             studioSelFx_ = -1;
             studioDragIdx_ = fBarIdx;
@@ -3074,6 +4185,7 @@ bool MainWindow::OnStudioLButtonDown(int mx, int my) {
                 studioDragOrigStarts_.clear();
                 for (const auto& sc : studioClips_) studioDragOrigStarts_.push_back(std::max(0.0, sc.timelineStartSec));
                 studioSelClip_ = hIdx;
+                studioSelOverlay_ = -1;
                 studioSelMusic_ = -1;
                 studioSelFx_ = -1;
                 studioSelFrame_ = -1;
@@ -3093,10 +4205,36 @@ bool MainWindow::OnStudioLButtonDown(int mx, int my) {
                 InvalidateRect(hwnd_, nullptr, FALSE);
                 return true;
             }
+            if (hKind == 3 && hIdx >= 0 && hIdx < static_cast<int>(studioOverlayClips_.size())) {
+                const auto& ov = studioOverlayClips_[static_cast<size_t>(hIdx)];
+                double outDur = ClipOutDur(ov);
+                double oStart = std::max(0.0, ov.timelineStartSec);
+                studioSelOverlay_ = hIdx;
+                studioSelClip_ = -1;
+                studioSelMusic_ = -1;
+                studioSelFx_ = -1;
+                studioSelFrame_ = -1;
+                studioDragMode_ = (hSide < 0) ? 17 : 18;
+                studioDragIdx_ = hIdx;
+                studioDragStartX_ = mx;
+                studioDragOrigA_ = (hSide < 0) ? ov.trimStartSec : ov.trimEndSec;
+                studioDragOrigB_ = oStart;
+                studioDragOrigC_ = outDur;
+                studioClipDragged_ = false;
+                studioPlaying_ = false;
+                studioGapLastTickMs_ = 0;
+                studioPlayheadSec_ = (hSide < 0) ? oStart : (oStart + std::max(0.02, outDur - 0.04));
+                SetCapture(hwnd_);
+                SetCursor(LoadCursorW(nullptr, IDC_SIZEWE));
+                SyncStudioMediaState(true);
+                InvalidateRect(hwnd_, nullptr, FALSE);
+                return true;
+            }
             if (hKind == 2 && hIdx >= 0 && hIdx < static_cast<int>(studioMusic_.size())) {
                 const auto& m = studioMusic_[static_cast<size_t>(hIdx)];
                 studioSelMusic_ = hIdx;
                 studioSelClip_ = -1;
+                studioSelOverlay_ = -1;
                 studioSelFx_ = -1;
                 studioSelFrame_ = -1;
                 studioDragIdx_ = hIdx;
@@ -3121,6 +4259,35 @@ bool MainWindow::OnStudioLButtonDown(int mx, int my) {
             return true;
         }
 
+        // Check V2 overlay clip body selection + free horizontal placement (or click to seek)
+        if (my >= gm.v2Top && my <= gm.v2Top + gm.v2H) {
+            for (size_t i = 0; i < studioOverlayClips_.size(); ++i) {
+                const auto& ov = studioOverlayClips_[i];
+                double cStart = std::max(0.0, ov.timelineStartSec);
+                double outDur = ClipOutDur(ov);
+                int x0 = secToX(cStart);
+                int x1 = secToX(cStart + outDur);
+                int visX1 = std::max(x0 + S(16), x1);
+                if (mx >= x0 && mx <= visX1) {
+                    studioSelOverlay_ = static_cast<int>(i);
+                    studioSelClip_ = -1;
+                    studioSelMusic_ = -1;
+                    studioSelFx_ = -1;
+                    studioSelFrame_ = -1;
+                    studioDragIdx_ = static_cast<int>(i);
+                    studioDragStartX_ = mx;
+                    studioDragOrigA_ = cStart;
+                    studioDragOrigB_ = xToSec(mx);
+                    studioDragOrigC_ = outDur;
+                    studioClipDragged_ = false;
+                    studioDragMode_ = 19;
+                    SetCapture(hwnd_);
+                    InvalidateRect(hwnd_, nullptr, FALSE);
+                    return true;
+                }
+            }
+        }
+
         // Check V1 & A1 clip body selection + press-and-drag horizontal placement (or click to seek)
         if (my >= gm.v1Top && my <= gm.a1Top + gm.a1H) {
             for (size_t i = 0; i < studioClips_.size(); ++i) {
@@ -3132,6 +4299,7 @@ bool MainWindow::OnStudioLButtonDown(int mx, int my) {
                 int visX1 = std::max(x0 + S(16), x1);
                 if (mx >= x0 && mx <= visX1) {
                     studioSelClip_ = static_cast<int>(i);
+                    studioSelOverlay_ = -1;
                     studioSelMusic_ = -1;
                     studioSelFx_ = -1;
                     studioSelFrame_ = -1;
@@ -3160,6 +4328,7 @@ bool MainWindow::OnStudioLButtonDown(int mx, int my) {
                 if (mx >= x0 - S(2) && mx <= x1 + S(2)) {
                     studioSelMusic_ = static_cast<int>(i);
                     studioSelClip_ = -1;
+                    studioSelOverlay_ = -1;
                     studioSelFx_ = -1;
                     studioSelFrame_ = -1;
                     studioDragIdx_ = static_cast<int>(i);
@@ -3221,14 +4390,19 @@ bool MainWindow::OnStudioMouseMove(int mx, int my) {
         int newCSide = (hKind == 1) ? hSide : 0;
         int newMIdx = (hKind == 2) ? hIdx : -1;
         int newMSide = (hKind == 2) ? hSide : 0;
+        int newOIdx = (hKind == 3) ? hIdx : -1;
+        int newOSide = (hKind == 3) ? hSide : 0;
         if (newCIdx != studioHoverClipIdx_ || newCSide != studioHoverClipSide_ ||
             newMIdx != studioHoverMusicIdx_ || newMSide != studioHoverMusicSide_ ||
+            newOIdx != studioHoverOverlayIdx_ || newOSide != studioHoverOverlaySide_ ||
             newFxHov != studioHoverFxIdx_ || newFrmIdx != studioHoverFrameIdx_ ||
             newFrmSide != studioHoverFrameSide_ || newStageCorner != studioHoverStageCorner_) {
             studioHoverClipIdx_ = newCIdx;
             studioHoverClipSide_ = newCSide;
             studioHoverMusicIdx_ = newMIdx;
             studioHoverMusicSide_ = newMSide;
+            studioHoverOverlayIdx_ = newOIdx;
+            studioHoverOverlaySide_ = newOSide;
             studioHoverFxIdx_ = newFxHov;
             studioHoverFrameIdx_ = newFrmIdx;
             studioHoverFrameSide_ = newFrmSide;
@@ -3268,6 +4442,7 @@ bool MainWindow::OnStudioMouseMove(int mx, int my) {
         bool doScrub = (now - studioLastScrubMs_ >= 85);
         if (doScrub) studioLastScrubMs_ = now;
         StudioSeekTimeline(target, doScrub);
+        if (!doScrub) SyncStudioFxOverlay();
         return true;
     }
     if (studioDragMode_ == 2 && studioDragIdx_ >= 0 && studioDragIdx_ < static_cast<int>(studioClips_.size())) {
@@ -3321,6 +4496,8 @@ bool MainWindow::OnStudioMouseMove(int mx, int my) {
             if (studioPlaying_) {
                 studioPlaying_ = false;
                 if (studioPlayer_) studioPlayer_->Pause();
+                if (studioMicPlayer_) studioMicPlayer_->Pause();
+                if (studioOverlayPlayer_) studioOverlayPlayer_->Pause();
                 if (studioMusicPlayer_) studioMusicPlayer_->Pause();
             }
             studioGapLastTickMs_ = 0;
@@ -3392,6 +4569,8 @@ bool MainWindow::OnStudioMouseMove(int mx, int my) {
                 if (studioPlaying_) {
                     studioPlaying_ = false;
                     if (studioPlayer_) studioPlayer_->Pause();
+                    if (studioMicPlayer_) studioMicPlayer_->Pause();
+                    if (studioOverlayPlayer_) studioOverlayPlayer_->Pause();
                     if (studioMusicPlayer_) studioMusicPlayer_->Pause();
                 }
                 studioGapLastTickMs_ = 0;
@@ -3502,18 +4681,147 @@ bool MainWindow::OnStudioMouseMove(int mx, int my) {
         InvalidateRect(hwnd_, nullptr, FALSE);
         return true;
     }
-    if (studioDragMode_ == 7 && studioDragIdx_ >= 0 && studioDragIdx_ < static_cast<int>(studioClips_.size())) {
-        double r = std::max(0.0, std::min(1.0, static_cast<double>(mx - gm.gameSlRc.left) / std::max(1L, gm.gameSlRc.right - gm.gameSlRc.left)));
-        studioClips_[static_cast<size_t>(studioDragIdx_)].gameVolPct = static_cast<int>(std::lround(r * 200.0));
-        SyncStudioMediaState(false);
+    if (studioDragMode_ == 16 && studioDragIdx_ >= 0 && studioDragIdx_ < static_cast<int>(studioOverlayClips_.size())) {
+        auto& ov = studioOverlayClips_[static_cast<size_t>(studioDragIdx_)];
+        const RECT canvasRc = CalcStageCanvasRect(gm, studioVertical916_, static_cast<int>(dpi_));
+        const double dnx = static_cast<double>(mx - studioDragStartX_) / std::max<int>(1, canvasRc.right - canvasRc.left);
+        const double dny = static_cast<double>(my - studioDragStartY_) / std::max<int>(1, canvasRc.bottom - canvasRc.top);
+        const int corner = static_cast<int>(std::lround(studioDragOrigD_)) - 100;
+        const double origS = studioDragOrigA_;
+        const double origX = studioDragOrigB_;
+        const double origY = studioDragOrigC_;
+        if (corner == 5) {
+            if (!studioStageBodyDragged_ && std::abs(mx - studioDragStartX_) < S(4) && std::abs(my - studioDragStartY_) < S(4)) {
+                return true;
+            }
+            if (!studioStageBodyDragged_) {
+                studioStageBodyDragged_ = true;
+                if (studioPlaying_) {
+                    studioPlaying_ = false;
+                    if (studioPlayer_) studioPlayer_->Pause();
+                    if (studioMicPlayer_) studioMicPlayer_->Pause();
+                    if (studioOverlayPlayer_) studioOverlayPlayer_->Pause();
+                    if (studioMusicPlayer_) studioMusicPlayer_->Pause();
+                }
+                studioGapLastTickMs_ = 0;
+            }
+            const double half = ov.pipScale * 0.5;
+            double cx = std::max(half, std::min(1.0 - half, origX + dnx));
+            double cy = std::max(half, std::min(1.0 - half, origY + dny));
+            if (std::abs(cx - 0.5) < 0.025) cx = 0.5;
+            if (std::abs(cy - 0.5) < 0.025) cy = 0.5;
+            ov.pipCenterX = cx;
+            ov.pipCenterY = cy;
+        } else if (corner >= 1 && corner <= 4) {
+            const double origL = origX - origS * 0.5;
+            const double origR = origX + origS * 0.5;
+            const double origT = origY - origS * 0.5;
+            const double origB = origY + origS * 0.5;
+            const double signX = (corner == 1 || corner == 3) ? -1.0 : +1.0;
+            const double signY = (corner == 1 || corner == 2) ? -1.0 : +1.0;
+            const double anchorX = (signX > 0.0) ? origL : origR;
+            const double anchorY = (signY > 0.0) ? origT : origB;
+            const double maxS = std::min((signX > 0.0) ? (1.0 - anchorX) : anchorX,
+                                         (signY > 0.0) ? (1.0 - anchorY) : anchorY);
+            const double newS = std::max(0.15, std::min(maxS, origS + (signX * dnx + signY * dny) * 0.5));
+            if (newS >= 0.985 && maxS >= 0.99) {
+                ov.pipScale = 1.0;
+                ov.pipCenterX = 0.5;
+                ov.pipCenterY = 0.5;
+            } else {
+                ov.pipScale = newS;
+                ov.pipCenterX = anchorX + signX * newS * 0.5;
+                ov.pipCenterY = anchorY + signY * newS * 0.5;
+            }
+        }
+        SyncStudioVideoFrameRect();
         InvalidateRect(hwnd_, nullptr, FALSE);
         return true;
     }
-    if (studioDragMode_ == 8 && studioDragIdx_ >= 0 && studioDragIdx_ < static_cast<int>(studioClips_.size())) {
-        double r = std::max(0.0, std::min(1.0, static_cast<double>(mx - gm.micSlRc.left) / std::max(1L, gm.micSlRc.right - gm.micSlRc.left)));
-        studioClips_[static_cast<size_t>(studioDragIdx_)].micVolPct = static_cast<int>(std::lround(r * 200.0));
-        SyncStudioMediaState(false);
+    if (studioDragMode_ == 17 && studioDragIdx_ >= 0 && studioDragIdx_ < static_cast<int>(studioOverlayClips_.size())) {
+        auto& ov = studioOverlayClips_[static_cast<size_t>(studioDragIdx_)];
+        const double origEnd = studioDragOrigB_ + studioDragOrigC_;
+        const double minTrimByStart = std::max(0.0, ov.trimEndSec - origEnd * std::max(0.5, ov.speed));
+        double dt = (static_cast<double>(mx - studioDragStartX_) / studioPxPerSec_) * ov.speed;
+        ov.trimStartSec = std::max(minTrimByStart, std::min(ov.trimEndSec - 0.25, studioDragOrigA_ + dt));
+        double newOutDur = ClipOutDur(ov);
+        ov.timelineStartSec = std::max(0.0, origEnd - newOutDur);
+        autoPanDrag(ov.timelineStartSec, ov.timelineStartSec + newOutDur);
+        studioPlayheadSec_ = ov.timelineStartSec;
+        ULONGLONG now = GetTickCount64();
+        if (now - studioLastScrubMs_ >= 75) { studioLastScrubMs_ = now; SyncStudioMediaState(true); }
         InvalidateRect(hwnd_, nullptr, FALSE);
+        return true;
+    }
+    if (studioDragMode_ == 18 && studioDragIdx_ >= 0 && studioDragIdx_ < static_cast<int>(studioOverlayClips_.size())) {
+        auto& ov = studioOverlayClips_[static_cast<size_t>(studioDragIdx_)];
+        double dt = (static_cast<double>(mx - studioDragStartX_) / studioPxPerSec_) * ov.speed;
+        ov.trimEndSec = std::min(ov.sourceDurSec, std::max(ov.trimStartSec + 0.25, studioDragOrigA_ + dt));
+        ov.timelineStartSec = studioDragOrigB_;
+        double outDur = ClipOutDur(ov);
+        autoPanDrag(ov.timelineStartSec, ov.timelineStartSec + outDur);
+        studioPlayheadSec_ = ov.timelineStartSec + std::max(0.02, outDur - 0.04);
+        ULONGLONG now = GetTickCount64();
+        if (now - studioLastScrubMs_ >= 75) { studioLastScrubMs_ = now; SyncStudioMediaState(true); }
+        InvalidateRect(hwnd_, nullptr, FALSE);
+        return true;
+    }
+    if (studioDragMode_ == 19 && studioDragIdx_ >= 0 && studioDragIdx_ < static_cast<int>(studioOverlayClips_.size())) {
+        if (!studioClipDragged_ && std::abs(mx - studioDragStartX_) < S(4)) {
+            return true;
+        }
+        if (!studioClipDragged_) {
+            studioClipDragged_ = true;
+            if (studioPlaying_) {
+                studioPlaying_ = false;
+                if (studioPlayer_) studioPlayer_->Pause();
+                if (studioMicPlayer_) studioMicPlayer_->Pause();
+                if (studioOverlayPlayer_) studioOverlayPlayer_->Pause();
+                if (studioMusicPlayer_) studioMusicPlayer_->Pause();
+            }
+            studioGapLastTickMs_ = 0;
+        }
+        auto& ov = studioOverlayClips_[static_cast<size_t>(studioDragIdx_)];
+        const double outDur = ClipOutDur(ov);
+        double dt = static_cast<double>(mx - studioDragStartX_) / studioPxPerSec_;
+        double cand = std::max(0.0, studioDragOrigA_ + dt);
+        const double snapThresh = std::min(1.5, 8.0 / studioPxPerSec_);
+        if (std::abs(cand - 0.0) < snapThresh) cand = 0.0;
+        else if (std::abs(cand - studioPlayheadSec_) < snapThresh) cand = studioPlayheadSec_;
+        else if (std::abs((cand + outDur) - studioPlayheadSec_) < snapThresh) cand = std::max(0.0, studioPlayheadSec_ - outDur);
+        else {
+            for (const auto& c : studioClips_) {
+                double cs = std::max(0.0, c.timelineStartSec);
+                double ce = cs + ClipOutDur(c);
+                if (std::abs(cand - cs) < snapThresh) { cand = cs; break; }
+                if (std::abs(cand - ce) < snapThresh) { cand = ce; break; }
+                if (std::abs((cand + outDur) - ce) < snapThresh) { cand = std::max(0.0, ce - outDur); break; }
+            }
+        }
+        ov.timelineStartSec = cand;
+        autoPanDrag(cand, cand + outDur);
+        SetCursor(LoadCursorW(nullptr, IDC_SIZEALL));
+        InvalidateRect(hwnd_, nullptr, FALSE);
+        return true;
+    }
+    if (studioDragMode_ == 7 && studioDragIdx_ >= 0) {
+        auto& vec = (studioDragOrigA_ >= 0.5) ? studioOverlayClips_ : studioClips_;
+        if (studioDragIdx_ < static_cast<int>(vec.size())) {
+            double r = std::max(0.0, std::min(1.0, static_cast<double>(mx - gm.gameSlRc.left) / std::max(1L, gm.gameSlRc.right - gm.gameSlRc.left)));
+            vec[static_cast<size_t>(studioDragIdx_)].gameVolPct = static_cast<int>(std::lround(r * 200.0));
+            SyncStudioMediaState(false);
+            InvalidateRect(hwnd_, nullptr, FALSE);
+        }
+        return true;
+    }
+    if (studioDragMode_ == 8 && studioDragIdx_ >= 0) {
+        auto& vec = (studioDragOrigA_ >= 0.5) ? studioOverlayClips_ : studioClips_;
+        if (studioDragIdx_ < static_cast<int>(vec.size())) {
+            double r = std::max(0.0, std::min(1.0, static_cast<double>(mx - gm.micSlRc.left) / std::max(1L, gm.micSlRc.right - gm.micSlRc.left)));
+            vec[static_cast<size_t>(studioDragIdx_)].micVolPct = static_cast<int>(std::lround(r * 200.0));
+            SyncStudioMediaState(false);
+            InvalidateRect(hwnd_, nullptr, FALSE);
+        }
         return true;
     }
     if (studioDragMode_ == 9 && studioSelMusic_ >= 0 && studioSelMusic_ < static_cast<int>(studioMusic_.size())) {
@@ -3537,6 +4845,8 @@ bool MainWindow::OnStudioLButtonUp(int mx, int my) {
         studioDragIdx_ = -1;
         studioHoverClipIdx_ = -1;
         studioHoverClipSide_ = 0;
+        studioHoverOverlayIdx_ = -1;
+        studioHoverOverlaySide_ = 0;
         studioHoverMusicIdx_ = -1;
         studioHoverMusicSide_ = 0;
         studioHoverFxIdx_ = -1;
@@ -3544,7 +4854,16 @@ bool MainWindow::OnStudioLButtonUp(int mx, int my) {
         studioHoverFrameSide_ = 0;
         studioHoverStageCorner_ = 0;
         ReleaseCapture();
-        if (m == 12 && dIdx >= 0 && dIdx < static_cast<int>(studioFrames_.size())) {
+        if (m == 16 && dIdx >= 0 && dIdx < static_cast<int>(studioOverlayClips_.size())) {
+            const int stHandle = static_cast<int>(std::lround(studioDragOrigD_));
+            const bool wasOvBodyClick = (stHandle == 105 && !savedStageBodyDragged);
+            studioStageBodyDragged_ = false;
+            if (!wasOvBodyClick) {
+                SetFooterMessage(L"Üst katman (V2 / PiP) boyutu veya konumu güncellendi.");
+            }
+            SyncStudioVideoFrameRect();
+            if (wasOvBodyClick) StudioTogglePlayPause();
+        } else if (m == 12 && dIdx >= 0 && dIdx < static_cast<int>(studioFrames_.size())) {
             const int stHandle = static_cast<int>(std::lround(studioDragOrigD_));
             const bool wasShrunkBodyClick = (stHandle == 5 && !savedStageBodyDragged);
             studioStageBodyDragged_ = false;
@@ -3559,6 +4878,12 @@ bool MainWindow::OnStudioLButtonUp(int mx, int my) {
             if (wasShrunkBodyClick) StudioTogglePlayPause();
         } else if (m == 13 || m == 14 || m == 15) {
             SyncStudioVideoFrameRect();
+        } else if (m == 17 && dIdx >= 0 && dIdx < static_cast<int>(studioOverlayClips_.size())) {
+            studioPlayheadSec_ = std::max(0.0, std::min(StudioTotalDuration(), studioOverlayClips_[static_cast<size_t>(dIdx)].timelineStartSec));
+        } else if (m == 18 && dIdx >= 0 && dIdx < static_cast<int>(studioOverlayClips_.size())) {
+            const auto& ov = studioOverlayClips_[static_cast<size_t>(dIdx)];
+            double outDur = ClipOutDur(ov);
+            studioPlayheadSec_ = std::max(0.0, std::min(StudioTotalDuration(), ov.timelineStartSec + std::max(0.02, outDur - 0.04)));
         } else if (m == 2 && dIdx >= 0 && dIdx < static_cast<int>(studioClips_.size())) {
             studioPlayheadSec_ = std::max(0.0, std::min(StudioTotalDuration(), studioClips_[static_cast<size_t>(dIdx)].timelineStartSec));
         } else if (m == 3 && dIdx >= 0 && dIdx < static_cast<int>(studioClips_.size())) {
@@ -3568,6 +4893,8 @@ bool MainWindow::OnStudioLButtonUp(int mx, int my) {
         }
         const bool wasClipMoveDrag = (m == 10 && savedClipDragged);
         const bool wasClipClick = (m == 10 && !savedClipDragged);
+        const bool wasOvMoveDrag = (m == 19 && savedClipDragged);
+        const bool wasOvClick = (m == 19 && !savedClipDragged);
         const double clickSeekSec = studioDragOrigB_;
         studioClipDragged_ = false;
         studioDragOrigStarts_.clear();
@@ -3583,13 +4910,16 @@ bool MainWindow::OnStudioLButtonUp(int mx, int my) {
             StudioHitTestTrimEdge(mx, my, cli.right, cli.bottom, hKind, hIdx, hSide, dummyAcc)) {
             if (hKind == 1) { studioHoverClipIdx_ = hIdx; studioHoverClipSide_ = hSide; }
             else if (hKind == 2) { studioHoverMusicIdx_ = hIdx; studioHoverMusicSide_ = hSide; }
+            else if (hKind == 3) { studioHoverOverlayIdx_ = hIdx; studioHoverOverlaySide_ = hSide; }
         }
-        if (wasClipClick) StudioSeekTimeline(clickSeekSec, true);
-        else if (m == 1 || m == 2 || m == 3 || wasClipMoveDrag) {
+        if (wasClipClick || wasOvClick) StudioSeekTimeline(clickSeekSec, true);
+        else if (m == 1 || m == 2 || m == 3 || wasClipMoveDrag || m == 17 || m == 18 || wasOvMoveDrag) {
             if (wasClipMoveDrag) studioLoadedClipIdx_ = -1;
+            if (wasOvMoveDrag) studioLoadedOverlayIdx_ = -1;
             SyncStudioMediaState(true);
         }
         else if (m == 4 || m == 5 || m == 6) SyncStudioMediaState(false);
+        if (m == 1 || m == 11) SyncStudioFxOverlay();
         InvalidateRect(hwnd_, nullptr, FALSE);
         return true;
     }
@@ -3628,6 +4958,11 @@ bool MainWindow::OnStudioMouseWheel(int mx, int my, int delta, bool ctrl) {
 }
 
 bool MainWindow::OnStudioButtonClick(int target) {
+    if (target >= ui::BTN_STU_ADD_OVR_BASE && target < ui::BTN_STU_ADD_OVR_BASE + 500) {
+        int ci = target - ui::BTN_STU_ADD_OVR_BASE;
+        if (ci >= 0 && ci < static_cast<int>(clips_.size())) StudioAddClipToOverlay(static_cast<size_t>(ci));
+        return true;
+    }
     if (target >= ui::BTN_STU_ADD_CLIP_BASE && target < ui::BTN_STU_ADD_MUSIC_BASE) {
         int ci = target - ui::BTN_STU_ADD_CLIP_BASE;
         if (ci >= 0 && ci < static_cast<int>(clips_.size())) StudioAddClipFromLibrary(static_cast<size_t>(ci));
@@ -3694,22 +5029,52 @@ bool MainWindow::OnStudioButtonClick(int target) {
             StudioMoveSelectedClip(+1); return true;
         case ui::BTN_STU_SPEED:
             StudioCycleClipSpeed(); return true;
-        case ui::BTN_STU_GAME_MUTE:
-            if (studioSelClip_ >= 0 && studioSelClip_ < static_cast<int>(studioClips_.size())) {
-                auto& c = studioClips_[static_cast<size_t>(studioSelClip_)];
+        case ui::BTN_STU_TOGGLE_TRACK:
+            StudioToggleSelectedClipTrack(); return true;
+        case ui::BTN_STU_GAME_MUTE: {
+            const bool useOv = (studioSelOverlay_ >= 0 && studioSelOverlay_ < static_cast<int>(studioOverlayClips_.size())) ||
+                               (studioSelClip_ < 0 && studioClips_.empty() && !studioOverlayClips_.empty());
+            if (useOv) {
+                int oi = (studioSelOverlay_ >= 0 && studioSelOverlay_ < static_cast<int>(studioOverlayClips_.size())) ? studioSelOverlay_ : 0;
+                if (oi < static_cast<int>(studioOverlayClips_.size())) {
+                    studioSelOverlay_ = oi; studioSelClip_ = -1;
+                    auto& c = studioOverlayClips_[static_cast<size_t>(oi)];
+                    c.gameVolPct = (c.gameVolPct > 0) ? 0 : 100;
+                    SyncStudioMediaState(false);
+                    InvalidateRect(hwnd_, nullptr, FALSE);
+                }
+            } else if (!studioClips_.empty()) {
+                int ci = (studioSelClip_ >= 0 && studioSelClip_ < static_cast<int>(studioClips_.size())) ? studioSelClip_ : 0;
+                studioSelClip_ = ci; studioSelOverlay_ = -1;
+                auto& c = studioClips_[static_cast<size_t>(ci)];
                 c.gameVolPct = (c.gameVolPct > 0) ? 0 : 100;
                 SyncStudioMediaState(false);
                 InvalidateRect(hwnd_, nullptr, FALSE);
             }
             return true;
-        case ui::BTN_STU_MIC_MUTE:
-            if (studioSelClip_ >= 0 && studioSelClip_ < static_cast<int>(studioClips_.size())) {
-                auto& c = studioClips_[static_cast<size_t>(studioSelClip_)];
+        }
+        case ui::BTN_STU_MIC_MUTE: {
+            const bool useOv = (studioSelOverlay_ >= 0 && studioSelOverlay_ < static_cast<int>(studioOverlayClips_.size())) ||
+                               (studioSelClip_ < 0 && studioClips_.empty() && !studioOverlayClips_.empty());
+            if (useOv) {
+                int oi = (studioSelOverlay_ >= 0 && studioSelOverlay_ < static_cast<int>(studioOverlayClips_.size())) ? studioSelOverlay_ : 0;
+                if (oi < static_cast<int>(studioOverlayClips_.size())) {
+                    studioSelOverlay_ = oi; studioSelClip_ = -1;
+                    auto& c = studioOverlayClips_[static_cast<size_t>(oi)];
+                    c.micVolPct = (c.micVolPct > 0) ? 0 : 100;
+                    SyncStudioMediaState(false);
+                    InvalidateRect(hwnd_, nullptr, FALSE);
+                }
+            } else if (!studioClips_.empty()) {
+                int ci = (studioSelClip_ >= 0 && studioSelClip_ < static_cast<int>(studioClips_.size())) ? studioSelClip_ : 0;
+                studioSelClip_ = ci; studioSelOverlay_ = -1;
+                auto& c = studioClips_[static_cast<size_t>(ci)];
                 c.micVolPct = (c.micVolPct > 0) ? 0 : 100;
                 SyncStudioMediaState(false);
                 InvalidateRect(hwnd_, nullptr, FALSE);
             }
             return true;
+        }
         case ui::BTN_STU_MUS_FADEIN:
             if (studioSelMusic_ >= 0 && studioSelMusic_ < static_cast<int>(studioMusic_.size())) {
                 studioMusic_[static_cast<size_t>(studioSelMusic_)].fadeIn = !studioMusic_[static_cast<size_t>(studioSelMusic_)].fadeIn;
@@ -3730,6 +5095,7 @@ bool MainWindow::OnStudioButtonClick(int target) {
                     if (kStudioFxPresets[i].type == fx.type) { cur = i; break; }
                 }
                 fx.type = kStudioFxPresets[(cur + 1) % kNumStudioFxPresets].type;
+                SyncStudioFxOverlay();
                 InvalidateRect(hwnd_, nullptr, FALSE);
             }
             return true;
@@ -3741,12 +5107,14 @@ bool MainWindow::OnStudioButtonClick(int target) {
                 else if (fx.durationSec < 0.85) fx.durationSec = 0.90;
                 else if (fx.durationSec < 1.15) fx.durationSec = 1.20;
                 else fx.durationSec = 0.30;
+                SyncStudioFxOverlay();
                 InvalidateRect(hwnd_, nullptr, FALSE);
             }
             return true;
         case ui::BTN_STU_FX_TO_PH:
             if (studioSelFx_ >= 0 && studioSelFx_ < static_cast<int>(studioTransitions_.size())) {
                 studioTransitions_[static_cast<size_t>(studioSelFx_)].timelineSec = studioPlayheadSec_;
+                SyncStudioFxOverlay();
                 InvalidateRect(hwnd_, nullptr, FALSE);
             }
             return true;

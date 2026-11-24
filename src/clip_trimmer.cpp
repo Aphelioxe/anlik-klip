@@ -450,16 +450,18 @@ void AppendResampledPcm(const std::vector<int16_t>& srcPcm, double speed, float 
     dstPcm.reserve(dstPcm.size() + targetOutPairs * 2);
     for (size_t i = 0; i < targetOutPairs; ++i) {
         double srcPos = static_cast<double>(i) * speed;
-        if (srcPos >= static_cast<double>(srcPairs - 1)) {
-            srcPos = static_cast<double>(srcPairs - 1);
+        if (srcPos >= static_cast<double>(srcPairs)) {
+            dstPcm.push_back(0);
+            dstPcm.push_back(0);
+            continue;
         }
         size_t i0 = static_cast<size_t>(srcPos);
-        size_t i1 = std::min(i0 + 1, srcPairs - 1);
+        size_t i1 = i0 + 1;
         double frac = srcPos - static_cast<double>(i0);
         float l0 = static_cast<float>(srcPcm[i0 * 2]) / 32767.0f;
         float r0 = static_cast<float>(srcPcm[i0 * 2 + 1]) / 32767.0f;
-        float l1 = static_cast<float>(srcPcm[i1 * 2]) / 32767.0f;
-        float r1 = static_cast<float>(srcPcm[i1 * 2 + 1]) / 32767.0f;
+        float l1 = (i1 < srcPairs) ? (static_cast<float>(srcPcm[i1 * 2]) / 32767.0f) : 0.0f;
+        float r1 = (i1 < srcPairs) ? (static_cast<float>(srcPcm[i1 * 2 + 1]) / 32767.0f) : 0.0f;
         float l = static_cast<float>((l0 * (1.0 - frac) + l1 * frac) * gain);
         float r = static_cast<float>((r0 * (1.0 - frac) + r1 * frac) * gain);
         dstPcm.push_back(FloatToPcm16(l));
@@ -954,6 +956,124 @@ bool CreateBlackNv12Sample(const std::vector<BYTE>& blackNv12, LONGLONG ts100, L
     return true;
 }
 
+bool CopyNv12SampleToTightVector(IMFSample* smp, uint32_t w, uint32_t h, std::vector<BYTE>& out) {
+    if (!smp || w < 2 || h < 2) return false;
+    const size_t yBytes = static_cast<size_t>(w) * h;
+    const size_t uvRows = h / 2;
+    const size_t totalBytes = yBytes + uvRows * w;
+    out.resize(totalBytes);
+
+    ComPtr<IMFMediaBuffer> mb;
+    if (SUCCEEDED(smp->GetBufferByIndex(0, mb.Put())) && mb) {
+        ComPtr<IMF2DBuffer> b2d;
+        if (SUCCEEDED(mb->QueryInterface(__uuidof(IMF2DBuffer), b2d.PutVoid())) && b2d) {
+            BYTE* pb = nullptr;
+            LONG pitch = 0;
+            if (SUCCEEDED(b2d->Lock2D(&pb, &pitch)) && pb && std::abs(pitch) >= static_cast<LONG>(w)) {
+                const ptrdiff_t stride = pitch;
+                const BYTE* srcY = pb;
+                for (uint32_t y = 0; y < h; ++y) {
+                    memcpy(out.data() + static_cast<size_t>(y) * w, srcY + static_cast<ptrdiff_t>(y) * stride, w);
+                }
+                const BYTE* srcUV = srcY + static_cast<ptrdiff_t>(h) * stride;
+                BYTE* dstUV = out.data() + yBytes;
+                for (uint32_t y = 0; y < uvRows; ++y) {
+                    memcpy(dstUV + static_cast<size_t>(y) * w, srcUV + static_cast<ptrdiff_t>(y) * stride, w);
+                }
+                b2d->Unlock2D();
+                return true;
+            }
+            if (pb) b2d->Unlock2D();
+        }
+    }
+
+    ComPtr<IMFMediaBuffer> cbuf;
+    if (SUCCEEDED(smp->ConvertToContiguousBuffer(cbuf.Put())) && cbuf) {
+        BYTE* p = nullptr;
+        DWORD len = 0;
+        if (SUCCEEDED(cbuf->Lock(&p, nullptr, &len)) && p && len >= totalBytes) {
+            memcpy(out.data(), p, totalBytes);
+            cbuf->Unlock();
+            return true;
+        }
+        if (p) cbuf->Unlock();
+    }
+    out.clear();
+    return false;
+}
+
+void CompositeNv12PipOverlay(IMFSample* dstSmp, uint32_t dstW, uint32_t dstH,
+                             const std::vector<BYTE>& ovNv12, uint32_t srcW, uint32_t srcH,
+                             double centerX, double centerY, double scale) {
+    if (!dstSmp || ovNv12.empty() || srcW < 4 || srcH < 4 || dstW < 16 || dstH < 16) return;
+    const size_t srcYBytes = static_cast<size_t>(srcW) * srcH;
+    const size_t srcNeed = srcYBytes + static_cast<size_t>(srcW / 2) * (srcH / 2) * 2;
+    if (ovNv12.size() < srcNeed) return;
+
+    const double sc = std::max(0.20, std::min(1.0, scale));
+    uint32_t boxW = std::max<uint32_t>(16u, std::min<uint32_t>(dstW, static_cast<uint32_t>(std::lround(dstW * sc)) & ~1u));
+    uint32_t boxH = std::max<uint32_t>(16u, std::min<uint32_t>(dstH, static_cast<uint32_t>(std::lround(dstH * sc)) & ~1u));
+    uint32_t boxX = static_cast<uint32_t>(std::max<int32_t>(0,
+        std::min<int32_t>(static_cast<int32_t>(dstW - boxW),
+            static_cast<int32_t>(std::lround(static_cast<double>(dstW) * centerX - static_cast<double>(boxW) * 0.5)) & ~1)));
+    uint32_t boxY = static_cast<uint32_t>(std::max<int32_t>(0,
+        std::min<int32_t>(static_cast<int32_t>(dstH - boxH),
+            static_cast<int32_t>(std::lround(static_cast<double>(dstH) * centerY - static_cast<double>(boxH) * 0.5)) & ~1)));
+
+    uint32_t pipW = boxW, pipH = boxH, pipX = boxX, pipY = boxY;
+    if (static_cast<uint64_t>(srcW) * boxH != static_cast<uint64_t>(srcH) * boxW) {
+        double sAr = static_cast<double>(srcW) / static_cast<double>(srcH);
+        double bAr = static_cast<double>(boxW) / static_cast<double>(boxH);
+        if (sAr < bAr) {
+            pipW = std::max<uint32_t>(8u, std::min<uint32_t>(boxW, static_cast<uint32_t>(std::lround(boxH * sAr)) & ~1u));
+            pipX = boxX + (((boxW - pipW) / 2) & ~1u);
+        } else {
+            pipH = std::max<uint32_t>(8u, std::min<uint32_t>(boxH, static_cast<uint32_t>(std::lround(boxW / sAr)) & ~1u));
+            pipY = boxY + (((boxH - pipH) / 2) & ~1u);
+        }
+    }
+
+    const uint32_t dhw = dstW / 2, shw = srcW / 2, shh = srcH / 2;
+    const uint32_t phx = pipX / 2, phy = pipY / 2, phw = pipW / 2, phh = pipH / 2;
+    const size_t dstTotal = static_cast<size_t>(dstW) * dstH + static_cast<size_t>(dhw) * (dstH / 2) * 2;
+
+    ComPtr<IMFMediaBuffer> buf;
+    if (FAILED(dstSmp->ConvertToContiguousBuffer(buf.Put())) || !buf) return;
+    BYTE* dstP = nullptr; DWORD dLen = 0;
+    if (FAILED(buf->Lock(&dstP, nullptr, &dLen)) || !dstP || dLen < dstTotal) {
+        if (dstP) buf->Unlock();
+        return;
+    }
+
+    const BYTE* sY = ovNv12.data();
+    const BYTE* sUV = ovNv12.data() + srcYBytes;
+    BYTE* dY = dstP;
+    BYTE* dUV = dstP + static_cast<size_t>(dstW) * dstH;
+
+    std::vector<uint32_t> lutX(pipW);
+    for (uint32_t dx = 0; dx < pipW; ++dx) lutX[dx] = std::min(srcW - 1, (dx * srcW) / pipW);
+    for (uint32_t dy = 0; dy < pipH; ++dy) {
+        uint32_t sy = std::min(srcH - 1, (dy * srcH) / pipH);
+        const BYTE* sRow = sY + static_cast<size_t>(sy) * srcW;
+        BYTE* dRow = dY + static_cast<size_t>(pipY + dy) * dstW + pipX;
+        for (uint32_t dx = 0; dx < pipW; ++dx) dRow[dx] = sRow[lutX[dx]];
+    }
+
+    std::vector<uint32_t> lutUvX(phw);
+    for (uint32_t dux = 0; dux < phw; ++dux) lutUvX[dux] = std::min(shw - 1, (dux * shw) / phw);
+    for (uint32_t duy = 0; duy < phh; ++duy) {
+        uint32_t suy = std::min(shh - 1, (duy * shh) / phh);
+        const BYTE* sRow = sUV + static_cast<size_t>(suy) * shw * 2;
+        BYTE* dRow = dUV + (static_cast<size_t>(phy + duy) * dhw + phx) * 2;
+        for (uint32_t dux = 0; dux < phw; ++dux) {
+            const uint32_t sux = lutUvX[dux] * 2;
+            dRow[dux * 2] = sRow[sux];
+            dRow[dux * 2 + 1] = sRow[sux + 1];
+        }
+    }
+    buf->Unlock();
+}
+
 struct SourceSegment {
     std::wstring path;
     double startSec = 0.0;
@@ -962,11 +1082,16 @@ struct SourceSegment {
     float gameGain = 1.0f;
     float micGain = 1.0f;
     double timelineStartSec = -1.0;
+    int track = 0;
+    double centerX = 0.5;
+    double centerY = 0.5;
+    double scale = 1.0;
 };
 
 struct EditEncodeParams {
     const ClipEditSpec* spec = nullptr;
     const std::vector<SourceSegment>* segments = nullptr;
+    const std::vector<SourceSegment>* overlaySegments = nullptr;
     const std::vector<DecodedMusicTrack>* decodedMusic = nullptr;
     UINT32 vpInW = 1280;
     UINT32 vpInH = 720;
@@ -1055,6 +1180,232 @@ HRESULT OpenSegmentReader(const std::wstring& path, IMFDXGIDeviceManager* dm,
     }
     return S_OK;
 }
+
+bool DecodeOverlaySegmentAudio(const SourceSegment& ov, DecodedMusicTrack& outTrack) {
+    outTrack = {};
+    if (ov.path.empty() || (ov.gameGain <= 0.001f && ov.micGain <= 0.001f)) return false;
+
+    ComPtr<IMFSourceReader> sr;
+    if (FAILED(MFCreateSourceReaderFromURL(ov.path.c_str(), nullptr, sr.Put())) || !sr) return false;
+    std::vector<DWORD> aIns;
+    sr->SetStreamSelection(static_cast<DWORD>(MF_SOURCE_READER_ALL_STREAMS), FALSE);
+    for (DWORD si = 0; si < 8; ++si) {
+        ComPtr<IMFMediaType> mt;
+        if (FAILED(sr->GetNativeMediaType(si, 0, mt.Put())) || !mt) break;
+        GUID maj{};
+        mt->GetGUID(MF_MT_MAJOR_TYPE, &maj);
+        if (maj == MFMediaType_Audio) aIns.push_back(si);
+    }
+    if (aIns.empty()) return false;
+
+    ClipAudioTrackLayout lay;
+    const bool hasLay = DetectClipAudioLayout(ov.path, lay);
+    auto cfgA = [&](DWORD idx) -> bool {
+        sr->SetStreamSelection(idx, TRUE);
+        ComPtr<IMFMediaType> decA;
+        MFCreateMediaType(decA.Put());
+        decA->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Audio);
+        decA->SetGUID(MF_MT_SUBTYPE, MFAudioFormat_PCM);
+        decA->SetUINT32(MF_MT_AUDIO_BITS_PER_SAMPLE, 16);
+        decA->SetUINT32(MF_MT_AUDIO_SAMPLES_PER_SECOND, 48000);
+        decA->SetUINT32(MF_MT_AUDIO_NUM_CHANNELS, 2);
+        return SUCCEEDED(sr->SetCurrentMediaType(idx, nullptr, decA.Get()));
+    };
+
+    DWORD mixSi = aIns[0], gameSi = DWORD(-1), micSi = DWORD(-1);
+    bool multi = false;
+    if (hasLay && lay.streamIndices.size() == aIns.size()) {
+        if (lay.mixStreamPos >= 0 && static_cast<size_t>(lay.mixStreamPos) < aIns.size()) mixSi = aIns[static_cast<size_t>(lay.mixStreamPos)];
+        if (lay.hasSeparateGameMic && lay.gameStreamPos >= 0 && lay.micStreamPos >= 0 &&
+            static_cast<size_t>(lay.gameStreamPos) < aIns.size() && static_cast<size_t>(lay.micStreamPos) < aIns.size()) {
+            gameSi = aIns[static_cast<size_t>(lay.gameStreamPos)];
+            micSi = aIns[static_cast<size_t>(lay.micStreamPos)];
+            multi = cfgA(gameSi) && cfgA(micSi);
+        }
+    }
+    if (!multi) {
+        if (gameSi != DWORD(-1)) sr->SetStreamSelection(gameSi, FALSE);
+        if (micSi != DWORD(-1)) sr->SetStreamSelection(micSi, FALSE);
+        if (!cfgA(mixSi)) return false;
+    }
+
+    const LONGLONG start100 = static_cast<LONGLONG>(ov.startSec * 1e7);
+    const LONGLONG end100 = static_cast<LONGLONG>(ov.endSec * 1e7);
+    const LONGLONG span100 = std::max<LONGLONG>(1, end100 - start100);
+    const size_t maxInPairs = static_cast<size_t>((span100 * 48000LL) / 10000000LL);
+    const size_t outPairs = static_cast<size_t>((static_cast<double>(span100) / std::max(0.5, ov.speed) * 48000.0) / 10000000.0);
+    if (outPairs == 0 || maxInPairs == 0) return false;
+
+    PROPVARIANT pv;
+    PropVariantInit(&pv);
+    pv.vt = VT_I8;
+    pv.hVal.QuadPart = std::max(0LL, start100 - 20000000LL);
+    sr->SetCurrentPosition(GUID_NULL, pv);
+    PropVariantClear(&pv);
+
+    std::vector<int16_t> pcm[2];
+    bool done[2] = { false, !multi };
+    while (!done[0] || !done[1]) {
+        DWORD si = 0, fl = 0;
+        LONGLONG ts = 0;
+        ComPtr<IMFSample> smp;
+        if (FAILED(sr->ReadSample(static_cast<DWORD>(MF_SOURCE_READER_ANY_STREAM), 0, &si, &fl, &ts, smp.Put()))) break;
+        int tk = multi ? (si == gameSi ? 0 : (si == micSi ? 1 : -1)) : (si == mixSi ? 0 : -1);
+        if (fl & MF_SOURCE_READERF_ENDOFSTREAM) {
+            if (tk >= 0) done[tk] = true;
+            continue;
+        }
+        if (!smp || tk < 0 || done[tk]) continue;
+        if (ts >= end100) { done[tk] = true; sr->SetStreamSelection(si, FALSE); continue; }
+        LONGLONG dur = 0;
+        smp->GetSampleDuration(&dur);
+        if (dur <= 0) dur = (1024LL * 10000000LL) / 48000LL;
+        if (ts + dur <= start100) continue;
+
+        ComPtr<IMFMediaBuffer> abuf;
+        if (SUCCEEDED(smp->ConvertToContiguousBuffer(abuf.Put())) && abuf) {
+            BYTE* p = nullptr; DWORD len = 0;
+            if (SUCCEEDED(abuf->Lock(&p, nullptr, &len)) && len >= 4) {
+                const size_t nPairs = len / 4;
+                const size_t skipPairs = (ts < start100) ? static_cast<size_t>(((start100 - ts) * 48000LL) / 10000000LL) : 0;
+                const size_t curPairs = pcm[tk].size() / 2;
+                if (skipPairs < nPairs && curPairs < maxInPairs) {
+                    const size_t take = std::min<size_t>(nPairs - skipPairs, maxInPairs - curPairs);
+                    const int16_t* s16 = reinterpret_cast<const int16_t*>(p) + skipPairs * 2;
+                    pcm[tk].insert(pcm[tk].end(), s16, s16 + take * 2);
+                }
+                if ((pcm[tk].size() / 2) >= maxInPairs) { done[tk] = true; sr->SetStreamSelection(si, FALSE); }
+                abuf->Unlock();
+            }
+        }
+    }
+
+    outTrack.startPair = static_cast<size_t>(std::max(0.0, ov.timelineStartSec) * 48000.0);
+    if (multi) {
+        std::vector<int16_t> gRes, mRes;
+        AppendResampledPcm(pcm[0], ov.speed, ov.gameGain, outPairs, gRes);
+        AppendResampledPcm(pcm[1], ov.speed, ov.micGain, outPairs, mRes);
+        outTrack.pcm.reserve(outPairs * 2);
+        for (size_t i = 0; i < outPairs * 2; ++i) {
+            float m = static_cast<float>(gRes[i]) / 32767.0f + static_cast<float>(mRes[i]) / 32767.0f;
+            outTrack.pcm.push_back(FloatToPcm16(m));
+        }
+    } else {
+        AppendResampledPcm(pcm[0], ov.speed, ov.gameGain, outPairs, outTrack.pcm);
+    }
+    return !outTrack.pcm.empty();
+}
+
+struct OverlayVideoCompositor {
+    struct Slot {
+        const SourceSegment* seg = nullptr;
+        LONGLONG start100 = 0;
+        LONGLONG end100 = 0;
+        LONGLONG ovStart100 = 0;
+        LONGLONG ovEnd100 = 0;
+        ComPtr<IMFSourceReader> sr;
+        DWORD vIn = 0;
+        UINT32 inW = 0, inH = 0;
+        std::vector<BYTE> curNv12;
+        LONGLONG lastSrcTs = -1;
+        bool hasFrame = false;
+        bool opened = false;
+        bool ended = false;
+    };
+    std::vector<Slot> slots;
+
+    void Init(const std::vector<SourceSegment>* ovSegs) {
+        slots.clear();
+        if (!ovSegs) return;
+        for (const auto& s : *ovSegs) {
+            Slot sl;
+            sl.seg = &s;
+            sl.start100 = static_cast<LONGLONG>(std::llround(s.startSec * 1e7));
+            sl.end100 = static_cast<LONGLONG>(std::llround(s.endSec * 1e7));
+            sl.ovStart100 = static_cast<LONGLONG>(std::llround(std::max(0.0, s.timelineStartSec) * 1e7));
+            LONGLONG outSpan = static_cast<LONGLONG>(std::llround((std::max(0.0, s.endSec - s.startSec) / std::max(0.5, s.speed)) * 1e7));
+            sl.ovEnd100 = sl.ovStart100 + outSpan;
+            slots.push_back(std::move(sl));
+        }
+    }
+
+    void CloseAll() {
+        for (auto& sl : slots) {
+            sl.sr.Reset();
+            std::vector<BYTE>().swap(sl.curNv12);
+            sl.opened = false;
+            sl.hasFrame = false;
+        }
+    }
+
+    LONGLONG MaxEnd100() const {
+        LONGLONG mx = 0;
+        for (const auto& sl : slots) mx = std::max(mx, sl.ovEnd100);
+        return mx;
+    }
+
+    void CompositeAt(LONGLONG gridTs, LONGLONG halfFrame100, IMFSample* dstSmp, uint32_t outW, uint32_t outH) {
+        if (!dstSmp || slots.empty()) return;
+        for (auto& sl : slots) {
+            if (gridTs + halfFrame100 < sl.ovStart100) continue;
+            if (gridTs >= sl.ovEnd100) {
+                if (sl.opened) {
+                    sl.sr.Reset();
+                    std::vector<BYTE>().swap(sl.curNv12);
+                    sl.opened = false;
+                    sl.hasFrame = false;
+                    sl.ended = true;
+                }
+                continue;
+            }
+            if (!sl.opened && !sl.ended) {
+                std::vector<DWORD> dummyA;
+                if (SUCCEEDED(OpenSegmentReader(sl.seg->path, nullptr, outW, outH, sl.sr, sl.vIn, dummyA, sl.inW, sl.inH)) && sl.sr) {
+                    PROPVARIANT pv;
+                    PropVariantInit(&pv);
+                    pv.vt = VT_I8;
+                    pv.hVal.QuadPart = std::max(0LL, sl.start100 - 20000000LL);
+                    sl.sr->SetCurrentPosition(GUID_NULL, pv);
+                    PropVariantClear(&pv);
+                    sl.opened = true;
+                } else {
+                    sl.ended = true;
+                    continue;
+                }
+            }
+            const LONGLONG relOut = std::max<LONGLONG>(0, gridTs - sl.ovStart100);
+            const LONGLONG targetSrcTs = sl.start100 + static_cast<LONGLONG>(static_cast<double>(relOut) * sl.seg->speed);
+            const LONGLONG stepTol = static_cast<LONGLONG>(41666.0 * std::max(1.0, sl.seg->speed));
+            while (!sl.ended && sl.sr && (!sl.hasFrame || sl.lastSrcTs + stepTol < targetSrcTs)) {
+                DWORD rsi = 0, fl = 0;
+                LONGLONG ts = 0;
+                ComPtr<IMFSample> smp;
+                if (FAILED(sl.sr->ReadSample(sl.vIn, 0, &rsi, &fl, &ts, smp.Put()))) {
+                    sl.ended = true;
+                    break;
+                }
+                if (fl & MF_SOURCE_READERF_ENDOFSTREAM) {
+                    sl.ended = true;
+                    break;
+                }
+                if (!smp) continue;
+                if (ts >= sl.end100) {
+                    sl.ended = true;
+                    break;
+                }
+                if (ts + 250000LL < targetSrcTs && (sl.hasFrame || ts + 500000LL < sl.start100)) continue;
+                if (CopyNv12SampleToTightVector(smp.Get(), sl.inW, sl.inH, sl.curNv12)) {
+                    sl.hasFrame = true;
+                    sl.lastSrcTs = ts;
+                }
+            }
+            if (sl.hasFrame && !sl.curNv12.empty()) {
+                CompositeNv12PipOverlay(dstSmp, outW, outH, sl.curNv12, sl.inW, sl.inH,
+                    sl.seg->centerX, sl.seg->centerY, sl.seg->scale);
+            }
+        }
+    }
+};
 
 bool RunEditMp4ClipAttempt(const EditEncodeParams& ep, std::atomic<bool>* cancelFlag,
                            bool allowHardware, std::string& outError, bool& outRetryWithSw) {
@@ -1235,6 +1586,9 @@ bool RunEditMp4ClipAttempt(const EditEncodeParams& ep, std::atomic<bool>* cancel
     memset(blackNv12.data(), blackY, static_cast<size_t>(outW) * outH);
     std::vector<BYTE> fxScratch;
     std::vector<BYTE> fxRawCopy;
+    OverlayVideoCompositor ovComp;
+    ovComp.Init(ep.overlaySegments);
+    const bool hasOverlaySegs = (ep.overlaySegments && !ep.overlaySegments->empty());
 
     auto flushAllAudio = [&](bool tail) -> bool {
         HRESULT aHr = S_OK;
@@ -1265,6 +1619,9 @@ bool RunEditMp4ClipAttempt(const EditEncodeParams& ep, std::atomic<bool>* cancel
             ComPtr<IMFSample> blkSmp;
             if (!CreateBlackNv12Sample(blackNv12, gridTs, newDur, blkSmp)) {
                 failHr = E_OUTOFMEMORY; failStep = "Boşluk karesi oluşturulamadı"; aborted = true; break;
+            }
+            if (hasOverlaySegs) {
+                ovComp.CompositeAt(gridTs, outFrameDur100 / 2, blkSmp.Get(), outW, outH);
             }
             if (!spec.transitions.empty()) {
                 ApplyNv12TransitionEffects(blkSmp.Get(), outW, outH, blackY,
@@ -1453,7 +1810,10 @@ bool RunEditMp4ClipAttempt(const EditEncodeParams& ep, std::atomic<bool>* cancel
                 LONGLONG relIn = std::max(0LL, ts - start100);
                 LONGLONG mappedTs = outVBase100 + static_cast<LONGLONG>(static_cast<double>(relIn) / seg.speed);
                 LONGLONG gridTs = (outFrameIdx * 10000000LL * outFpsD) / outFpsN;
-                if (mappedTs + (outFrameDur100 / 2) < gridTs) continue;
+                const LONGLONG matchTol = (seg.speed > 1.05)
+                    ? std::max<LONGLONG>(1000LL, static_cast<LONGLONG>((static_cast<double>(outFrameDur100) / seg.speed) * 0.45))
+                    : (outFrameDur100 / 2);
+                if (mappedTs + matchTol < gridTs) continue;
                 if (gridTs >= outVBase100 + outSpan100) continue;
 
                 LONGLONG nextGridTs = ((outFrameIdx + 1) * 10000000LL * outFpsD) / outFpsN;
@@ -1600,7 +1960,7 @@ bool RunEditMp4ClipAttempt(const EditEncodeParams& ep, std::atomic<bool>* cancel
                 if (segFadeAlpha < 0.999f) {
                     ApplyNv12FadeInSample(outSmp.Get(), outW, outH, segFadeAlpha);
                 }
-                const bool needDupBackup = !spec.transitions.empty() || !spec.frameTransforms.empty();
+                const bool needDupBackup = !spec.transitions.empty() || !spec.frameTransforms.empty() || hasOverlaySegs;
                 fxRawCopy.clear();
                 if (needDupBackup) {
                     ComPtr<IMFMediaBuffer> rb;
@@ -1614,6 +1974,9 @@ bool RunEditMp4ClipAttempt(const EditEncodeParams& ep, std::atomic<bool>* cancel
                     const double frameSec = static_cast<double>(gridTs) / 1e7;
                     ApplyNv12FrameTransform(outSmp.Get(), outW, outH, blackY,
                         frameSec, spec.frameTransforms, fxScratch);
+                    if (hasOverlaySegs) {
+                        ovComp.CompositeAt(gridTs, outFrameDur100 / 2, outSmp.Get(), outW, outH);
+                    }
                     ApplyNv12TransitionEffects(outSmp.Get(), outW, outH, blackY,
                         frameSec, spec.transitions, fxScratch);
                 }
@@ -1660,6 +2023,9 @@ bool RunEditMp4ClipAttempt(const EditEncodeParams& ep, std::atomic<bool>* cancel
                             const double dupSec = static_cast<double>(gTs) / 1e7;
                             ApplyNv12FrameTransform(dupSmp.Get(), outW, outH, blackY,
                                 dupSec, spec.frameTransforms, fxScratch);
+                            if (hasOverlaySegs) {
+                                ovComp.CompositeAt(gTs, outFrameDur100 / 2, dupSmp.Get(), outW, outH);
+                            }
                             ApplyNv12TransitionEffects(dupSmp.Get(), outW, outH, blackY,
                                 dupSec, spec.transitions, fxScratch);
                         }
@@ -1812,6 +2178,52 @@ bool RunEditMp4ClipAttempt(const EditEncodeParams& ep, std::atomic<bool>* cancel
 
         outVBase100 = newOutVBase100;
     }
+
+    if (!aborted && hasOverlaySegs) {
+        const LONGLONG maxOvEnd100 = ovComp.MaxEnd100();
+        while (!aborted) {
+            if (cancelFlag && cancelFlag->load()) { userCancelled = true; aborted = true; break; }
+            LONGLONG gridTs = (outFrameIdx * 10000000LL * outFpsD) / outFpsN;
+            if (gridTs + (outFrameDur100 / 2) >= maxOvEnd100) break;
+            LONGLONG nextGridTs = ((outFrameIdx + 1) * 10000000LL * outFpsD) / outFpsN;
+            LONGLONG newDur = std::max<LONGLONG>(1, nextGridTs - gridTs);
+            ComPtr<IMFSample> blkSmp;
+            if (!CreateBlackNv12Sample(blackNv12, gridTs, newDur, blkSmp)) {
+                failHr = E_OUTOFMEMORY; failStep = "Üst katman arka plan karesi oluşturulamadı"; aborted = true; break;
+            }
+            ovComp.CompositeAt(gridTs, outFrameDur100 / 2, blkSmp.Get(), outW, outH);
+            if (!spec.transitions.empty()) {
+                ApplyNv12TransitionEffects(blkSmp.Get(), outW, outH, blackY,
+                    static_cast<double>(gridTs) / 1e7, spec.transitions, fxScratch);
+            }
+            HRESULT whr = sw->WriteSample(vOutIdx, blkSmp.Get());
+            if (FAILED(whr)) {
+                failHr = whr; failStep = "Üst katman video karesi yazılamadı"; aborted = true; break;
+            }
+            ++outFrameIdx;
+            ++vWritten;
+
+            if (hasOutMix) {
+                constexpr size_t kSilentChunk = 16384;
+                const size_t targetPairs = static_cast<size_t>((nextGridTs * 48000LL) / 10000000LL);
+                const size_t curPairs = static_cast<size_t>(mixWrittenPairs) + (outMixAccum.size() / 2);
+                if (curPairs + kSilentChunk <= targetPairs) {
+                    outMixAccum.insert(outMixAccum.end(), kSilentChunk * 2, 0);
+                    if (!flushAllAudio(false)) break;
+                }
+            }
+        }
+        if (!aborted && hasOutMix) {
+            outVBase100 = (outFrameIdx * 10000000LL * outFpsD) / outFpsN;
+            const size_t targetPairs = static_cast<size_t>((outVBase100 * 48000LL) / 10000000LL);
+            const size_t curPairs = static_cast<size_t>(mixWrittenPairs) + (outMixAccum.size() / 2);
+            if (curPairs < targetPairs) {
+                outMixAccum.insert(outMixAccum.end(), (targetPairs - curPairs) * 2, 0);
+                flushAllAudio(false);
+            }
+        }
+    }
+    ovComp.CloseAll();
 
     if (aborted || vWritten == 0) {
         sw.Reset();
@@ -2388,6 +2800,7 @@ bool EditMp4Clip(const ClipEditSpec& spec, std::string& outError,
     const float defaultMicGain = std::max(0.0f, std::min(2.0f, static_cast<float>(spec.micVolPct) / 100.0f));
 
     std::vector<SourceSegment> segments;
+    std::vector<SourceSegment> overlaySegments;
     bool hasCut = false;
     bool hasInsert = false;
     std::wstring primaryPath = spec.srcPath;
@@ -2408,14 +2821,31 @@ bool EditMp4Clip(const ClipEditSpec& spec, std::string& outError,
                 float segGame = (ms.gameVolPct >= 0) ? std::max(0.0f, std::min(2.0f, static_cast<float>(ms.gameVolPct) / 100.0f)) : defaultGameGain;
                 float segMic = (ms.micVolPct >= 0) ? std::max(0.0f, std::min(2.0f, static_cast<float>(ms.micVolPct) / 100.0f)) : defaultMicGain;
                 double tlStart = (ms.timelineStartSec >= 0.0) ? ms.timelineStartSec : -1.0;
-                segments.push_back({ ms.path, s0, s1, segSpd, segGame, segMic, tlStart });
+                SourceSegment sg;
+                sg.path = ms.path;
+                sg.startSec = s0;
+                sg.endSec = s1;
+                sg.speed = segSpd;
+                sg.gameGain = segGame;
+                sg.micGain = segMic;
+                sg.timelineStartSec = tlStart;
+                sg.track = (ms.track == 1) ? 1 : 0;
+                sg.centerX = ms.centerX;
+                sg.centerY = ms.centerY;
+                sg.scale = ms.scale;
+                if (sg.track == 1) {
+                    sg.timelineStartSec = std::max(0.0, sg.timelineStartSec);
+                    overlaySegments.push_back(std::move(sg));
+                } else {
+                    segments.push_back(std::move(sg));
+                }
             }
         }
-        if (segments.empty()) {
+        if (segments.empty() && overlaySegments.empty()) {
             outError = "Montaj için geçerli klip bulunamadı.";
             return false;
         }
-        primaryPath = segments[0].path;
+        primaryPath = !segments.empty() ? segments[0].path : overlaySegments[0].path;
     } else {
         hasCut = (spec.cutEndSec > spec.cutStartSec + 0.1) &&
                  (spec.cutStartSec > startSec + 0.1) &&
@@ -2517,6 +2947,12 @@ bool EditMp4Clip(const ClipEditSpec& spec, std::string& outError,
         minSegSpeed = std::min(minSegSpeed, sg.speed);
         maxSegSpeed = std::max(maxSegSpeed, sg.speed);
     }
+    for (const auto& ov : overlaySegments) {
+        double ovEnd = std::max(0.0, ov.timelineStartSec) + std::max(0.0, ov.endSec - ov.startSec) / ov.speed;
+        totalOutDurSec = std::max(totalOutDurSec, ovEnd);
+        minSegSpeed = std::min(minSegSpeed, ov.speed);
+        maxSegSpeed = std::max(maxSegSpeed, ov.speed);
+    }
     if (totalOutDurSec < 0.2) totalOutDurSec = 0.2;
 
     std::vector<DecodedMusicTrack> decodedMusic;
@@ -2534,10 +2970,17 @@ bool EditMp4Clip(const ClipEditSpec& spec, std::string& outError,
             decodedMusic.push_back(std::move(dmt));
         }
     }
+    for (const auto& ov : overlaySegments) {
+        DecodedMusicTrack ovMix;
+        if (DecodeOverlaySegmentAudio(ov, ovMix)) {
+            foundA = true;
+            decodedMusic.push_back(std::move(ovMix));
+        }
+    }
 
     UINT32 vpInW = srcW, vpInH = srcH;
-    for (const auto& sg : segments) {
-        if (_wcsicmp(sg.path.c_str(), primaryPath.c_str()) == 0) continue;
+    auto probeExtraSeg = [&](const SourceSegment& sg) -> bool {
+        if (_wcsicmp(sg.path.c_str(), primaryPath.c_str()) == 0) return true;
         ComPtr<IMFSourceReader> segProbe;
         HRESULT segProbeHr = MFCreateSourceReaderFromURL(sg.path.c_str(), nullptr, segProbe.Put());
         if (FAILED(segProbeHr) || !segProbe) {
@@ -2545,33 +2988,34 @@ bool EditMp4Clip(const ClipEditSpec& spec, std::string& outError,
             Logger::Log("EditMp4Clip pre-probe failed on segment: %s", outError.c_str());
             return false;
         }
-        {
-            for (DWORD si = 0; si < 8; ++si) {
-                ComPtr<IMFMediaType> mt;
-                if (FAILED(segProbe->GetNativeMediaType(si, 0, mt.Put())) || !mt) break;
-                GUID maj{};
-                mt->GetGUID(MF_MT_MAJOR_TYPE, &maj);
-                if (maj == MFMediaType_Video) {
-                    UINT32 iw = 0, ih = 0, sfn = 0, sfd = 0;
-                    if (SUCCEEDED(MFGetAttributeSize(mt.Get(), MF_MT_FRAME_SIZE, &iw, &ih))) {
-                        vpInW = std::max(vpInW, iw);
-                        vpInH = std::max(vpInH, ih);
-                    }
-                    if (SUCCEEDED(MFGetAttributeRatio(mt.Get(), MF_MT_FRAME_RATE, &sfn, &sfd)) && sfn > 0 && sfd > 0) {
-                        snapCfrFps(sfn, sfd);
-                        const double curFps = static_cast<double>(fpsN) / static_cast<double>(fpsD);
-                        const double segFps = static_cast<double>(sfn) / static_cast<double>(sfd);
-                        if (segFps > curFps && segFps <= 120.5) {
-                            fpsN = sfn;
-                            fpsD = sfd;
-                        }
-                    }
-                } else if (maj == MFMediaType_Audio) {
-                    foundA = true;
+        for (DWORD si = 0; si < 8; ++si) {
+            ComPtr<IMFMediaType> mt;
+            if (FAILED(segProbe->GetNativeMediaType(si, 0, mt.Put())) || !mt) break;
+            GUID maj{};
+            mt->GetGUID(MF_MT_MAJOR_TYPE, &maj);
+            if (maj == MFMediaType_Video) {
+                UINT32 iw = 0, ih = 0, sfn = 0, sfd = 0;
+                if (SUCCEEDED(MFGetAttributeSize(mt.Get(), MF_MT_FRAME_SIZE, &iw, &ih))) {
+                    vpInW = std::max(vpInW, iw);
+                    vpInH = std::max(vpInH, ih);
                 }
+                if (SUCCEEDED(MFGetAttributeRatio(mt.Get(), MF_MT_FRAME_RATE, &sfn, &sfd)) && sfn > 0 && sfd > 0) {
+                    snapCfrFps(sfn, sfd);
+                    const double curFps = static_cast<double>(fpsN) / static_cast<double>(fpsD);
+                    const double segFps = static_cast<double>(sfn) / static_cast<double>(sfd);
+                    if (segFps > curFps && segFps <= 120.5) {
+                        fpsN = sfn;
+                        fpsD = sfd;
+                    }
+                }
+            } else if (maj == MFMediaType_Audio) {
+                foundA = true;
             }
         }
-    }
+        return true;
+    };
+    for (const auto& sg : segments) { if (!probeExtraSeg(sg)) return false; }
+    for (const auto& ov : overlaySegments) { if (!probeExtraSeg(ov)) return false; }
     const bool anyAudio = foundA || !decodedMusic.empty();
 
     UINT32 outW = srcW, outH = srcH, outFpsN = fpsN, outFpsD = fpsD, outBr = avgBr;
@@ -2607,12 +3051,13 @@ bool EditMp4Clip(const ClipEditSpec& spec, std::string& outError,
         outBr = vBps;
     }
     (void)minSegSpeed;
-    const bool needVp = (outW != srcW || outH != srcH || spec.vertical916 || hasInsert || segments.size() > 1);
+    const bool needVp = (outW != srcW || outH != srcH || spec.vertical916 || hasInsert || segments.size() > 1 || !overlaySegments.empty());
     const LONGLONG outFrameDur100 = (10000000LL * outFpsD) / std::max<uint32_t>(1u, outFpsN);
 
     EditEncodeParams ep;
     ep.spec = &spec;
     ep.segments = &segments;
+    ep.overlaySegments = &overlaySegments;
     ep.decodedMusic = &decodedMusic;
     ep.vpInW = vpInW;
     ep.vpInH = vpInH;

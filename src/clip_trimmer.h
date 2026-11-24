@@ -15,6 +15,10 @@ struct MontageSegmentSpec {
     int gameVolPct = -1; // < 0 uses ClipEditSpec::gameVolPct
     int micVolPct = -1;  // < 0 uses ClipEditSpec::micVolPct
     double timelineStartSec = -1.0; // < 0.0 appends seamlessly after previous segment
+    int track = 0;       // 0 = V1 main track, 1 = V2 overlay/PiP track
+    double centerX = 0.5;
+    double centerY = 0.5;
+    double scale = 1.0;  // [0.20..1.0] when track == 1
 };
 
 struct MontageMusicTrackSpec {

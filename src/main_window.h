@@ -44,6 +44,8 @@ public:
     bool IsStudioOpen() const { return studioOpen_; }
     bool IsStudioVideoReady() const { return studioPlayer_ != nullptr && studioVideoReady_; }
     void StudioVideoHostUpdate();
+    bool IsStudioOverlayReady() const { return studioOverlayPlayer_ != nullptr && studioOverlayReady_; }
+    void StudioOverlayHostUpdate();
     int StudioHitTestStageHandle(int mx, int my, int cw, int ch) const;
 
 private:
@@ -240,8 +242,14 @@ private:
         double trimEndSec = 0.0;
         double speed = 1.0;
         bool hasMultiTrack = false;
+        int mixStreamPos = 0;
+        int gameStreamPos = -1;
+        int micStreamPos = -1;
         int gameVolPct = 100;
         int micVolPct = 100;
+        double pipCenterX = 0.76;
+        double pipCenterY = 0.72;
+        double pipScale = 0.38;
         bool waveLoaded = false;
         std::vector<float> wavePeaks;
     };
@@ -286,11 +294,13 @@ private:
     bool studioVertical916_ = false;
     int studioTargetMb_ = 0;
     std::vector<StudioClipItem> studioClips_;
+    std::vector<StudioClipItem> studioOverlayClips_;
     std::vector<StudioMusicItem> studioMusic_;
     std::vector<StudioTransitionItem> studioTransitions_;
     std::vector<MontageFrameSpec> studioFrames_;
     std::vector<std::wstring> studioRecentAudio_;
     int studioSelClip_ = -1;
+    int studioSelOverlay_ = -1;
     int studioSelMusic_ = -1;
     int studioSelFx_ = -1;
     int studioSelFrame_ = -1;
@@ -302,22 +312,41 @@ private:
     bool studioPlaying_ = false;
     bool studioVideoReady_ = false;
     bool studioAudioReady_ = false;
+    bool studioMicReady_ = false;
+    bool studioOverlayReady_ = false;
     int studioLoadedClipIdx_ = -1;
+    int studioLoadedOverlayIdx_ = -1;
     std::wstring studioLoadedClipPath_;
     std::wstring studioLoadedMusicPath_;
+    std::wstring studioLoadedMicPath_;
+    std::wstring studioLoadedOverlayPath_;
     double studioPendingSeekSec_ = -1.0;
     double studioPendingAudioSeekSec_ = -1.0;
+    double studioPendingMicSeekSec_ = -1.0;
+    double studioPendingOverlaySeekSec_ = -1.0;
     std::atomic<uint64_t> studioGen_{0};
     HWND studioVideoHwnd_ = nullptr;
+    HWND studioOverlayVideoHwnd_ = nullptr;
+    HWND studioFxOverlayHwnd_ = nullptr;
     IMFPMediaPlayer* studioPlayer_ = nullptr;
     IMFPMediaPlayer* studioMusicPlayer_ = nullptr;
+    IMFPMediaPlayer* studioMicPlayer_ = nullptr;
+    IMFPMediaPlayer* studioOverlayPlayer_ = nullptr;
     StudioMpCallback* studioVideoCb_ = nullptr;
     StudioMpCallback* studioAudioCb_ = nullptr;
+    StudioMpCallback* studioMicCb_ = nullptr;
+    StudioMpCallback* studioOverlayCb_ = nullptr;
 
     float studioAppliedVol_ = -1.0f;
     int studioAppliedMute_ = -1;
     float studioAppliedRate_ = -1.0f;
     float studioAppliedMusVol_ = -1.0f;
+    float studioAppliedMicVol_ = -1.0f;
+    int studioAppliedMicMute_ = -1;
+    float studioAppliedMicRate_ = -1.0f;
+    float studioAppliedOverlayVol_ = -1.0f;
+    int studioAppliedOverlayMute_ = -1;
+    float studioAppliedOverlayRate_ = -1.0f;
     bool studioLastFxActive_ = false;
 
     std::thread studioWaveThread_;
@@ -338,9 +367,13 @@ private:
     ULONGLONG studioGapLastTickMs_ = 0;
     ULONGLONG studioLastScrubMs_ = 0;
     ULONGLONG studioIgnoreEndUntilMs_ = 0;
+    ULONGLONG studioOverlayIgnoreEndUntilMs_ = 0;
     bool studioSeekPending_ = false;
+    bool studioOverlaySeekPending_ = false;
     int studioHoverClipIdx_ = -1;
     int studioHoverClipSide_ = 0;  // -1=left, +1=right, 0=none
+    int studioHoverOverlayIdx_ = -1;
+    int studioHoverOverlaySide_ = 0; // -1=left, +1=right, 0=none
     int studioHoverMusicIdx_ = -1;
     int studioHoverMusicSide_ = 0; // -1=left, +1=right, 0=none
     int studioHoverFxIdx_ = -1;
@@ -348,21 +381,29 @@ private:
     int studioHoverFrameSide_ = 0; // -1=left, +1=right, 0=none
     int studioHoverStageCorner_ = 0; // 0=none, 1=TL, 2=TR, 3=BL, 4=BR, 5=body
     RECT studioLastVideoRc_{};
+    RECT studioLastOverlayVideoRc_{};
+    RECT studioLastFxOverlayScreenRc_{};
 
     void OpenStudio(bool loadQueued = true);
     void CloseStudio();
     void UpdateStudioLayout(int cw, int ch);
     void SyncStudioVideoFrameRect();
+    void SyncStudioFxOverlay();
+    void DestroyStudioFxOverlay();
     void UpdateStudioMetrics();
     double StudioTotalDuration() const;
     bool MapTimelineToClip(double tlSec, int& outIdx, double& outLocalSec, double& outClipStartSec) const;
+    bool MapTimelineToOverlayClip(double tlSec, int& outIdx, double& outLocalSec, double& outClipStartSec) const;
     int StudioHitTestTransition(int mx, int my, int cw, int ch) const;
     bool StudioHitTestFrameBar(int mx, int my, int cw, int ch, int& outIdx, int& outSide) const;
     bool StudioHitTestTrimEdge(int mx, int my, int cw, int ch, int& outKind, int& outIdx, int& outSide, double& outAccSec) const;
     int StudioHitTestClipBody(int mx, int my, int cw, int ch) const;
     void StudioFitZoomToView(int cw, int ch);
     void StudioTrimClipEdgeToPlayhead(bool leftEdge);
+    bool BuildStudioClipItem(const std::wstring& path, const std::wstring& name, double fallbackDurSec, StudioClipItem& outItem) const;
     void StudioAddClipFromLibrary(size_t rawClipIdx);
+    void StudioAddClipToOverlay(size_t rawClipIdx);
+    void StudioToggleSelectedClipTrack();
     void StudioAddMusicFile(const std::wstring& audioPath = L"");
     void StudioAddTransition(MontageTransitionType type);
     void StudioSplitAtPlayhead();
