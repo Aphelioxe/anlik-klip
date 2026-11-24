@@ -2492,6 +2492,15 @@ bool EditMp4Clip(const ClipEditSpec& spec, std::string& outError,
         if (SUCCEEDED(nativeV->GetUINT32(MF_MT_VIDEO_NOMINAL_RANGE, &v)) && v != 0) nomRange = v;
     }
     if (fpsN == 0 || fpsD == 0) { fpsN = 60; fpsD = 1; }
+    auto snapCfrFps = [](UINT32& fn, UINT32& fd) {
+        if (fn == 0 || fd == 0) { fn = 60; fd = 1; return; }
+        if ((fn == 60000 && fd == 1001) || (fn == 30000 && fd == 1001)) return;
+        const double fps = static_cast<double>(fn) / static_cast<double>(fd);
+        if (fps >= 55.0 && fps <= 62.0) { fn = 60; fd = 1; }
+        else if (fps >= 27.5 && fps <= 31.5) { fn = 30; fd = 1; }
+        else if (fps >= 112.0 && fps <= 125.0) { fn = 120; fd = 1; }
+    };
+    snapCfrFps(fpsN, fpsD);
     avgBr = std::max<uint32_t>(2500000u, std::min<uint32_t>(20000000u, avgBr));
     probeSr.Reset();
 
@@ -2543,10 +2552,19 @@ bool EditMp4Clip(const ClipEditSpec& spec, std::string& outError,
                 GUID maj{};
                 mt->GetGUID(MF_MT_MAJOR_TYPE, &maj);
                 if (maj == MFMediaType_Video) {
-                    UINT32 iw = 0, ih = 0;
+                    UINT32 iw = 0, ih = 0, sfn = 0, sfd = 0;
                     if (SUCCEEDED(MFGetAttributeSize(mt.Get(), MF_MT_FRAME_SIZE, &iw, &ih))) {
                         vpInW = std::max(vpInW, iw);
                         vpInH = std::max(vpInH, ih);
+                    }
+                    if (SUCCEEDED(MFGetAttributeRatio(mt.Get(), MF_MT_FRAME_RATE, &sfn, &sfd)) && sfn > 0 && sfd > 0) {
+                        snapCfrFps(sfn, sfd);
+                        const double curFps = static_cast<double>(fpsN) / static_cast<double>(fpsD);
+                        const double segFps = static_cast<double>(sfn) / static_cast<double>(sfd);
+                        if (segFps > curFps && segFps <= 120.5) {
+                            fpsN = sfn;
+                            fpsD = sfd;
+                        }
                     }
                 } else if (maj == MFMediaType_Audio) {
                     foundA = true;

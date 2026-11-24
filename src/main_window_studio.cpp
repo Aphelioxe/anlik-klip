@@ -103,7 +103,15 @@ LRESULT CALLBACK StudioVideoHostProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM 
             }
             break;
         }
+        case WM_SIZE:
+            if (mw && mw->IsStudioVideoReady()) mw->StudioVideoHostUpdate();
+            return 0;
         case WM_PAINT: {
+            if (mw && mw->IsStudioVideoReady()) {
+                ValidateRect(hwnd, nullptr);
+                mw->StudioVideoHostUpdate();
+                return 0;
+            }
             PAINTSTRUCT ps{};
             HDC hdc = BeginPaint(hwnd, &ps);
             RECT rc{};
@@ -587,6 +595,12 @@ void MainWindow::StudioTrimClipEdgeToPlayhead(bool leftEdge) {
     if (hwnd_) InvalidateRect(hwnd_, nullptr, FALSE);
 }
 
+void MainWindow::StudioVideoHostUpdate() {
+    if (studioPlayer_ && studioVideoReady_) {
+        studioPlayer_->UpdateVideo();
+    }
+}
+
 void MainWindow::OpenStudio(bool loadQueued) {
     if (!hwnd_ || studioOpen_) return;
     if (playerOpen_) CloseEmbeddedPlayer();
@@ -609,6 +623,11 @@ void MainWindow::OpenStudio(bool loadQueued) {
     studioLoadedMusicPath_.clear();
     studioPendingSeekSec_ = -1.0;
     studioPendingAudioSeekSec_ = -1.0;
+    studioAppliedVol_ = -1.0f;
+    studioAppliedMute_ = -1;
+    studioAppliedRate_ = -1.0f;
+    studioAppliedMusVol_ = -1.0f;
+    studioLastFxActive_ = false;
     studioDragMode_ = 0;
     studioClipDragged_ = false;
     studioDragOrigStarts_.clear();
@@ -725,6 +744,11 @@ void MainWindow::CloseStudio() {
     studioLoadedClipIdx_ = -1;
     studioLoadedClipPath_.clear();
     studioLoadedMusicPath_.clear();
+    studioAppliedVol_ = -1.0f;
+    studioAppliedMute_ = -1;
+    studioAppliedRate_ = -1.0f;
+    studioAppliedMusVol_ = -1.0f;
+    studioLastFxActive_ = false;
     studioDragMode_ = 0;
     studioClipDragged_ = false;
     studioDragOrigStarts_.clear();
@@ -838,23 +862,46 @@ void MainWindow::StartStudioWaveformWorker() {
 void MainWindow::SyncStudioMediaState(bool forceSeekVideo) {
     if (!studioOpen_ || trimBusy_ || !studioVideoHwnd_) return;
     if (studioClips_.empty()) {
-        if (studioPlayer_) studioPlayer_->Pause();
-        if (studioMusicPlayer_) studioMusicPlayer_->Pause();
+        if (studioPlayer_) {
+            MFP_MEDIAPLAYER_STATE st = MFP_MEDIAPLAYER_STATE_EMPTY;
+            if (FAILED(studioPlayer_->GetState(&st)) || st == MFP_MEDIAPLAYER_STATE_PLAYING) {
+                studioPlayer_->Pause();
+            }
+        }
+        if (studioMusicPlayer_) {
+            MFP_MEDIAPLAYER_STATE ast = MFP_MEDIAPLAYER_STATE_EMPTY;
+            if (FAILED(studioMusicPlayer_->GetState(&ast)) || ast == MFP_MEDIAPLAYER_STATE_PLAYING) {
+                studioMusicPlayer_->Pause();
+            }
+        }
         studioPlaying_ = false;
-        ShowWindow(studioVideoHwnd_, SW_HIDE);
+        if (IsWindowVisible(studioVideoHwnd_)) ShowWindow(studioVideoHwnd_, SW_HIDE);
         return;
     }
 
     int segIdx = -1;
     double localSec = 0.0, clipStartOut = 0.0;
     if (!MapTimelineToClip(studioPlayheadSec_, segIdx, localSec, clipStartOut) || segIdx < 0) {
-        if (studioPlayer_) studioPlayer_->Pause();
+        if (studioPlayer_) {
+            MFP_MEDIAPLAYER_STATE st = MFP_MEDIAPLAYER_STATE_EMPTY;
+            if (FAILED(studioPlayer_->GetState(&st)) || st == MFP_MEDIAPLAYER_STATE_PLAYING) {
+                studioPlayer_->Pause();
+            }
+        }
         studioLoadedClipIdx_ = -1;
-        ShowWindow(studioVideoHwnd_, SW_HIDE);
+        if (IsWindowVisible(studioVideoHwnd_)) {
+            ShowWindow(studioVideoHwnd_, SW_HIDE);
+            if (hwnd_) {
+                RECT cli{};
+                GetClientRect(hwnd_, &cli);
+                StudioGeometry gm = CalcStudioGeom(cli.right, cli.bottom, static_cast<int>(dpi_));
+                InvalidateRect(hwnd_, &gm.stageRc, FALSE);
+            }
+        }
     } else {
         const auto& clip = studioClips_[static_cast<size_t>(segIdx)];
         SyncStudioVideoFrameRect();
-        ShowWindow(studioVideoHwnd_, SW_SHOW);
+        if (!IsWindowVisible(studioVideoHwnd_)) ShowWindow(studioVideoHwnd_, SW_SHOW);
 
         if (!studioPlayer_) {
             studioVideoCb_ = new StudioMpCallback(hwnd_, studioGen_.load(), false);
@@ -875,6 +922,9 @@ void MainWindow::SyncStudioMediaState(bool forceSeekVideo) {
             studioLoadedClipIdx_ = segIdx;
             studioLoadedClipPath_ = clip.path;
             studioPendingSeekSec_ = localSec;
+            studioAppliedVol_ = -1.0f;
+            studioAppliedMute_ = -1;
+            studioAppliedRate_ = -1.0f;
             IMFPMediaItem* item = nullptr;
             if (SUCCEEDED(studioPlayer_->CreateMediaItemFromURL(clip.path.c_str(), TRUE, 0, &item)) && item) {
                 SelectBestPreviewAudioTrack(item, clip.path);
@@ -885,9 +935,22 @@ void MainWindow::SyncStudioMediaState(bool forceSeekVideo) {
             }
         } else if (studioVideoReady_) {
             studioLoadedClipIdx_ = segIdx;
-            studioPlayer_->SetVolume(previewVol);
-            studioPlayer_->SetMute(previewMute ? TRUE : FALSE);
-            studioPlayer_->SetRate(static_cast<float>(clip.speed));
+            const int wantMute = previewMute ? 1 : 0;
+            const float wantRate = static_cast<float>(clip.speed);
+            if (std::abs(previewVol - studioAppliedVol_) > 0.002f) {
+                studioPlayer_->SetVolume(previewVol);
+                studioAppliedVol_ = previewVol;
+            }
+            if (wantMute != studioAppliedMute_) {
+                studioPlayer_->SetMute(wantMute ? TRUE : FALSE);
+                studioAppliedMute_ = wantMute;
+            }
+            if (std::abs(wantRate - studioAppliedRate_) > 0.001f) {
+                studioPlayer_->SetRate(wantRate);
+                studioAppliedRate_ = wantRate;
+            }
+            MFP_MEDIAPLAYER_STATE vState = MFP_MEDIAPLAYER_STATE_EMPTY;
+            const bool haveVState = SUCCEEDED(studioPlayer_->GetState(&vState));
             if (forceSeekVideo) {
                 PROPVARIANT pos;
                 PropVariantInit(&pos);
@@ -900,9 +963,15 @@ void MainWindow::SyncStudioMediaState(bool forceSeekVideo) {
                 }
                 PropVariantClear(&pos);
             }
-            studioPlayer_->UpdateVideo();
-            if (studioPlaying_) studioPlayer_->Play();
-            else studioPlayer_->Pause();
+            if (studioPlaying_) {
+                const bool needPlay = !haveVState || (vState != MFP_MEDIAPLAYER_STATE_PLAYING);
+                if (forceSeekVideo || needPlay) studioPlayer_->UpdateVideo();
+                if (needPlay) studioPlayer_->Play();
+            } else {
+                const bool needPause = !haveVState || (vState == MFP_MEDIAPLAYER_STATE_PLAYING);
+                if (forceSeekVideo || needPause) studioPlayer_->UpdateVideo();
+                if (needPause) studioPlayer_->Pause();
+            }
         }
     }
 
@@ -926,14 +995,17 @@ void MainWindow::SyncStudioMediaState(bool forceSeekVideo) {
                 studioAudioReady_ = false;
                 studioLoadedMusicPath_ = activeMus->path;
                 studioPendingAudioSeekSec_ = targetASec;
+                studioAppliedMusVol_ = -1.0f;
                 IMFPMediaItem* aItem = nullptr;
                 if (SUCCEEDED(studioMusicPlayer_->CreateMediaItemFromURL(activeMus->path.c_str(), TRUE, 0, &aItem)) && aItem) {
                     studioMusicPlayer_->SetMediaItem(aItem);
                     aItem->Release();
                 }
             } else if (studioAudioReady_) {
-                studioMusicPlayer_->SetVolume(musVol);
-                studioMusicPlayer_->SetMute(FALSE);
+                if (std::abs(musVol - studioAppliedMusVol_) > 0.002f) {
+                    studioMusicPlayer_->SetVolume(musVol);
+                    studioAppliedMusVol_ = musVol;
+                }
                 PROPVARIANT aPos;
                 PropVariantInit(&aPos);
                 double curASec = targetASec;
@@ -949,11 +1021,17 @@ void MainWindow::SyncStudioMediaState(bool forceSeekVideo) {
                     studioMusicPlayer_->SetPosition(MFP_POSITIONTYPE_100NS, &np);
                     PropVariantClear(&np);
                 }
-                studioMusicPlayer_->Play();
+                MFP_MEDIAPLAYER_STATE aState = MFP_MEDIAPLAYER_STATE_EMPTY;
+                if (FAILED(studioMusicPlayer_->GetState(&aState)) || aState != MFP_MEDIAPLAYER_STATE_PLAYING) {
+                    studioMusicPlayer_->Play();
+                }
             }
         }
     } else if (studioMusicPlayer_ && studioAudioReady_) {
-        studioMusicPlayer_->Pause();
+        MFP_MEDIAPLAYER_STATE aState = MFP_MEDIAPLAYER_STATE_EMPTY;
+        if (FAILED(studioMusicPlayer_->GetState(&aState)) || aState == MFP_MEDIAPLAYER_STATE_PLAYING) {
+            studioMusicPlayer_->Pause();
+        }
     }
 }
 
@@ -968,8 +1046,17 @@ void MainWindow::UpdateStudioMetrics() {
     int curIdx = -1;
     double tmpL = 0.0, tmpC = 0.0;
     if (!MapTimelineToClip(studioPlayheadSec_, curIdx, tmpL, tmpC) || curIdx < 0) {
-        if (studioPlayer_) studioPlayer_->Pause();
-        if (studioVideoHwnd_ && IsWindowVisible(studioVideoHwnd_)) ShowWindow(studioVideoHwnd_, SW_HIDE);
+        if (studioPlayer_) {
+            MFP_MEDIAPLAYER_STATE vState = MFP_MEDIAPLAYER_STATE_EMPTY;
+            if (FAILED(studioPlayer_->GetState(&vState)) || vState == MFP_MEDIAPLAYER_STATE_PLAYING) {
+                studioPlayer_->Pause();
+            }
+        }
+        bool hidVideoWindow = false;
+        if (studioVideoHwnd_ && IsWindowVisible(studioVideoHwnd_)) {
+            ShowWindow(studioVideoHwnd_, SW_HIDE);
+            hidVideoWindow = true;
+        }
         ULONGLONG now = GetTickCount64();
         if (studioGapLastTickMs_ == 0) {
             studioGapLastTickMs_ = now;
@@ -983,7 +1070,12 @@ void MainWindow::UpdateStudioMetrics() {
             studioPlayheadSec_ = tot;
             studioPlaying_ = false;
             studioGapLastTickMs_ = 0;
-            if (studioMusicPlayer_) studioMusicPlayer_->Pause();
+            if (studioMusicPlayer_) {
+                MFP_MEDIAPLAYER_STATE aState = MFP_MEDIAPLAYER_STATE_EMPTY;
+                if (FAILED(studioMusicPlayer_->GetState(&aState)) || aState == MFP_MEDIAPLAYER_STATE_PLAYING) {
+                    studioMusicPlayer_->Pause();
+                }
+            }
         } else {
             int nextIdx = -1;
             double nl = 0.0, nc = 0.0;
@@ -1005,7 +1097,9 @@ void MainWindow::UpdateStudioMetrics() {
             } else if (studioPlayheadSec_ < studioTimelineScrollSec_) {
                 studioTimelineScrollSec_ = std::max(0.0, studioPlayheadSec_ - 0.5);
             }
-            InvalidateRect(hwnd_, nullptr, FALSE);
+            if (hidVideoWindow) InvalidateRect(hwnd_, &gm.stageRc, FALSE);
+            RECT tlRedraw{ 0, gm.toolY, cli.right, cli.bottom };
+            InvalidateRect(hwnd_, &tlRedraw, FALSE);
         }
         return;
     }
@@ -1020,7 +1114,13 @@ void MainWindow::UpdateStudioMetrics() {
     const auto& clip = studioClips_[static_cast<size_t>(curIdx)];
     if (studioSeekPending_) {
         if (GetTickCount64() < studioIgnoreEndUntilMs_) {
-            if (hwnd_) InvalidateRect(hwnd_, nullptr, FALSE);
+            if (hwnd_) {
+                RECT cli{};
+                GetClientRect(hwnd_, &cli);
+                StudioGeometry gm = CalcStudioGeom(cli.right, cli.bottom, static_cast<int>(dpi_));
+                RECT tlRedraw{ 0, gm.toolY, cli.right, cli.bottom };
+                InvalidateRect(hwnd_, &tlRedraw, FALSE);
+            }
             return;
         }
         studioSeekPending_ = false;
@@ -1038,12 +1138,10 @@ void MainWindow::UpdateStudioMetrics() {
 
     if (GetTickCount64() >= studioIgnoreEndUntilMs_ && localPos >= clip.trimEndSec - 0.04) {
         AdvancePastStudioClip(curIdx);
-    } else if (GetTickCount64() >= studioIgnoreEndUntilMs_) {
+    } else {
         double relLocal = std::max(0.0, std::min(clip.trimEndSec - clip.trimStartSec, localPos - clip.trimStartSec));
         studioPlayheadSec_ = clipStartOut + relLocal / std::max(0.5, clip.speed);
         SyncStudioVideoFrameRect();
-        SyncStudioMediaState(false);
-    } else {
         SyncStudioMediaState(false);
     }
 
@@ -1058,7 +1156,20 @@ void MainWindow::UpdateStudioMetrics() {
         } else if (studioPlayheadSec_ < studioTimelineScrollSec_) {
             studioTimelineScrollSec_ = std::max(0.0, studioPlayheadSec_ - 0.5);
         }
-        InvalidateRect(hwnd_, nullptr, FALSE);
+        bool fxNow = false;
+        for (const auto& fx : studioTransitions_) {
+            double halfW = std::max(0.15, fx.durationSec) * 0.5;
+            if (studioPlayheadSec_ >= fx.timelineSec - halfW && studioPlayheadSec_ <= fx.timelineSec + halfW) {
+                fxNow = true;
+                break;
+            }
+        }
+        if (fxNow != studioLastFxActive_) {
+            studioLastFxActive_ = fxNow;
+            InvalidateRect(hwnd_, &gm.stageRc, FALSE);
+        }
+        RECT tlRedraw{ 0, gm.toolY, cli.right, cli.bottom };
+        InvalidateRect(hwnd_, &tlRedraw, FALSE);
     }
 }
 
@@ -1350,6 +1461,11 @@ void MainWindow::StartStudioRender() {
     studioAudioReady_ = false;
     studioLoadedClipPath_.clear();
     studioLoadedMusicPath_.clear();
+    studioAppliedVol_ = -1.0f;
+    studioAppliedMute_ = -1;
+    studioAppliedRate_ = -1.0f;
+    studioAppliedMusVol_ = -1.0f;
+    studioLastFxActive_ = false;
     if (studioVideoHwnd_) ShowWindow(studioVideoHwnd_, SW_HIDE);
 
     trimCancel_.store(false);
@@ -1447,9 +1563,13 @@ bool MainWindow::HandleStudioAppMessage(UINT msg, WPARAM /*wParam*/, LPARAM lPar
                             float vol = std::max(0.0f, std::min(1.0f,
                                 static_cast<float>(c.hasMultiTrack ? std::max(c.gameVolPct, c.micVolPct) : c.gameVolPct) / 100.0f));
                             bool mute = (c.gameVolPct == 0 && (!c.hasMultiTrack || c.micVolPct == 0));
+                            float wantRate = static_cast<float>(c.speed);
                             studioPlayer_->SetVolume(vol);
                             studioPlayer_->SetMute(mute ? TRUE : FALSE);
-                            studioPlayer_->SetRate(static_cast<float>(c.speed));
+                            studioPlayer_->SetRate(wantRate);
+                            studioAppliedVol_ = vol;
+                            studioAppliedMute_ = mute ? 1 : 0;
+                            studioAppliedRate_ = wantRate;
                         }
                         if (studioPendingSeekSec_ > 0.01) {
                             PROPVARIANT sp;
@@ -1473,6 +1593,7 @@ bool MainWindow::HandleStudioAppMessage(UINT msg, WPARAM /*wParam*/, LPARAM lPar
                     } else if (ev->type == MFP_EVENT_TYPE_POSITION_SET) {
                         studioSeekPending_ = false;
                         studioIgnoreEndUntilMs_ = GetTickCount64() + 120;
+                        if (!studioPlaying_) studioPlayer_->UpdateVideo();
                     } else if (ev->type == MFP_EVENT_TYPE_PLAYBACK_ENDED) {
                         if (studioVideoReady_ && !studioSeekPending_ && GetTickCount64() >= studioIgnoreEndUntilMs_) {
                             int curIdx = studioLoadedClipIdx_;
@@ -1494,9 +1615,12 @@ bool MainWindow::HandleStudioAppMessage(UINT msg, WPARAM /*wParam*/, LPARAM lPar
                 } else if (ev->isAudio && studioMusicPlayer_) {
                     if (ev->type == MFP_EVENT_TYPE_MEDIAITEM_SET) {
                         studioAudioReady_ = true;
+                        studioMusicPlayer_->SetMute(FALSE);
                         for (const auto& m : studioMusic_) {
                             if (_wcsicmp(m.path.c_str(), studioLoadedMusicPath_.c_str()) == 0) {
-                                studioMusicPlayer_->SetVolume(std::max(0.0f, std::min(1.0f, static_cast<float>(m.volPct) / 100.0f)));
+                                float musVol = std::max(0.0f, std::min(1.0f, static_cast<float>(m.volPct) / 100.0f));
+                                studioMusicPlayer_->SetVolume(musVol);
+                                studioAppliedMusVol_ = musVol;
                                 break;
                             }
                         }

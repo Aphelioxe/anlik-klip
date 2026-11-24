@@ -42,6 +42,8 @@ public:
     bool IsPlayerOpen() const { return playerOpen_; }
     bool IsPlayerReady() const { return playerReady_; }
     bool IsStudioOpen() const { return studioOpen_; }
+    bool IsStudioVideoReady() const { return studioPlayer_ != nullptr && studioVideoReady_; }
+    void StudioVideoHostUpdate();
     int StudioHitTestStageHandle(int mx, int my, int cw, int ch) const;
 
 private:
@@ -311,6 +313,12 @@ private:
     IMFPMediaPlayer* studioMusicPlayer_ = nullptr;
     StudioMpCallback* studioVideoCb_ = nullptr;
     StudioMpCallback* studioAudioCb_ = nullptr;
+
+    float studioAppliedVol_ = -1.0f;
+    int studioAppliedMute_ = -1;
+    float studioAppliedRate_ = -1.0f;
+    float studioAppliedMusVol_ = -1.0f;
+    bool studioLastFxActive_ = false;
 
     std::thread studioWaveThread_;
     std::atomic<bool> studioWaveStop_{false};
