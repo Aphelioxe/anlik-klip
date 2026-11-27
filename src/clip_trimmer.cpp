@@ -1811,7 +1811,7 @@ bool RunEditMp4ClipAttempt(const EditEncodeParams& ep, std::atomic<bool>* cancel
                 LONGLONG mappedTs = outVBase100 + static_cast<LONGLONG>(static_cast<double>(relIn) / seg.speed);
                 LONGLONG gridTs = (outFrameIdx * 10000000LL * outFpsD) / outFpsN;
                 const LONGLONG matchTol = (seg.speed > 1.05)
-                    ? std::max<LONGLONG>(1000LL, static_cast<LONGLONG>((static_cast<double>(outFrameDur100) / seg.speed) * 0.45))
+                    ? std::max<LONGLONG>(1000LL, static_cast<LONGLONG>((static_cast<double>(outFrameDur100) / seg.speed) * 0.49))
                     : (outFrameDur100 / 2);
                 if (mappedTs + matchTol < gridTs) continue;
                 if (gridTs >= outVBase100 + outSpan100) continue;

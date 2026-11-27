@@ -181,6 +181,8 @@ private:
     float playerVol_ = 1.0f;
     bool playerMuted_ = false;
     float playerRate_ = 1.0f;
+    bool playerRatePending_ = false;
+    ULONGLONG playerRatePendingUntilMs_ = 0;
     bool draggingSeek_ = false;
     bool draggingVol_ = false;
     bool playerFullscreen_ = false;
@@ -316,6 +318,7 @@ private:
     bool studioOverlayReady_ = false;
     int studioLoadedClipIdx_ = -1;
     int studioLoadedOverlayIdx_ = -1;
+    int studioLoadedAudioStreamPos_ = -1;
     std::wstring studioLoadedClipPath_;
     std::wstring studioLoadedMusicPath_;
     std::wstring studioLoadedMicPath_;
@@ -370,6 +373,27 @@ private:
     ULONGLONG studioOverlayIgnoreEndUntilMs_ = 0;
     bool studioSeekPending_ = false;
     bool studioOverlaySeekPending_ = false;
+    bool studioMicSeekPending_ = false;
+    bool studioRatePending_ = false;
+    bool studioMicRatePending_ = false;
+    bool studioOverlayRatePending_ = false;
+    ULONGLONG studioRatePendingUntilMs_ = 0;
+    ULONGLONG studioMicNextSeekMs_ = 0;
+    ULONGLONG studioOverlayNextSeekMs_ = 0;
+    ULONGLONG studioLastPeriodicSyncMs_ = 0;
+    int studioTickLastOvIdx_ = -1;
+    int studioTickLastFrmIdx_ = -1;
+    bool studioTickLastHasMus_ = false;
+    HDC studioLayerDc_ = nullptr;
+    HBITMAP studioLayerBmp_ = nullptr;
+    HGDIOBJ studioLayerOld_ = nullptr;
+    int studioLayerW_ = 0;
+    int studioLayerH_ = 0;
+    bool studioLayerValid_ = false;
+    bool studioPlayheadFastTick_ = false;
+    std::vector<UiButtonRect> studioLayerButtons_;
+    std::unordered_map<std::wstring, HBITMAP> studioMiniThumbs_;
+    void FreeStudioCache();
     int studioHoverClipIdx_ = -1;
     int studioHoverClipSide_ = 0;  // -1=left, +1=right, 0=none
     int studioHoverOverlayIdx_ = -1;
@@ -418,7 +442,7 @@ private:
     void StopStudioWaveformWorker();
     void StartStudioRender();
     void PaintMontajLanding(void* gPtr, int cw, int ch);
-    void PaintStudio(void* gPtr, int cw, int ch);
+    void PaintStudio(HDC dstDc, int cw, int ch);
     bool HandleStudioPreTranslate(const MSG& msg);
     bool HandleStudioAppMessage(UINT msg, WPARAM wParam, LPARAM lParam, LRESULT& outRes);
     bool OnStudioLButtonDown(int mx, int my);

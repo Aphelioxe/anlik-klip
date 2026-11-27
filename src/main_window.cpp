@@ -471,6 +471,7 @@ bool MainWindow::Create(int initialTab) {
 }
 
 void MainWindow::FreeBackbuffer() {
+    FreeStudioCache();
     if (memDc_) {
         if (memOldBmp_) SelectObject(memDc_, memOldBmp_);
         if (memBmp_) DeleteObject(memBmp_);
@@ -1180,6 +1181,8 @@ void MainWindow::CloseEmbeddedPlayer() {
     playerReady_ = false;
     playerPlaying_ = false;
     playerEnded_ = false;
+    playerRatePending_ = false;
+    playerRatePendingUntilMs_ = 0;
     draggingSeek_ = false;
     draggingVol_ = false;
     trimMode_ = false;
@@ -1811,25 +1814,29 @@ void MainWindow::CyclePlayerRate() {
     else if (playerRate_ < 1.25f) playerRate_ = 1.5f;
     else if (playerRate_ < 1.75f) playerRate_ = 2.0f;
     else playerRate_ = 0.5f;
-    if (player_) {
-        bool rateApplied = false;
-        if (playerRate_ >= 1.9f) {
-            IMFRateControl* rc = nullptr;
-            if (SUCCEEDED(MFGetService(player_, MF_RATE_CONTROL_SERVICE, __uuidof(IMFRateControl), reinterpret_cast<void**>(&rc))) && rc) {
-                if (SUCCEEDED(rc->SetRate(TRUE, playerRate_))) {
-                    rateApplied = true;
-                }
-                rc->Release();
+    if (player_ && playerReady_) {
+        MFP_MEDIAPLAYER_STATE curSt = MFP_MEDIAPLAYER_STATE_EMPTY;
+        const bool isPlayingNow = (SUCCEEDED(player_->GetState(&curSt)) && curSt == MFP_MEDIAPLAYER_STATE_PLAYING);
+        HRESULT hr = player_->SetRate(playerRate_);
+        if (FAILED(hr)) {
+            float minR = 0.5f, maxR = 1.0f;
+            if (SUCCEEDED(player_->GetSupportedRates(FALSE, &minR, &maxR)) && maxR >= 0.5f) {
+                playerRate_ = std::max(minR, std::min(maxR, playerRate_));
+                hr = player_->SetRate(playerRate_);
             }
         }
-        if (!rateApplied) {
-            HRESULT hr = player_->SetRate(playerRate_);
-            if (FAILED(hr)) {
-                float minR = 0.5f, maxR = 1.0f;
-                if (SUCCEEDED(player_->GetSupportedRates(FALSE, &minR, &maxR)) && maxR >= 0.5f) {
-                    playerRate_ = std::max(minR, std::min(maxR, playerRate_));
-                    player_->SetRate(playerRate_);
-                }
+        if (isPlayingNow && SUCCEEDED(hr)) {
+            playerRatePending_ = false;
+            playerPlaying_ = true;
+            playerEnded_ = false;
+        } else {
+            const bool wantPlay = playerPlaying_ && !playerEnded_;
+            if (SUCCEEDED(hr) && wantPlay) {
+                playerRatePending_ = true;
+                playerRatePendingUntilMs_ = GetTickCount64() + 260;
+            } else {
+                playerRatePending_ = false;
+                if (wantPlay) player_->Play();
             }
         }
     }
@@ -1844,6 +1851,13 @@ void MainWindow::CyclePlayerRate() {
 
 void MainWindow::UpdatePlayerMetrics() {
     if (!player_ || !playerReady_) return;
+    if (playerRatePending_) {
+        if (GetTickCount64() >= playerRatePendingUntilMs_) {
+            playerRatePending_ = false;
+            if (playerPlaying_ && !playerEnded_) player_->Play();
+        }
+        return;
+    }
     if (!draggingSeek_ && draggingTrim_ == 0) {
         PROPVARIANT pos;
         PropVariantInit(&pos);
@@ -2070,6 +2084,8 @@ void MainWindow::UpdateHover(int mx, int my) {
     if (nb != hoverBtnId_ || nc != hoverCardIdx_) {
         hoverBtnId_ = nb;
         hoverCardIdx_ = nc;
+        studioLayerValid_ = false;
+        studioPlayheadFastTick_ = false;
         InvalidateRect(hwnd_, nullptr, FALSE);
     }
 }
@@ -2190,6 +2206,8 @@ void MainWindow::OpenFolder(const std::wstring& path) {
 
 void MainWindow::SetFooterMessage(const std::wstring& msg) {
     footerMsg_ = msg;
+    studioLayerValid_ = false;
+    studioPlayheadFastTick_ = false;
     if (hwnd_) InvalidateRect(hwnd_, nullptr, FALSE);
 }
 
@@ -2203,22 +2221,30 @@ void MainWindow::PaintWindow(HDC targetDc) {
     if (!memDc_ || memW_ != cw || memH_ != ch) {
         FreeBackbuffer();
         memDc_ = CreateCompatibleDC(targetDc);
-        memBmp_ = CreateCompatibleBitmap(targetDc, cw, ch);
+        BITMAPINFO bmi{};
+        bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+        bmi.bmiHeader.biWidth = cw;
+        bmi.bmiHeader.biHeight = -ch;
+        bmi.bmiHeader.biPlanes = 1;
+        bmi.bmiHeader.biBitCount = 32;
+        bmi.bmiHeader.biCompression = BI_RGB;
+        void* dibBits = nullptr;
+        memBmp_ = CreateDIBSection(targetDc, &bmi, DIB_RGB_COLORS, &dibBits, nullptr, 0);
+        if (!memBmp_) memBmp_ = CreateCompatibleBitmap(targetDc, cw, ch);
         memOldBmp_ = SelectObject(memDc_, memBmp_);
         memW_ = cw;
         memH_ = ch;
     }
     HDC memDc = memDc_;
 
-    {
+    if (activeTab_ == 1 && studioOpen_) {
+        PaintStudio(memDc, cw, ch);
+    } else {
         Gdiplus::Graphics g(memDc);
         g.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
         g.SetTextRenderingHint(Gdiplus::TextRenderingHintClearTypeGridFit);
         g.SetPixelOffsetMode(Gdiplus::PixelOffsetModeHalf);
 
-        if (activeTab_ == 1 && studioOpen_) {
-            PaintStudio(&g, cw, ch);
-        } else {
         g.Clear(Gc(9, 12, 19));
 
         // Ambient radial/gradient glow orbs (vibrant modern backdrop)
@@ -3207,7 +3233,6 @@ void MainWindow::PaintWindow(HDC targetDc) {
             g.ResetTransform();
             g.ResetClip();
         }
-        }
     }
 
     BitBlt(targetDc, 0, 0, cw, ch, memDc, 0, 0, SRCCOPY);
@@ -3247,6 +3272,8 @@ LRESULT MainWindow::OnMessage(UINT msg, WPARAM wParam, LPARAM lParam) {
             return 0;
 
         case WM_SIZE:
+            studioLayerValid_ = false;
+            studioPlayheadFastTick_ = false;
             if (wParam != SIZE_MINIMIZED) {
                 UpdateLayoutForSize(LOWORD(lParam), HIWORD(lParam));
                 if (studioOpen_) SyncStudioFxOverlay();
@@ -3261,6 +3288,7 @@ LRESULT MainWindow::OnMessage(UINT msg, WPARAM wParam, LPARAM lParam) {
             HDC hdc = BeginPaint(hwnd_, &ps);
             PaintWindow(hdc);
             EndPaint(hwnd_, &ps);
+            studioPlayheadFastTick_ = false;
             return 0;
         }
 
@@ -3309,7 +3337,7 @@ LRESULT MainWindow::OnMessage(UINT msg, WPARAM wParam, LPARAM lParam) {
                 if (!fastTick) {
                     if (hwnd_) SetTimer(hwnd_, TIMER_UI_ANIM_ID, 48, nullptr);
                     animPhase_ += 0.16;
-                    if (hwnd_ && !playerFullscreen_ && !studioOpen_) {
+                    if (hwnd_ && !playerFullscreen_ && !studioOpen_ && !(playerOpen_ && playerPlaying_)) {
                         RECT sidePulseRc{ S(14), S(68), S(208), S(104) };
                         InvalidateRect(hwnd_, &sidePulseRc, FALSE);
                     }
@@ -3493,12 +3521,33 @@ LRESULT MainWindow::OnMessage(UINT msg, WPARAM wParam, LPARAM lParam) {
                         PropVariantClear(&dur);
                         player_->SetVolume(playerVol_);
                         player_->SetMute(playerMuted_ ? TRUE : FALSE);
-                        player_->SetRate(playerRate_);
                         player_->UpdateVideo();
-                        player_->Play();
-                        playerPlaying_ = true;
-                        playerEnded_ = false;
+                        if (std::abs(playerRate_ - 1.0f) > 0.01f) {
+                            HRESULT rhr = player_->SetRate(playerRate_);
+                            if (SUCCEEDED(rhr)) {
+                                playerRatePending_ = true;
+                                playerRatePendingUntilMs_ = GetTickCount64() + 260;
+                                playerPlaying_ = true;
+                                playerEnded_ = false;
+                            } else {
+                                playerRatePending_ = false;
+                                player_->Play();
+                                playerPlaying_ = true;
+                                playerEnded_ = false;
+                            }
+                        } else {
+                            playerRatePending_ = false;
+                            player_->Play();
+                            playerPlaying_ = true;
+                            playerEnded_ = false;
+                        }
                         InvalidateRect(hwnd_, nullptr, FALSE);
+                    } else if (ev->type == MFP_EVENT_TYPE_RATE_SET) {
+                        if (playerRatePending_) {
+                            playerRatePending_ = false;
+                            player_->UpdateVideo();
+                            if (playerPlaying_ && !playerEnded_) player_->Play();
+                        }
                     } else if (ev->type == MFP_EVENT_TYPE_PLAYBACK_ENDED) {
                         playerPlaying_ = false;
                         playerEnded_ = true;
@@ -3516,7 +3565,7 @@ LRESULT MainWindow::OnMessage(UINT msg, WPARAM wParam, LPARAM lParam) {
                         player_->SetVolume(playerVol_);
                         player_->SetMute(playerMuted_ ? TRUE : FALSE);
                     } else if (ev->type == MFP_EVENT_TYPE_PAUSE) {
-                        playerPlaying_ = false;
+                        if (!playerRatePending_) playerPlaying_ = false;
                     } else if (ev->type == MFP_EVENT_TYPE_ERROR) {
                         SetFooterMessage(L"Oynatma hatası oluştu.");
                     }
@@ -3868,6 +3917,8 @@ LRESULT MainWindow::OnMessage(UINT msg, WPARAM wParam, LPARAM lParam) {
             studioHoverFrameSide_ = 0;
             studioHoverStageCorner_ = 0;
             if (!draggingSeek_ && !draggingVol_ && draggingTrim_ == 0) pressedBtnId_ = 0;
+            studioLayerValid_ = false;
+            studioPlayheadFastTick_ = false;
             InvalidateRect(hwnd_, nullptr, FALSE);
             return 0;
 
@@ -4261,7 +4312,15 @@ LRESULT MainWindow::OnMessage(UINT msg, WPARAM wParam, LPARAM lParam) {
                             break;
                         }
                     }
-                    if (!playerOpen_) InvalidateRect(hwnd_, nullptr, FALSE);
+                    if (studioOpen_) {
+                        if (!studioPlaying_ && studioLeftTab_ == 0) {
+                            studioLayerValid_ = false;
+                            studioPlayheadFastTick_ = false;
+                            InvalidateRect(hwnd_, nullptr, FALSE);
+                        }
+                    } else if (!playerOpen_) {
+                        InvalidateRect(hwnd_, nullptr, FALSE);
+                    }
                 } else if (tm->hBmp) {
                     DeleteObject(tm->hBmp);
                 }
