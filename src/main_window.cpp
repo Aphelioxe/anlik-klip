@@ -2318,16 +2318,13 @@ void MainWindow::PaintWindow(HDC targetDc) {
             Gdiplus::SolidBrush brInner(app_.IsRunning() ? Gc(239, 68, 68) : Gc(100, 116, 139));
             g.FillEllipse(&brInner, (float)S(29), (float)S(31), (float)S(10), (float)S(10));
         }
-        g.DrawString(L"Anlık Klip", -1, &fTitle, Gdiplus::RectF((float)S(60), (float)S(16), (float)S(102), (float)S(24)), &sfLeft, &brText);
-        FillRoundRect(g, (float)S(166), (float)S(20), (float)S(38), (float)S(18), (float)S(9), Gc(59, 130, 246, 48));
-        StrokeRoundRect(g, (float)S(166), (float)S(20), (float)S(38), (float)S(18), (float)S(9), Gc(96, 165, 250, 125));
+        g.DrawString(L"Anlık Klip", -1, &fTitle, Gdiplus::RectF((float)S(60), (float)S(23), (float)S(102), (float)S(26)), &sfLeft, &brText);
+        FillRoundRect(g, (float)S(166), (float)S(27), (float)S(38), (float)S(18), (float)S(9), Gc(59, 130, 246, 48));
+        StrokeRoundRect(g, (float)S(166), (float)S(27), (float)S(38), (float)S(18), (float)S(9), Gc(96, 165, 250, 125));
         {
             Gdiplus::SolidBrush brVer(Gc(147, 197, 253));
-            g.DrawString(L"v1.4", -1, &fSmall, Gdiplus::RectF((float)S(166), (float)S(20), (float)S(38), (float)S(18)), &sfCenter, &brVer);
+            g.DrawString(L"v1.4", -1, &fSmall, Gdiplus::RectF((float)S(166), (float)S(27), (float)S(38), (float)S(18)), &sfCenter, &brVer);
         }
-        wchar_t resSub[48] = {};
-        swprintf(resSub, 48, L"%dp • %d FPS", app_.Config().height, app_.Config().fps);
-        g.DrawString(resSub, -1, &fSub, Gdiplus::RectF((float)S(60), (float)S(38), (float)S(146), (float)S(18)), &sfLeft, &brMuted);
 
         // Live status capsule with animated pulse halo
         AppRuntimeStats st = app_.GetStats();
