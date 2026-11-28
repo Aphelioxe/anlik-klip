@@ -2552,9 +2552,7 @@ void MainWindow::PaintWindow(HDC targetDc) {
             }
             addBtnPx(BTN_PLY_BACK, S(242), S(18), S(114), S(34), L"←  Kliplere", Gc(28, 34, 47), Gc(40, 49, 68), Gc(54, 66, 90), !trimBusy_);
             g.DrawString(playerClipTitle_.c_str(), -1, &fBold,
-                Gdiplus::RectF((float)S(364), (float)S(16), (float)std::max(S(140), cw - S(816)), (float)S(20)), &sfLeft, &brText);
-            g.DrawString(L"Space: Oynat • ←/→: ±5sn • F: Tam Ekran • Esc: Geri", -1, &fSmall,
-                Gdiplus::RectF((float)S(364), (float)S(36), (float)std::max(S(180), cw - S(816)), (float)S(16)), &sfLeft, &brMuted);
+                Gdiplus::RectF((float)S(364), (float)S(18), (float)std::max(S(140), cw - S(816)), (float)S(34)), &sfLeft, &brText);
 
             addBtnPx(BTN_PLY_SHARE, cw - S(444), S(18), S(82), S(34), uploadBusy_ ? L"Yükleniyor" : L"Link Al",
                 Gc(28, 34, 47), Gc(40, 49, 68), Gc(52, 64, 86), !trimBusy_ && !uploadBusy_);
