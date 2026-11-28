@@ -484,7 +484,6 @@ private:
     HWND cmbResFps_ = nullptr;
     HWND cmbBitrate_ = nullptr;
     HWND chkGameAudio_ = nullptr;
-    HWND chkSpotifyAudio_ = nullptr;
     HWND trkGameVol_ = nullptr;
     HWND lblGameVol_ = nullptr;
     HWND chkMicAudio_ = nullptr;
@@ -500,7 +499,6 @@ private:
     HWND edtMicHotkey_ = nullptr;
     HWND btnSetMicHotkey_ = nullptr;
     HWND btnClearMicHotkey_ = nullptr;
-    HWND lblHotkeyStatus_ = nullptr;
     HWND btnRestartAdmin_ = nullptr;
     HWND edtOutDir_ = nullptr;
     HWND btnBrowseDir_ = nullptr;

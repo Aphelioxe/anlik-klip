@@ -55,7 +55,7 @@ AppConfig LoadConfig(const std::wstring& iniPath) {
 
     cfg.captureGameAudio = GetPrivateProfileIntW(L"Audio", L"CaptureGame", 1, iniPath.c_str()) != 0;
     cfg.gameVolumePct = ClampInt(GetPrivateProfileIntW(L"Audio", L"GameVolumePct", 100, iniPath.c_str()), 0, 200);
-    cfg.captureSpotify = GetPrivateProfileIntW(L"Audio", L"CaptureSpotify", 1, iniPath.c_str()) != 0;
+    cfg.captureSpotify = true;
     cfg.captureMic = GetPrivateProfileIntW(L"Audio", L"CaptureMic", 1, iniPath.c_str()) != 0;
     cfg.micVolumePct = ClampInt(GetPrivateProfileIntW(L"Audio", L"MicVolumePct", 100, iniPath.c_str()), 0, 200);
     cfg.micMuted = GetPrivateProfileIntW(L"Audio", L"MicMuted", 0, iniPath.c_str()) != 0;

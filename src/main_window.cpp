@@ -60,7 +60,6 @@ enum NativeCtrlId {
     ID_CMB_RESFPS,
     ID_CMB_BITRATE,
     ID_CHK_GAME_AUDIO,
-    ID_CHK_SPOTIFY_AUDIO,
     ID_TRK_GAME_VOL,
     ID_CHK_MIC_AUDIO,
     ID_CHK_MIC_MUTE,
@@ -733,10 +732,6 @@ void MainWindow::CreateControls() {
     btnClearMicHotkey_ = make(L"BUTTON", L"Temizle", BS_OWNERDRAW | WS_TABSTOP, 736, 324, 86, 26, ID_BTN_CLR_MIC_HK);
 
     bool elev = HotkeyEngine::IsProcessElevated();
-    wchar_t hkMsg[200] = {};
-    swprintf(hkMsg, 200, L"Tuş algılama: Çift katman • %ls",
-        elev ? L"Yönetici Modu Aktif" : L"Normal Mod (Yönetici oyunlar için yandaki buton)");
-    lblHotkeyStatus_ = makeLbl(hkMsg, 258, 359, 488, 22);
     btnRestartAdmin_ = make(L"BUTTON", elev ? L"Yönetici Aktif" : L"Yönetici Başlat",
         BS_OWNERDRAW | WS_TABSTOP, 752, 357, 130, 26, ID_BTN_RESTART_ADMIN);
     if (elev) EnableWindow(btnRestartAdmin_, FALSE);
@@ -749,7 +744,6 @@ void MainWindow::CreateControls() {
     chkSound_ = makeChk(L"Klip alınca \"çıng\" bildirim sesi çal", 258, 432, 246, 22, ID_CHK_SOUND);
     btnTestSound_ = make(L"BUTTON", L"Sesi Test Et", BS_OWNERDRAW | WS_TABSTOP, 512, 429, 98, 26, ID_BTN_TEST_SOUND);
     chkAutoStart_ = makeChk(L"Windows açılışında arka planda başlat", 258, 466, 290, 22, ID_CHK_AUTOSTART);
-    chkSpotifyAudio_ = makeChk(L"Spotify müziğini kliplere kaydet", 258, 496, 262, 22, ID_CHK_SPOTIFY_AUDIO);
     chkMobileSync_ = makeChk(L"Telefon Aktarımı (Wi-Fi)", 620, 432, 148, 22, ID_CHK_MOBILE_SYNC);
     btnShowQr_ = make(L"BUTTON", L"QR Kod / Bağlan", BS_OWNERDRAW | WS_TABSTOP, 772, 429, 110, 26, ID_BTN_MOBILE_QR);
 
@@ -813,7 +807,6 @@ void MainWindow::LoadSettingsControls() {
     SendMessageW(cmbBitrate_, CB_SETCURSEL, brIdx, 0);
 
     SendMessageW(chkGameAudio_, BM_SETCHECK, cfg.captureGameAudio ? BST_CHECKED : BST_UNCHECKED, 0);
-    SendMessageW(chkSpotifyAudio_, BM_SETCHECK, cfg.captureSpotify ? BST_CHECKED : BST_UNCHECKED, 0);
     SendMessageW(trkGameVol_, TBM_SETPOS, TRUE, cfg.gameVolumePct);
     wchar_t vbuf[16] = {};
     swprintf(vbuf, 16, L"%%%d", cfg.gameVolumePct);
@@ -871,7 +864,7 @@ void MainWindow::ReadSettingsControls(AppConfig& out) {
     if (bIdx >= 0 && bIdx < kNumBr) out.bitrateKbps = kBitrates[bIdx];
 
     out.captureGameAudio = (SendMessageW(chkGameAudio_, BM_GETCHECK, 0, 0) == BST_CHECKED);
-    out.captureSpotify = (SendMessageW(chkSpotifyAudio_, BM_GETCHECK, 0, 0) == BST_CHECKED);
+    out.captureSpotify = true;
     out.gameVolumePct = static_cast<int>(SendMessageW(trkGameVol_, TBM_GETPOS, 0, 0));
     out.captureMic = (SendMessageW(chkMicAudio_, BM_GETCHECK, 0, 0) == BST_CHECKED);
     out.micMuted = (SendMessageW(chkMicMute_, BM_GETCHECK, 0, 0) == BST_CHECKED);
@@ -3207,18 +3200,19 @@ void MainWindow::PaintWindow(HDC targetDc) {
 
             {
                 const AppConfig& mc = app_.Config();
-                wchar_t mobTxt[160] = {};
                 if (app_.IsMobileSyncRunning()) {
+                    wchar_t mobTxt[160] = {};
                     swprintf(mobTxt, 160, L"Wi-Fi Aktif: %ls:%d  •  PIN: %ls",
                         app_.GetMobileLanIp().c_str(), mc.mobileSyncPort, mc.mobilePin.c_str());
                     Gdiplus::SolidBrush brMobOk(Gc(134, 239, 172));
                     g.DrawString(mobTxt, -1, &fSmall,
                         Gdiplus::RectF((float)(S(560) + sox), (float)S(468), (float)S(326), (float)S(20)), &sfLeft, &brMobOk);
-                } else {
+                } else if (mc.mobileSyncEnabled) {
                     std::wstring merr = app_.GetMobileError();
-                    const wchar_t* msg = !merr.empty() ? merr.c_str() : L"Telefon aktarımı kapalı (0 RAM)";
-                    g.DrawString(msg, -1, &fSmall,
-                        Gdiplus::RectF((float)(S(560) + sox), (float)S(468), (float)S(326), (float)S(20)), &sfLeft, &brMuted);
+                    if (!merr.empty()) {
+                        g.DrawString(merr.c_str(), -1, &fSmall,
+                            Gdiplus::RectF((float)(S(560) + sox), (float)S(468), (float)S(326), (float)S(20)), &sfLeft, &brMuted);
+                    }
                 }
             }
 
@@ -4383,13 +4377,12 @@ LRESULT MainWindow::OnMessage(UINT msg, WPARAM wParam, LPARAM lParam) {
                     }
                     break;
                 case ID_CHK_GAME_AUDIO:
-                case ID_CHK_SPOTIFY_AUDIO:
                 case ID_CHK_MIC_AUDIO:
                 case ID_CHK_MIC_MUTE:
                 case ID_CHK_MIC_GATE: {
                     AppConfig cfg = app_.Config();
                     cfg.captureGameAudio = (SendMessageW(chkGameAudio_, BM_GETCHECK, 0, 0) == BST_CHECKED);
-                    cfg.captureSpotify = (SendMessageW(chkSpotifyAudio_, BM_GETCHECK, 0, 0) == BST_CHECKED);
+                    cfg.captureSpotify = true;
                     cfg.captureMic = (SendMessageW(chkMicAudio_, BM_GETCHECK, 0, 0) == BST_CHECKED);
                     cfg.micMuted = (SendMessageW(chkMicMute_, BM_GETCHECK, 0, 0) == BST_CHECKED);
                     cfg.micNoiseGate = (SendMessageW(chkMicGate_, BM_GETCHECK, 0, 0) == BST_CHECKED);
