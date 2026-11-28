@@ -546,11 +546,12 @@ void MainWindow::BringToFront(int tab) {
 }
 
 void MainWindow::NotifyClipSaved(const ClipSaveResult& res) {
-    SetFooterMessage(res.message);
     if (res.ok) {
+        if (footerMsg_.rfind(L"Kayıt hatası", 0) == 0) footerMsg_.clear();
         RefreshClips(playerOpen_ ? L"" : res.filePath);
-    } else if (hwnd_) {
-        InvalidateRect(hwnd_, nullptr, FALSE);
+    } else {
+        SetFooterMessage(res.message);
+        if (hwnd_) InvalidateRect(hwnd_, nullptr, FALSE);
     }
 }
 
@@ -2483,8 +2484,6 @@ void MainWindow::PaintWindow(HDC targetDc) {
         addBtnPx(BTN_SIDE_MIC, S(114), btnBaseY + S(46), S(90), S(32), app_.Config().micMuted ? L"Mik: Sustu" : L"Mik: Açık",
             app_.Config().micMuted ? Gc(180, 83, 9) : Gc(30, 37, 52),
             app_.Config().micMuted ? Gc(217, 119, 6) : Gc(42, 51, 70), Gc(52, 64, 86));
-        g.DrawString(L"X ile kapatınca tepside çalışır", -1, &fSmall,
-            Gdiplus::RectF((float)S(16), (float)(btnBaseY + S(90)), (float)S(188), (float)S(20)), &sfCenter, &brMuted);
 
         if (activeTab_ == 0 && playerOpen_ && playerFullscreen_) {
             // ================= FULLSCREEN PLAYER OVERLAY BAR =================

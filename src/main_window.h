@@ -475,7 +475,7 @@ private:
     std::atomic<uint64_t> thumbGen_{0};
     std::thread thumbThread_;
 
-    std::wstring footerMsg_ = L"Pencereyi kapattığınızda kayıt ve kısayol arka planda en düşük RAM ile devam eder.";
+    std::wstring footerMsg_;
     std::vector<AudioDeviceInfo> micDevices_;
     std::vector<HWND> settingsCtrls_;
 
